@@ -677,27 +677,24 @@ async def _analyze_vision_comprehensive(
     context_info = build_context_info(context)
     prompt_text = VISION_ANALYSIS_PROMPT.format(context_info=context_info)
 
-    # Encode image
-    encoded_image = base64.b64encode(data).decode("utf-8")
-    images_list = [encoded_image]
-
-    # Call Gemini Vision API
-    payload = {"prompt": {"text": prompt_text, "images": images_list}}
-    headers = {"X-API-KEY": INTERNAL_API_KEY, "Content-Type": "application/json"}
-
-    timeout = httpx.Timeout(120.0, connect=30.0, read=120.0, write=120.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    # Route comprehensive vision through the configured backend (chatgpt by
+    # default) instead of the disabled legacy /ai/gemini/vision. _call_ai_with_images
+    # takes image PATHS (not base64), so spill the bytes to a temp file we clean up.
+    import tempfile
+    import os as _os
+    _tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as _tf:
+            _tf.write(data)
+            _tmp_path = _tf.name
         try:
-            print("🎨 Starting comprehensive vision analysis...", flush=True)
-            response = await client.post(
-                f"{API_BASE_URL}/ai/gemini/vision",
-                json=payload,
-                headers=headers,
-                timeout=timeout
-            )
-            response.raise_for_status()
-
-            ai_response_str = response.json().get("message", "{}")
+            print(f"🎨 Starting comprehensive vision analysis via {ANALYSIS_BACKEND}...", flush=True)
+            ai_response_str = await _call_ai_with_images(
+                prompt=prompt_text,
+                image_paths=[_tmp_path],
+                backend=ANALYSIS_BACKEND,
+                timeout=180.0,
+            ) or "{}"
             ai_response_str = _clean_json_response(ai_response_str)
             analysis_result = json.loads(ai_response_str)
 
@@ -772,6 +769,12 @@ async def _analyze_vision_comprehensive(
             error_result["prompt"] = prompt_text
             error_result.setdefault("embedding_info", {}).setdefault("metadata", {})["stacktrace"] = traceback.format_exc()
             return error_result
+    finally:
+        if _tmp_path:
+            try:
+                _os.unlink(_tmp_path)
+            except Exception:
+                pass
 
 
 async def analyze_content(
