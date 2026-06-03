@@ -71,6 +71,12 @@ ANALYSIS_MODEL = os.getenv("ANALYSIS_MODEL", "sonnet")  # Pro Claude model for f
 #   fallback once auth is refreshed.
 SAFETY_BACKEND = os.getenv("SAFETY_BACKEND", "chatgpt").lower()
 ANALYSIS_BACKEND = os.getenv("ANALYSIS_BACKEND", SAFETY_BACKEND).lower()
+# Image VISION needs a true vision model. codex (chatgpt) is a code model and
+# returns empty/garbage on images even when api-ai localizes the file; gemini
+# needs per-host OAuth. claude reads the localized /tmp image reliably and is
+# free via the subscription CLI — so vision defaults to claude regardless of
+# the text-analysis backend. Verified on arkserver:8000 (obj 36319).
+VISION_BACKEND = os.getenv("VISION_BACKEND", "claude").lower()
 
 # CSV Chunking configuration
 CSV_CHUNK_SIZE = 10  # Process 10 rows per chunk (small for testing/debugging)
@@ -701,7 +707,7 @@ async def _analyze_vision_comprehensive(
                 f"Antworte AUSSCHLIESSLICH mit dem geforderten JSON, ohne Markdown-Fences."
             )
             image_paths = []
-            print(f"🎨 Vision analysis via {ANALYSIS_BACKEND} (URL {image_url})", flush=True)
+            print(f"🎨 Vision analysis via {VISION_BACKEND} (URL {image_url})", flush=True)
         else:
             import tempfile
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as _tf:
@@ -709,12 +715,12 @@ async def _analyze_vision_comprehensive(
                 _tmp_path = _tf.name
             prompt_to_send = prompt_text
             image_paths = [_tmp_path]
-            print(f"🎨 Vision analysis via {ANALYSIS_BACKEND} (local file fallback)", flush=True)
+            print(f"🎨 Vision analysis via {VISION_BACKEND} (local file fallback)", flush=True)
         try:
             ai_response_str = await _call_ai_with_images(
                 prompt=prompt_to_send,
                 image_paths=image_paths,
-                backend=ANALYSIS_BACKEND,
+                backend=VISION_BACKEND,
                 timeout=180.0,
             ) or "{}"
             ai_response_str = _clean_json_response(ai_response_str)
@@ -1221,7 +1227,7 @@ async def _run_vision_analysis_with_paths(
     prompt = VISION_ANALYSIS_PROMPT.format(context_info=context_info)
 
     # Let exceptions bubble for Celery autoretry; see _run_safety_check_with_paths.
-    print(f"🎨 Running vision analysis via {ANALYSIS_BACKEND} backend on {len(image_paths)} images")
+    print(f"🎨 Running vision analysis via {VISION_BACKEND} backend on {len(image_paths)} images")
     ai_response_str = await _call_ai_with_images(
         prompt=prompt,
         image_paths=image_paths,
