@@ -641,12 +641,25 @@ class AsyncPipelineManager:
 
         # Save AI analysis results to database (like sync route does)
         storage_obj.ai_category = analysis_result.get("category")
-        storage_obj.ai_danger_potential = analysis_result.get("danger_potential")
 
-        if "safety_info" in analysis_result:
-            storage_obj.safety_info = analysis_result.get("safety_info")
-            safety_info = analysis_result.get("safety_info", {})
-            storage_obj.ai_safety_rating = "safe" if safety_info.get("isSafe", True) else "unsafe"
+        # A FAILED analysis (error / 429 / timeout) is NOT evidence the image is
+        # dangerous — do not brand it unsafe/danger=10, which trips _check_quarantine
+        # permanently and deadlocks re-analysis (the analyzer can't fetch a 451'd
+        # image). Mark status=failed (public stays hidden = fail-closed) and leave
+        # rating/danger unknown so a successful re-run can clear it.
+        _vision_failed = (
+            analysis_result.get("category") == "error"
+            or str(analysis_result.get("mode", "")).endswith("error")
+        )
+        if _vision_failed:
+            storage_obj.ai_safety_status = "failed"
+        else:
+            storage_obj.ai_danger_potential = analysis_result.get("danger_potential")
+            if "safety_info" in analysis_result:
+                storage_obj.safety_info = analysis_result.get("safety_info")
+                safety_info = analysis_result.get("safety_info", {})
+                storage_obj.ai_safety_rating = "safe" if safety_info.get("isSafe", True) else "unsafe"
+            storage_obj.ai_safety_status = "completed"
 
         storage_obj.ai_title = analysis_result.get("ai_title")
         storage_obj.ai_subtitle = analysis_result.get("ai_subtitle")
@@ -784,12 +797,25 @@ class AsyncPipelineManager:
 
         # Save AI analysis results to database (like sync route does)
         storage_obj.ai_category = analysis_result.get("category")
-        storage_obj.ai_danger_potential = analysis_result.get("danger_potential")
 
-        if "safety_info" in analysis_result:
-            storage_obj.safety_info = analysis_result.get("safety_info")
-            safety_info = analysis_result.get("safety_info", {})
-            storage_obj.ai_safety_rating = "safe" if safety_info.get("isSafe", True) else "unsafe"
+        # A FAILED analysis (error / 429 / timeout) is NOT evidence the image is
+        # dangerous — do not brand it unsafe/danger=10, which trips _check_quarantine
+        # permanently and deadlocks re-analysis (the analyzer can't fetch a 451'd
+        # image). Mark status=failed (public stays hidden = fail-closed) and leave
+        # rating/danger unknown so a successful re-run can clear it.
+        _vision_failed = (
+            analysis_result.get("category") == "error"
+            or str(analysis_result.get("mode", "")).endswith("error")
+        )
+        if _vision_failed:
+            storage_obj.ai_safety_status = "failed"
+        else:
+            storage_obj.ai_danger_potential = analysis_result.get("danger_potential")
+            if "safety_info" in analysis_result:
+                storage_obj.safety_info = analysis_result.get("safety_info")
+                safety_info = analysis_result.get("safety_info", {})
+                storage_obj.ai_safety_rating = "safe" if safety_info.get("isSafe", True) else "unsafe"
+            storage_obj.ai_safety_status = "completed"
 
         storage_obj.ai_title = analysis_result.get("ai_title")
         storage_obj.ai_subtitle = analysis_result.get("ai_subtitle")
