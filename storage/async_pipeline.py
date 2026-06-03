@@ -386,6 +386,7 @@ class AsyncPipelineManager:
             result = await analyze_content(
                 data,
                 data_mime,
+                object_id=storage_obj.id,
                 context=cfg.get("context"),
                 vision_mode=cfg.get("vision_mode", "auto"),
                 ai_tasks_str=cfg.get("ai_tasks"),
@@ -628,6 +629,7 @@ class AsyncPipelineManager:
             analysis_result = await analyze_content(
                 data,
                 mime_type,
+                object_id=storage_obj.id,
                 context=cfg.get("context"),
                 vision_mode=cfg.get("vision_mode", "auto"),
                 ai_tasks_str=cfg.get("ai_tasks"),
@@ -770,6 +772,7 @@ class AsyncPipelineManager:
             analysis_result = await analyze_content(
                 data,
                 mime_type,
+                object_id=storage_obj.id,
                 context=None,
                 vision_mode=cfg.get("vision_mode", "auto"),
                 ai_tasks_str=cfg.get("ai_tasks"),
