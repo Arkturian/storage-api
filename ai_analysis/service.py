@@ -49,6 +49,9 @@ import asyncio
 INTERNAL_API_KEY = os.getenv("AI_INTERNAL_API_KEY", "Inetpass1")
 # Make AI API base configurable to avoid hardcoding wrong ports on prod
 API_BASE_URL = os.getenv("AI_API_BASE_URL", "http://127.0.0.1:8000")
+# Public storage base used to hand image URLs to the (CLI-based) AI backends,
+# which fetch the image themselves (contract agreed with api-ai/AiApi).
+STORAGE_BASE_URL = os.getenv("STORAGE_BASE_URL", "").rstrip("/")
 
 # Model configuration for different tasks
 SAFETY_MODEL = os.getenv("SAFETY_MODEL", "haiku")  # Fast Claude model for safety checks
@@ -656,7 +659,8 @@ async def _analyze_csv_chunked(
 async def _analyze_vision_comprehensive(
     data: bytes,
     context: Optional[Dict[str, Any]] = None,
-    vision_mode: str = "generic"
+    vision_mode: str = "generic",
+    object_id: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     VISION MODE: Comprehensive image analysis with product detection and visual intelligence.
@@ -677,21 +681,39 @@ async def _analyze_vision_comprehensive(
     context_info = build_context_info(context)
     prompt_text = VISION_ANALYSIS_PROMPT.format(context_info=context_info)
 
-    # Route comprehensive vision through the configured backend (chatgpt by
-    # default) instead of the disabled legacy /ai/gemini/vision. _call_ai_with_images
-    # takes image PATHS (not base64), so spill the bytes to a temp file we clean up.
-    import tempfile
+    # Deliver the image to the (CLI-based) AI backend as a downscaled HTTPS
+    # storage URL embedded in the prompt — the codex/claude CLI fetches it
+    # itself. This is the contract agreed with api-ai (AiApi): no base64, no
+    # local temp file. width=600 keeps it fast (full resolution is unnecessary).
+    # Falls back to a local temp file only when no object_id/STORAGE_BASE_URL.
     import os as _os
+    image_url = None
+    if object_id is not None and STORAGE_BASE_URL:
+        image_url = f"{STORAGE_BASE_URL}/storage/media/{object_id}?width=600&format=jpg"
+
     _tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as _tf:
-            _tf.write(data)
-            _tmp_path = _tf.name
+        if image_url:
+            prompt_to_send = (
+                f"{prompt_text}\n\n"
+                f"WICHTIG: Das zu analysierende Bild liegt unter dieser URL — lade es "
+                f"herunter und analysiere es: {image_url}\n"
+                f"Antworte AUSSCHLIESSLICH mit dem geforderten JSON, ohne Markdown-Fences."
+            )
+            image_paths = []
+            print(f"🎨 Vision analysis via {ANALYSIS_BACKEND} (URL {image_url})", flush=True)
+        else:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as _tf:
+                _tf.write(data)
+                _tmp_path = _tf.name
+            prompt_to_send = prompt_text
+            image_paths = [_tmp_path]
+            print(f"🎨 Vision analysis via {ANALYSIS_BACKEND} (local file fallback)", flush=True)
         try:
-            print(f"🎨 Starting comprehensive vision analysis via {ANALYSIS_BACKEND}...", flush=True)
             ai_response_str = await _call_ai_with_images(
-                prompt=prompt_text,
-                image_paths=[_tmp_path],
+                prompt=prompt_to_send,
+                image_paths=image_paths,
                 backend=ANALYSIS_BACKEND,
                 timeout=180.0,
             ) or "{}"
@@ -810,7 +832,7 @@ async def analyze_content(
         if eff_mode == "auto":
             eff_mode = "product" if (context_role == "product") else "generic"
         print(f"🎨 Detected image upload - using vision analysis mode={eff_mode}", flush=True)
-        return await _analyze_vision_comprehensive(data, context, vision_mode=eff_mode)
+        return await _analyze_vision_comprehensive(data, context, vision_mode=eff_mode, object_id=object_id)
 
     # For non-images, use existing modes
     if ai_config.is_split():
