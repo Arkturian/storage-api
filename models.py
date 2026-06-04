@@ -121,6 +121,12 @@ class StorageObject(Base):
     # Multi-Tenancy (v4.0)
     tenant_id = Column(String(50), default="arkturian", index=True)  # Tenant identifier for multi-tenancy
 
+    # Two-Phase-Delete / Cascade-Delete (v5.0) — soft-delete tombstone. When set,
+    # the object is treated as gone (media endpoint 404s) but bytes stay intact
+    # so a SWFME cascade-delete saga can untombstone (compensate) before the
+    # final hard-delete. NULL = live.
+    tombstoned_at = Column(DateTime, nullable=True, index=True)
+
 
 class AsyncTask(Base):
     __tablename__ = "async_tasks"

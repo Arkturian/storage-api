@@ -45,6 +45,19 @@ app = FastAPI(
 @app.on_event("startup")
 async def startup():
     await connect_db()
+    # Idempotent schema migration (no Alembic): add the tombstoned_at column for
+    # two-phase / cascade delete if it doesn't exist yet. SQLite ALTER ADD COLUMN.
+    try:
+        from database import engine
+        from sqlalchemy import text as _sql_text
+        with engine.connect() as _conn:
+            _cols = [row[1] for row in _conn.execute(_sql_text("PRAGMA table_info(storage_objects)")).fetchall()]
+            if "tombstoned_at" not in _cols:
+                _conn.execute(_sql_text("ALTER TABLE storage_objects ADD COLUMN tombstoned_at DATETIME"))
+                _conn.commit()
+                print("✅ migration: added storage_objects.tombstoned_at")
+    except Exception as _mig_exc:
+        print(f"⚠️ tombstoned_at migration check failed: {_mig_exc}")
 
 @app.on_event("shutdown")
 async def shutdown():

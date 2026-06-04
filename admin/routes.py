@@ -1,7 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.security.api_key import APIKeyHeader
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import Optional, List
+from datetime import datetime
+import os
 from database import get_db
 from auth import get_current_user
 from models import StorageObject, User
@@ -9,6 +12,31 @@ from pydantic import BaseModel
 from storage.service import generic_storage
 
 router = APIRouter()
+
+# --- Admin / service auth for cascade-delete endpoints ---------------------
+# Accepts a named per-bot key from ADMIN_API_KEYS ("name:key,name2:key2") or the
+# master key (AI_INTERNAL_API_KEY). Returns the caller name for the audit log.
+# Convention agreed with Knowledge/SWFME for swfme-api adapter auth (Post #976).
+_admin_api_key_header = APIKeyHeader(name="X-API-KEY", auto_error=False)
+
+
+def _admin_keys() -> dict:
+    keys: dict = {}
+    for pair in (os.getenv("ADMIN_API_KEYS", "") or "").split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            name, key = pair.split(":", 1)
+            if key.strip():
+                keys[key.strip()] = name.strip()
+    keys.setdefault(os.getenv("AI_INTERNAL_API_KEY", "Inetpass1"), "master")
+    return keys
+
+
+def require_admin_key(x_api_key: Optional[str] = Depends(_admin_api_key_header)) -> str:
+    caller = _admin_keys().get((x_api_key or "").strip())
+    if not caller:
+        raise HTTPException(status_code=401, detail="admin/service key required")
+    return caller
 
 class UserWithCollections(BaseModel):
     email: str
@@ -325,3 +353,102 @@ def purge_objects_by_collection(db: Session, collection_id: str) -> CleanupRespo
         deleted_count=deleted_count,
         message=f"Deleted {deleted_count} objects from collection {collection_id}"
     )
+
+# ===========================================================================
+# Two-Phase / Cascade-Delete endpoints (source-service side for swfme-api)
+# Path prefix /admin → these are /admin/storage/{asset_id}/...
+# ===========================================================================
+
+@router.post("/storage/{asset_id}/tombstone")
+def tombstone_asset(
+    asset_id: int,
+    db: Session = Depends(get_db),
+    caller: str = Depends(require_admin_key),
+):
+    """Soft-delete: mark the asset tombstoned. Media endpoint then 404s, but the
+    bytes stay intact so the cascade saga can untombstone (compensate) before the
+    final hard-delete. Idempotent."""
+    obj = db.query(StorageObject).filter(StorageObject.id == asset_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="asset not found")
+    if obj.tombstoned_at is None:
+        obj.tombstoned_at = datetime.utcnow()
+        db.commit()
+    print(f"🪦 tombstone asset {asset_id} by {caller}")
+    return {"asset_id": asset_id, "tombstoned": True,
+            "tombstoned_at": obj.tombstoned_at.isoformat(), "by": caller}
+
+
+@router.post("/storage/{asset_id}/untombstone")
+def untombstone_asset(
+    asset_id: int,
+    db: Session = Depends(get_db),
+    caller: str = Depends(require_admin_key),
+):
+    """Saga compensation: revoke the tombstone — asset becomes servable again."""
+    obj = db.query(StorageObject).filter(StorageObject.id == asset_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="asset not found")
+    obj.tombstoned_at = None
+    db.commit()
+    print(f"♻️  untombstone asset {asset_id} by {caller} (saga compensation)")
+    return {"asset_id": asset_id, "tombstoned": False, "by": caller}
+
+
+@router.delete("/storage/{asset_id}/hard-delete")
+def hard_delete_asset(
+    asset_id: int,
+    db: Session = Depends(get_db),
+    caller: str = Depends(require_admin_key),
+):
+    """Final, irreversible local removal: file + all derivatives + ChromaDB
+    embedding + DB row (delegates to the existing _perform_delete). The cascade
+    workflow calls this LAST, after all downstream purge_refs have acked."""
+    obj = db.query(StorageObject).filter(StorageObject.id == asset_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="asset not found")
+    from storage.routes import _perform_delete
+    result = _perform_delete(asset_id, db, owner_user_id=obj.owner_user_id or 0, is_admin=True)
+    print(f"🗑️  hard-delete asset {asset_id} by {caller}")
+    return {"asset_id": asset_id, "hard_deleted": True, "by": caller, "local": result}
+
+
+@router.get("/storage/{asset_id}/blast-radius")
+def blast_radius(
+    asset_id: int,
+    downstream: bool = Query(True, description="Also aggregate downstream consumer refs"),
+    db: Session = Depends(get_db),
+    caller: str = Depends(require_admin_key),
+):
+    """Dry-run: what a hard-delete would remove. Local artifacts + (optional)
+    aggregated downstream refs from artrack/knowledge. Mutates nothing."""
+    obj = db.query(StorageObject).filter(StorageObject.id == asset_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="asset not found")
+    local = {
+        "object_row": True,
+        "file_bytes": bool(obj.object_key) and obj.storage_mode != "external",
+        "mime_type": obj.mime_type,
+        "has_hls_transcode": bool(obj.hls_url),
+        "embedding": True,
+        "tombstoned": obj.tombstoned_at is not None,
+    }
+    radius = {"asset_id": asset_id, "local": local, "downstream": {}}
+    if downstream:
+        import httpx
+        key = os.getenv("AI_INTERNAL_API_KEY", "Inetpass1")
+        targets = {
+            "artrack": f"{os.getenv('ARTRACK_API_URL', 'https://api-artrack.arkturian.com')}/admin/storage/{asset_id}/refs",
+            "knowledge": f"{os.getenv('KNOWLEDGE_API_URL', 'https://knowledge-api.arkturian.com')}/admin/refs/storage/{asset_id}",
+        }
+        for name, url in targets.items():
+            try:
+                with httpx.Client(timeout=8.0) as c:
+                    r = c.get(url, headers={"X-API-KEY": key})
+                    radius["downstream"][name] = {
+                        "status": r.status_code,
+                        "refs": (r.json() if r.status_code == 200 else None),
+                    }
+            except Exception as e:  # noqa: BLE001
+                radius["downstream"][name] = {"error": str(e)}
+    return radius

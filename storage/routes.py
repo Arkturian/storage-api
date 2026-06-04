@@ -2894,6 +2894,12 @@ def _check_quarantine(obj, current_user: Optional[User]) -> None:
     """
     if obj is None:
         return
+    # Tombstoned (pending cascade-delete) → treated as gone for ALL callers. The
+    # bytes survive so the saga can untombstone (compensate), but no serving path
+    # delivers it. Admin management still works via /admin/storage/{id}/* which
+    # query the DB directly and don't go through this gate.
+    if getattr(obj, "tombstoned_at", None) is not None:
+        raise HTTPException(status_code=404, detail={"error": "asset not found", "code": "tombstoned"})
     # Owner / admin bypass
     if current_user is not None:
         if getattr(current_user, "trust_level", None) == "admin":
