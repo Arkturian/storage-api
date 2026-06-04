@@ -94,7 +94,7 @@ def one(args, oid):
         if args.dry_run:
             return oid, True, title, desc
         patch = {}
-        if title:
+        if title and not args.description_only:
             patch["title"] = title
         if desc:
             patch["description"] = desc
@@ -117,6 +117,8 @@ def main():
     ap.add_argument("--concurrency", type=int, default=3)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--description-only", action="store_true",
+                    help="only write description, keep existing title (for videos)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
