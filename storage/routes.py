@@ -11,6 +11,7 @@ import shutil
 import hashlib
 import base64
 import subprocess
+import threading
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime
@@ -19,6 +20,14 @@ from PIL import Image
 from storage.pillow_plugins import ensure_heif_support
 
 ensure_heif_support()
+
+# Bound concurrent ffmpeg video-frame extractions. get_media_variant is a sync
+# endpoint that FastAPI runs in a ~40-thread pool, so a burst of first-load
+# thumbnail requests (e.g. a video grid) could spawn dozens of parallel ffmpeg
+# processes (~0.5 GB each) and OOM-killed arkserver on 2026-06-04. Cached frames
+# bypass ffmpeg entirely; only cache-misses contend for this semaphore.
+_FFMPEG_FRAME_SEM = threading.BoundedSemaphore(int(os.getenv("MEDIA_FFMPEG_CONCURRENCY", "3")))
+_FFMPEG_FRAME_WAIT = float(os.getenv("MEDIA_FFMPEG_WAIT", "45"))
 
 try:
     import fitz  # type: ignore[import]
@@ -3277,7 +3286,13 @@ def get_media_variant(
                 media_type_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
                 return FileResponse(cache_path, media_type=media_type_map.get(suffix, "image/jpeg"), headers=_media_extra_headers)
 
+            acquired = _FFMPEG_FRAME_SEM.acquire(timeout=_FFMPEG_FRAME_WAIT)
             try:
+                if not acquired:
+                    # Too many concurrent ffmpeg frame-extractions in flight —
+                    # fall through to serving the original instead of piling on
+                    # memory (OOM guard, 2026-06-04).
+                    raise RuntimeError("ffmpeg frame-extraction concurrency limit reached")
                 # Extract frame from middle of video
                 import subprocess
 
@@ -3292,8 +3307,9 @@ def get_media_variant(
 
                 # Extract frame using ffmpeg - output directly to JPEG for speed
                 ffmpeg_cmd = [
-                    "ffmpeg", "-y", "-ss", str(timestamp), "-i", str(src_path),
-                    "-vframes", "1", "-q:v", "2", str(cache_path)
+                    "ffmpeg", "-nostdin", "-threads", "1", "-y",
+                    "-ss", str(timestamp), "-i", str(src_path),
+                    "-an", "-vframes", "1", "-q:v", "2", str(cache_path)
                 ]
                 # Ensure cache directory exists
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3323,6 +3339,9 @@ def get_media_variant(
             except Exception as e:
                 print(f"⚠️ Failed to extract video frame for object {object_id}: {e}")
                 # Fall through to return original video
+            finally:
+                if acquired:
+                    _FFMPEG_FRAME_SEM.release()
 
         return FileResponse(src_path, media_type=media_type_current, headers=_media_extra_headers)
 
