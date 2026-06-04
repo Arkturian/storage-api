@@ -3484,6 +3484,35 @@ def get_media_variant(
 
         return Response(content=content, media_type=media_type, headers=_media_extra_headers)
 
+    def _serve_oriented_original(_src):
+        """Serve the image original, but bake in EXIF orientation first if it
+        carries a non-trivial one. Many consumers (canvas / WebGL / AR / native
+        map views) ignore the EXIF orientation tag and would render the image
+        rotated — normalising on the server means no consumer has to handle it.
+        Images without an orientation tag are served byte-exact (no re-encode)."""
+        try:
+            with Image.open(_src) as _im:
+                _orient = _im.getexif().get(0x0112)  # 274 = Orientation
+                if _orient in (None, 0, 1):
+                    return FileResponse(_src, media_type=media_type_current, headers=_media_extra_headers)
+                _cache_dir = generic_storage.webview_dir / (obj.tenant_id or "_")
+                _cache_dir.mkdir(parents=True, exist_ok=True)
+                _oriented = _cache_dir / f"oriented_{object_id}.jpg"
+                if refresh and _oriented.exists():
+                    try:
+                        _oriented.unlink()
+                    except Exception:
+                        pass
+                if not _oriented.exists():
+                    _fixed = ImageOps.exif_transpose(_im)
+                    if _fixed.mode in {"RGBA", "LA", "P"}:
+                        _fixed = _fixed.convert("RGB")
+                    _fixed.save(_oriented, format="JPEG", quality=95, optimize=True)
+                return FileResponse(_oriented, media_type="image/jpeg", headers=_media_extra_headers)
+        except Exception as _exc:
+            print(f"⚠️ orient-serve fallback for object {object_id}: {_exc}")
+            return FileResponse(_src, media_type=media_type_current, headers=_media_extra_headers)
+
     apply_trim = False
     if stored_trim and stored_trim.get("applied"):
         if trim_param_supplied:
@@ -3491,9 +3520,9 @@ def get_media_variant(
         else:
             apply_trim = default_trim_enabled
 
-    # Default: if no hints provided, return original (full)
+    # Default: if no hints provided, return original (full) — orientation-normalised
     if not apply_trim and variant is None and display_for is None and not width and not height and not format:
-        return FileResponse(src_path, media_type=media_type_current, headers=_media_extra_headers)
+        return _serve_oriented_original(src_path)
 
     # Derive a deterministic webview name for medium/custom
     if obj.object_key:
@@ -3530,7 +3559,7 @@ def get_media_variant(
         max_edge = 320  # Default thumbnail width (increased from 300 to match video frame extraction)
     elif variant == "full":
         if not apply_trim:
-            return FileResponse(src_path, media_type=media_type_current, headers=_media_extra_headers)
+            return _serve_oriented_original(src_path)
         max_edge = None
     else:
         # medium or custom
