@@ -398,15 +398,29 @@ def untombstone_asset(
 @router.delete("/storage/{asset_id}/hard-delete")
 def hard_delete_asset(
     asset_id: int,
+    force: bool = Query(False, description="Skip the tombstone-first invariant (direct admin delete)"),
     db: Session = Depends(get_db),
     caller: str = Depends(require_admin_key),
 ):
     """Final, irreversible local removal: file + all derivatives + ChromaDB
     embedding + DB row (delegates to the existing _perform_delete). The cascade
-    workflow calls this LAST, after all downstream purge_refs have acked."""
+    workflow calls this LAST, after all downstream purge_refs have acked.
+
+    Enforces the two-phase invariant: the asset must be tombstoned first (so all
+    serving paths already 404 before the bytes vanish — no concurrent-read race
+    during the unlink). Pass ?force=true to bypass for a direct admin delete."""
     obj = db.query(StorageObject).filter(StorageObject.id == asset_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="asset not found")
+    if obj.tombstoned_at is None and not force:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "tombstone_required",
+                "code": "not_tombstoned",
+                "remediation": f"POST /admin/storage/{asset_id}/tombstone first, or retry this DELETE with ?force=true",
+            },
+        )
     from storage.routes import _perform_delete
     result = _perform_delete(asset_id, db, owner_user_id=obj.owner_user_id or 0, is_admin=True)
     print(f"🗑️  hard-delete asset {asset_id} by {caller}")
