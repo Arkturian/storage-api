@@ -4618,6 +4618,63 @@ class StorageObjectUpdate(BaseModel):
     safety_info: Optional[dict] = None
 
 
+def _clear_object_derivatives(obj) -> None:
+    """Drop cached derivatives (webview / oriented / vidframe / thumbnail) for an
+    object so the next serve regenerates from freshly-replaced bytes."""
+    tenant = obj.tenant_id or "arkturian"
+    stem = Path(obj.object_key).stem if obj.object_key else None
+    patterns = [f"oriented_{obj.id}.jpg", f"vidframe_{obj.id}_*"]
+    if stem:
+        patterns += [f"web_{stem}*", f"thumb_{stem}*"]
+    for d in {generic_storage.webview_dir, generic_storage.webview_dir / tenant,
+              generic_storage.thumbnails_dir, generic_storage.thumbnails_dir / tenant}:
+        if not d.exists():
+            continue
+        for pat in patterns:
+            for f in d.glob(pat):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+
+@router.post("/objects/{object_id}/replace-image", response_model=StorageObjectResponse)
+async def replace_object_image(
+    object_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Replace an object's image bytes IN PLACE (e.g. from the editor: rotate/crop)
+    targeting the exact object by id — not the fragile filename+owner reuse path.
+
+    Preserves ALL DB metadata (latitude/longitude, title, description, collection,
+    ai_*); only the file + dimensions/checksum change. So a re-encoded edit — whose
+    canvas export has no EXIF — keeps its stored GPS etc. Clears stale derivative
+    caches so the new bytes are served everywhere immediately."""
+    obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Not found")
+    if current_user.trust_level != "admin" and obj.owner_user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    data = await file.read()
+    is_image = (
+        data[:3] == b"\xff\xd8\xff"            # JPEG
+        or data[:8] == b"\x89PNG\r\n\x1a\n"    # PNG
+        or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")  # WebP
+    )
+    if not is_image:
+        raise HTTPException(status_code=415, detail="replace-image expects a JPEG/PNG/WebP")
+    from storage.domain import update_file_and_record
+    await update_file_and_record(db, storage_obj=obj, data=data, context=None)
+    try:
+        _clear_object_derivatives(obj)
+    except Exception as _e:  # noqa: BLE001
+        print(f"⚠️ derivative cache clear after replace-image {object_id}: {_e}")
+    print(f"✏️  replace-image {object_id} ({len(data)} bytes) — metadata preserved")
+    return StorageObjectResponse.from_orm(obj)
+
+
 @router.patch("/objects/{object_id}", response_model=StorageObjectResponse)
 async def update_object_metadata(
     object_id: int,
