@@ -88,7 +88,7 @@ class StorageObject(Base):
     ai_safety_rating = Column(String, nullable=True)
     metadata_json = Column(JSON, default=dict)
     download_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)  # /storage/list default sort
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     expires_at = Column(DateTime, nullable=True, index=True)  # TTL: NULL = never expires
 

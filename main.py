@@ -56,8 +56,15 @@ async def startup():
                 _conn.execute(_sql_text("ALTER TABLE storage_objects ADD COLUMN tombstoned_at DATETIME"))
                 _conn.commit()
                 print("✅ migration: added storage_objects.tombstoned_at")
+            # Performance: index the default /storage/list sort column. Without it
+            # ORDER BY created_at DESC on a large table is a full scan + temp-btree
+            # sort (~10s on 30k rows) — that was the admin-panel cold-load "warmup".
+            _conn.execute(_sql_text(
+                "CREATE INDEX IF NOT EXISTS ix_storage_objects_created_at ON storage_objects(created_at)"
+            ))
+            _conn.commit()
     except Exception as _mig_exc:
-        print(f"⚠️ tombstoned_at migration check failed: {_mig_exc}")
+        print(f"⚠️ schema migration check failed: {_mig_exc}")
 
 @app.on_event("shutdown")
 async def shutdown():
