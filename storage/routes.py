@@ -3010,8 +3010,15 @@ def _resolve_glb_params(decimate, texture_format, texture_quality, texture_max_s
     """Resolve GLB transform params, applying preset defaults for anything not
     explicitly supplied. Returns the concrete params that key the derivative cache."""
     d = _GLB_PRESET_DEFAULTS.get(preset or "", {})
+    # decimate is a keep-ratio (fraction of triangles kept): 1.0 = keep all = no
+    # decimation. 3D-API treats 0.0 as a legacy alias for 1.0 (keep all), so we
+    # normalize 1.0 -> 0.0 here: byte-identical mesh, single canonical cache key
+    # (no duplicate derivative between ?decimate=1.0 and the omit/default path).
+    _decimate = decimate if decimate is not None else d.get("decimate", 0.0)
+    if _decimate == 1.0:
+        _decimate = 0.0
     return {
-        "decimate":         decimate         if decimate         is not None else d.get("decimate", 0.0),
+        "decimate":         _decimate,
         "texture_format":   (texture_format  if texture_format   is not None else d.get("texture_format", "webp")).lower(),
         "texture_quality":  texture_quality  if texture_quality  is not None else d.get("texture_quality", 85),
         "texture_max_size": texture_max_size if texture_max_size is not None else d.get("texture_max_size", 2048),
@@ -3051,7 +3058,7 @@ def get_media_variant(
     trim: Optional[bool] = Query(None, description="Set true to crop using stored trim bounds (if available)"),
     refresh: bool = Query(False, description="When true, clears cached derivatives before rendering"),
     # GLB / 3D model optimization params — forwarded to 3D-API /optimize/glb
-    decimate: Optional[float] = Query(None, ge=0, le=0.99, description="GLB: mesh decimation 0..0.99 via Blender"),
+    decimate: Optional[float] = Query(None, ge=0, le=1.0, description="GLB: Blender keep-ratio (fraction of triangles kept). 1.0 = keep all = no decimation (default); 0.5 = keep 50%; 0 = legacy alias for 1.0 (keep all)"),
     texture_format: Optional[str] = Query(None, description="GLB: webp | jpg | png"),
     texture_quality: Optional[int] = Query(None, ge=1, le=100, description="GLB: texture encoder quality 1..100"),
     texture_max_size: Optional[int] = Query(None, ge=0, description="GLB: max texture edge in px (0 = no downscale)"),
