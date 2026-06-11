@@ -1774,8 +1774,38 @@ def rename_collection(
 
 
 
+def _hydrate_storage_urls(response_obj, storage_obj, request) -> None:
+    """Fill computed file_url/thumbnail_url/webview_url on a response model the same
+    way the GET/list handlers do. Write endpoints (upload/fetch/analyze/replace/
+    update) return a raw `from_orm` row whose file_url column is empty — the URLs
+    are built per-request from the host, not stored — so without this the caller
+    gets file_url="" until a follow-up GET (reported by AiApi 2026-06-11). The
+    request-derived base_url is required: a config fallback would hand out
+    cross-host URLs that 404 against the wrong instance's DB."""
+    try:
+        base_url = get_base_url_from_request(request)
+        urls = build_storage_urls(
+            object_id=storage_obj.id,
+            tenant_id=storage_obj.tenant_id,
+            checksum=storage_obj.checksum,
+            metadata_json=storage_obj.metadata_json,
+            base_url=base_url,
+            storage_mode=storage_obj.storage_mode,
+            stored_file_url=storage_obj.file_url if storage_obj.file_url else None,
+            mime_type=storage_obj.mime_type,
+        )
+        response_obj.file_url = urls["file_url"]
+        response_obj.thumbnail_url = urls["thumbnail_url"]
+        response_obj.webview_url = urls["webview_url"]
+    except Exception as _e:
+        logging.getLogger("gunicorn.error").warning(
+            f"_hydrate_storage_urls failed for obj {getattr(storage_obj, 'id', None)}: {_e}"
+        )
+
+
 @router.post("/upload", response_model=StorageObjectResponse)
 async def upload_file(
+    request: Request,
     file: Optional[UploadFile] = File(None),
     original_filename: Optional[str] = Form(None),  # Required when file is omitted (path-only register mode)
     context: Optional[str] = Form(None),
@@ -2030,7 +2060,9 @@ async def upload_file(
                 saved_obj = temp_zip  # Return temp ZIP if processing failed
                 
             # Return immediately after HLS processing (successful or failed) - avoid normal upload pipeline
-            return StorageObjectResponse.from_orm(saved_obj)
+            _resp = StorageObjectResponse.from_orm(saved_obj)
+            _hydrate_storage_urls(_resp, saved_obj, request)
+            return _resp
         else:
             # Normal upload logic
             existing = None
@@ -2142,8 +2174,10 @@ async def upload_file(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-        
-    return StorageObjectResponse.from_orm(saved_obj)
+
+    _resp = StorageObjectResponse.from_orm(saved_obj)
+    _hydrate_storage_urls(_resp, saved_obj, request)
+    return _resp
 
 
 class RemoteFetchRequest(BaseModel):
@@ -2160,6 +2194,7 @@ class RemoteFetchRequest(BaseModel):
 @router.post("/fetch", response_model=StorageObjectResponse)
 async def fetch_and_store_remote(
     payload: RemoteFetchRequest,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     api_key_header: str = Security(_APIKeyHeader(name="X-API-KEY", auto_error=True)),
@@ -2355,7 +2390,9 @@ async def fetch_and_store_remote(
         except Exception:
             pass
 
-        return StorageObjectResponse.from_orm(saved_obj)
+        _resp = StorageObjectResponse.from_orm(saved_obj)
+        _hydrate_storage_urls(_resp, saved_obj, request)
+        return _resp
 
     except HTTPException:
         raise
@@ -2365,6 +2402,7 @@ async def fetch_and_store_remote(
 @router.post("/objects/{object_id}/analyze", response_model=StorageObjectResponse)
 async def analyze_existing_object(
     object_id: int,
+    request: Request,
     ai_context_text: Optional[str] = Query(None, description="Optional context hint for AI"),
     ai_tasks: Optional[str] = Query(None, description="CSV/JSON list: safety,vision,product,embedding,kg,notify"),
     ai_vision_mode: Optional[str] = Query(None, description="auto|generic|product"),
@@ -2486,7 +2524,9 @@ async def analyze_existing_object(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-    return StorageObjectResponse.from_orm(obj)
+    _resp = StorageObjectResponse.from_orm(obj)
+    _hydrate_storage_urls(_resp, obj, request)
+    return _resp
 
 
 @router.get("/asset-refs")
@@ -4648,6 +4688,7 @@ def _clear_object_derivatives(obj) -> None:
 @router.post("/objects/{object_id}/replace-image", response_model=StorageObjectResponse)
 async def replace_object_image(
     object_id: int,
+    request: Request,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -4679,13 +4720,16 @@ async def replace_object_image(
     except Exception as _e:  # noqa: BLE001
         print(f"⚠️ derivative cache clear after replace-image {object_id}: {_e}")
     print(f"✏️  replace-image {object_id} ({len(data)} bytes) — metadata preserved")
-    return StorageObjectResponse.from_orm(obj)
+    _resp = StorageObjectResponse.from_orm(obj)
+    _hydrate_storage_urls(_resp, obj, request)
+    return _resp
 
 
 @router.patch("/objects/{object_id}", response_model=StorageObjectResponse)
 async def update_object_metadata(
     object_id: int,
     payload: StorageObjectUpdate,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     tenant_id: str = Depends(get_tenant_id),
@@ -4751,7 +4795,9 @@ async def update_object_metadata(
             import traceback
             traceback.print_exc()
 
-    return StorageObjectResponse.from_orm(obj)
+    _resp = StorageObjectResponse.from_orm(obj)
+    _hydrate_storage_urls(_resp, obj, request)
+    return _resp
 
 
 @router.post("/objects/{object_id}/embed", response_model=StorageObjectResponse)
@@ -4920,6 +4966,7 @@ def transfer_owner_by_link(
 @router.put("/files/{object_id}", response_model=StorageObjectResponse)
 async def replace_file(
     object_id: int,
+    request: Request,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -5004,7 +5051,9 @@ async def replace_file(
             import traceback
             traceback.print_exc()
 
-    return StorageObjectResponse.from_orm(updated_obj)
+    _resp = StorageObjectResponse.from_orm(updated_obj)
+    _hydrate_storage_urls(_resp, updated_obj, request)
+    return _resp
 
 @admin_router.post("/trigger-processing/{object_id}")
 async def admin_trigger_processing(
