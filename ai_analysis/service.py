@@ -77,6 +77,11 @@ ANALYSIS_BACKEND = os.getenv("ANALYSIS_BACKEND", SAFETY_BACKEND).lower()
 # free via the subscription CLI — so vision defaults to claude regardless of
 # the text-analysis backend. Verified on arkserver:8000 (obj 36319).
 VISION_BACKEND = os.getenv("VISION_BACKEND", "claude").lower()
+# Smart-routing: if the safety verdict's confidence is below this, re-run the vision
+# call ONCE with high reasoning effort — invests the extra latency only in genuinely
+# uncertain cases. Set to 0 to disable. (effort passthrough → claude --effort.)
+SAFETY_CONFIDENCE_RETRY_THRESHOLD = float(os.getenv("SAFETY_CONFIDENCE_RETRY_THRESHOLD", "0.7"))
+HIGH_EFFORT_LEVEL = os.getenv("HIGH_EFFORT_LEVEL", "high")
 
 # CSV Chunking configuration
 CSV_CHUNK_SIZE = 10  # Process 10 rows per chunk (small for testing/debugging)
@@ -87,7 +92,8 @@ async def _call_claude_with_images(
     prompt: str,
     image_paths: List[str],
     model: str = None,
-    timeout: float = 120.0
+    timeout: float = 120.0,
+    effort: str = None,
 ) -> str:
     """
     Call Claude API with local image paths.
@@ -111,6 +117,9 @@ async def _call_claude_with_images(
         "prompt": prompt,
         "image_paths": image_paths
     }
+    # Optional reasoning-effort passthrough (api-ai maps to claude --effort).
+    if effort:
+        payload["effort"] = effort
 
     # Add model as query parameter
     headers = {"X-API-KEY": INTERNAL_API_KEY, "Content-Type": "application/json"}
@@ -211,11 +220,12 @@ async def _call_ai_with_images(
     backend: str,
     claude_model: str = None,
     timeout: float = 120.0,
+    effort: str = None,
 ) -> str:
     """
     Dispatcher: route an image+text safety/vision call to the configured backend.
     Centralises the backend switch so SAFETY_BACKEND / ANALYSIS_BACKEND only
-    need to be checked once.
+    need to be checked once. `effort` (reasoning effort) is passed to claude only.
     """
     b = (backend or "chatgpt").lower()
     if b in ("chatgpt", "codex", "openai"):
@@ -230,6 +240,7 @@ async def _call_ai_with_images(
             image_paths=image_paths,
             model=claude_model,
             timeout=timeout,
+            effort=effort,
         )
     if b == "gemini":
         return await _call_gemini_with_images(
@@ -1234,17 +1245,34 @@ async def _run_vision_analysis_with_paths(
     # See _run_safety_check_with_paths: image+text must use claude (chatgpt/codex
     # CLI 500s on image_paths). All 5 video frames go in ONE call here — claude has
     # a concurrency cap of 1/host, so aggregating avoids 503s (per AiApi 2026-06-13).
-    print(f"🎨 Running vision analysis via {VISION_BACKEND} backend on {len(image_paths)} images")
-    ai_response_str = await _call_ai_with_images(
-        prompt=prompt,
-        image_paths=image_paths,
-        backend=VISION_BACKEND,
-        claude_model=ANALYSIS_MODEL,
-        timeout=240.0,  # 5 frames + heavy prompt (safety+quality+full vision) needs >120s on sonnet
-    )
+    async def _vision_call(effort=None):
+        print(f"🎨 Running vision analysis via {VISION_BACKEND} backend on "
+              f"{len(image_paths)} images (effort={effort or 'default'})")
+        raw = await _call_ai_with_images(
+            prompt=prompt,
+            image_paths=image_paths,
+            backend=VISION_BACKEND,
+            claude_model=ANALYSIS_MODEL,
+            timeout=240.0,  # 5 frames + heavy prompt (safety+quality+full vision) needs >120s on sonnet
+            effort=effort,
+        )
+        cleaned = _clean_json_response(raw)
+        return cleaned, json.loads(cleaned)
 
-    ai_response_str = _clean_json_response(ai_response_str)
-    result = json.loads(ai_response_str)
+    ai_response_str, result = await _vision_call()
+
+    # Smart-routing: a low-confidence safety verdict → re-run ONCE with high reasoning
+    # effort. Keeps average latency low (most videos run standard) and spends the
+    # extra inference only on the genuinely uncertain ones (per AiApi recommendation).
+    _conf = (result.get("safetyCheck") or {}).get("confidence")
+    if (SAFETY_CONFIDENCE_RETRY_THRESHOLD > 0 and _conf is not None
+            and _conf < SAFETY_CONFIDENCE_RETRY_THRESHOLD):
+        print(f"🔁 safety confidence {_conf} < {SAFETY_CONFIDENCE_RETRY_THRESHOLD} "
+              f"→ re-running with effort={HIGH_EFFORT_LEVEL}")
+        try:
+            ai_response_str, result = await _vision_call(effort=HIGH_EFFORT_LEVEL)
+        except Exception as _e:
+            print(f"⚠️ high-effort retry failed ({_e}); keeping initial result")
 
     # Extract all components
     safety_check = result.get("safetyCheck", {})
