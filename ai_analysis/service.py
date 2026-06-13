@@ -1171,11 +1171,15 @@ async def _run_safety_check_with_paths(
     # via BaseStorageTask.autoretry_for. After max_retries, the task's
     # on_failure hook marks ai_safety_status='failed' which the quarantine
     # logic treats as unsafe. Fail-closed throughout.
-    print(f"🛡️ Running safety check via {SAFETY_BACKEND} backend on {len(image_paths)} images")
+    # Image+text analysis MUST go through claude: the chatgpt/codex CLI backend
+    # 500s on image_paths (codex-CLI v0.138 rejects the positional prompt when -i
+    # flags are present — confirmed by AiApi 2026-06-13). claude-CLI reads the
+    # local frame paths natively and is free (subscription). VISION_BACKEND=claude.
+    print(f"🛡️ Running safety check via {VISION_BACKEND} backend on {len(image_paths)} images")
     ai_response_str = await _call_ai_with_images(
         prompt=prompt,
         image_paths=image_paths,
-        backend=SAFETY_BACKEND,
+        backend=VISION_BACKEND,
         claude_model=SAFETY_MODEL,
         timeout=60.0,
     )
@@ -1227,11 +1231,14 @@ async def _run_vision_analysis_with_paths(
     prompt = VISION_ANALYSIS_PROMPT.format(context_info=context_info)
 
     # Let exceptions bubble for Celery autoretry; see _run_safety_check_with_paths.
+    # See _run_safety_check_with_paths: image+text must use claude (chatgpt/codex
+    # CLI 500s on image_paths). All 5 video frames go in ONE call here — claude has
+    # a concurrency cap of 1/host, so aggregating avoids 503s (per AiApi 2026-06-13).
     print(f"🎨 Running vision analysis via {VISION_BACKEND} backend on {len(image_paths)} images")
     ai_response_str = await _call_ai_with_images(
         prompt=prompt,
         image_paths=image_paths,
-        backend=ANALYSIS_BACKEND,
+        backend=VISION_BACKEND,
         claude_model=ANALYSIS_MODEL,
         timeout=120.0,
     )
