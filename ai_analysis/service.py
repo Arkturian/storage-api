@@ -1256,6 +1256,7 @@ async def _run_vision_analysis_with_paths(
     tech_metadata = result.get("technicalMetadata", {})
     media_analysis = result.get("mediaAnalysis", {})
     embedding_info = result.get("embeddingInfo", {})
+    quality_assessment = result.get("qualityAssessment", {})
 
     is_safe = safety_check.get("isSafe")
     if is_safe is None:
@@ -1272,6 +1273,7 @@ async def _run_vision_analysis_with_paths(
             },
             "category": classification.get("category", "unknown"),
             "danger_potential": classification.get("dangerPotential", 1),
+            "quality_assessment": quality_assessment,
             "ai_title": media_analysis.get("suggestedTitle"),
             "ai_subtitle": media_analysis.get("suggestedSubtitle"),
             "ai_tags": media_analysis.get("tags", []),

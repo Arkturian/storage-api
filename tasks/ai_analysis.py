@@ -415,10 +415,17 @@ def process_video_analysis(object_id: int, thumb_dir: str, filename: str) -> Dic
     storage_obj.ai_collections = []  # Not provided in new format
     storage_obj.safety_info = result.get("safety_info")
 
+    # Technical/perceptual quality score (0-100) — same claude call as safety.
+    # Storage only EXPOSES the score; the consuming app decides what to publish.
+    quality = result.get("quality_assessment") or {}
+    if quality.get("qualityScore") is not None:
+        storage_obj.ai_quality_score = quality.get("qualityScore")
+
     # Build ai_context_metadata
     ai_context = {
         "embedding_info": result.get("embedding_info", {}),
         "ai_response": result.get("ai_response", ""),
+        "quality_assessment": quality,  # full breakdown: sharpness/exposure/stability/composition/noise
         "mode": "video",
         "frames_analyzed": len(image_paths)
     }

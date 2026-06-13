@@ -428,6 +428,17 @@ DEINE AUFGABEN - SEHR DETAILLIERT:
    - complexity_score: Komplexität (1-10)
    - uniqueness_score: Einzigartigkeit (1-10)
 
+6. TECHNISCHE QUALITÄTSBEWERTUNG (Quality Assessment) - WICHTIG für User-Generated-Content
+   Bewerte die TECHNISCHE/WAHRNEHMBARE Aufnahmequalität (NICHT den Inhalt, NICHT Produkt-Aspekte).
+   Bei Videos: über ALLE bereitgestellten Frames mitteln. Jeder Wert als Zahl 0-100 (0=unbrauchbar, 100=exzellent):
+   - sharpness: Schärfe / Fokus (verwackelt/unscharf -> niedrig)
+   - exposure: Belichtung (über-/unterbelichtet, ausgebrannte Lichter/abgesoffene Schatten -> niedrig)
+   - stability: Bildstabilität (Wackler / Motion-Blur durch Kamerabewegung -> niedrig)
+   - composition: Bildkomposition / sinnvoller Bildausschnitt
+   - noise: Rauscharmut (viel Bildrauschen/Körnung -> niedrig)
+   - qualityScore: GESAMTSCORE 0-100, gewichtetes Gesamturteil der reinen Aufnahmequalität
+   Plus eine kurze reasoning-Begründung (1 Satz).
+
 WICHTIG:
 - Sei SEHR detailliert und umfassend
 - Schätze Eigenschaften intelligent auch wenn nicht explizit sichtbar
@@ -447,6 +458,15 @@ ANTWORT FORMAT (JSON):
     "dangerPotential": integer (1-10),
     "isProduct": boolean,
     "productType": "string or null"
+  }},
+  "qualityAssessment": {{
+    "qualityScore": integer (0-100),
+    "sharpness": integer (0-100),
+    "exposure": integer (0-100),
+    "stability": integer (0-100),
+    "composition": integer (0-100),
+    "noise": integer (0-100),
+    "reasoning": "string"
   }},
   "productAnalysis": {{
     "brand": "string or null",

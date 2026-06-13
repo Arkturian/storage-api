@@ -95,6 +95,7 @@ class StorageObject(Base):
     # AI Analysis Fields
     ai_category = Column(String, nullable=True)
     ai_danger_potential = Column(Integer, nullable=True)  # e.g., 1-10 scale
+    ai_quality_score = Column(Integer, nullable=True)  # 0-100 technical/perceptual capture quality (breakdown in ai_context_metadata)
 
     # Enhanced AI Metadata Fields (v2.0)
     ai_title = Column(String(500), nullable=True)  # AI-generated title
@@ -178,6 +179,7 @@ class StorageObjectResponse(BaseModel):
     expires_at: Optional[datetime] = None  # TTL: NULL = never expires
     ai_category: Optional[str] = None
     ai_danger_potential: Optional[int] = None
+    ai_quality_score: Optional[int] = None  # 0-100 capture quality (app decides what to publish)
     ai_title: Optional[str] = None
     ai_subtitle: Optional[str] = None
     ai_tags: Optional[List[str]] = None
