@@ -1240,7 +1240,7 @@ async def _run_vision_analysis_with_paths(
         image_paths=image_paths,
         backend=VISION_BACKEND,
         claude_model=ANALYSIS_MODEL,
-        timeout=120.0,
+        timeout=240.0,  # 5 frames + heavy prompt (safety+quality+full vision) needs >120s on sonnet
     )
 
     ai_response_str = _clean_json_response(ai_response_str)
