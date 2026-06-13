@@ -253,6 +253,61 @@ async def _call_ai_with_images(
     )
 
 
+def _demux_and_transcribe_audio(video_path: str, timeout: float = 60.0):
+    """Extract a video's audio track (ffmpeg -vn, local) and transcribe it via
+    api-ai POST /ai/transcribe (Whisper). Returns the transcript text, or None if
+    the video has no audio track or transcription fails — best-effort, never raises.
+    STT runs on api-ai per owner directive; storage only does the local demux.
+    Whisper needs no billing gate; language is auto-detected (field omitted)."""
+    import subprocess, tempfile, os as _os
+    # 1. Is there an audio stream at all? (guests often film silently)
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", video_path],
+            capture_output=True, text=True, timeout=20,
+        )
+        if "audio" not in (probe.stdout or ""):
+            print(f"🔇 No audio track in {video_path} — skipping transcription")
+            return None
+    except Exception as e:
+        print(f"⚠️ ffprobe audio-check failed: {e}")
+        return None
+    # 2. Demux to a mono 16k m4a temp file (small, Whisper-friendly)
+    fd, audio_path = tempfile.mkstemp(suffix=".m4a")
+    _os.close(fd)
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-nostdin", "-i", video_path, "-vn",
+             "-ac", "1", "-ar", "16000", "-c:a", "aac", audio_path],
+            capture_output=True, timeout=60, check=True,
+        )
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+        if not audio_bytes:
+            return None
+        # 3. Transcribe via api-ai (Whisper default, X-API-KEY, no billing gate)
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(
+                f"{API_BASE_URL}/ai/transcribe",
+                headers={"X-API-KEY": INTERNAL_API_KEY},
+                files={"file": ("audio.m4a", audio_bytes, "audio/mp4")},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        text = (data.get("text") or "").strip()
+        print(f"🎙️ Transcribed audio (lang={data.get('language')}, {len(text)} chars)")
+        return text or None
+    except Exception as e:
+        print(f"⚠️ Audio transcription failed: {e}")
+        return None
+    finally:
+        try:
+            _os.remove(audio_path)
+        except Exception:
+            pass
+
+
 def extract_excel_as_text(data: bytes, mime_type: str) -> str:
     """
     Extract text from Excel files (.xlsx, .xls) as CSV-like format.

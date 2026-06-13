@@ -96,6 +96,7 @@ class StorageObject(Base):
     ai_category = Column(String, nullable=True)
     ai_danger_potential = Column(Integer, nullable=True)  # e.g., 1-10 scale
     ai_quality_score = Column(Integer, nullable=True)  # 0-100 technical/perceptual capture quality (breakdown in ai_context_metadata)
+    audio_transcript = Column(Text, nullable=True)  # speech-to-text of the video's audio track (opt-in via transcribe_audio)
 
     # Enhanced AI Metadata Fields (v2.0)
     ai_title = Column(String(500), nullable=True)  # AI-generated title
@@ -180,6 +181,7 @@ class StorageObjectResponse(BaseModel):
     ai_category: Optional[str] = None
     ai_danger_potential: Optional[int] = None
     ai_quality_score: Optional[int] = None  # 0-100 capture quality (app decides what to publish)
+    audio_transcript: Optional[str] = None  # transcript of the video's spoken audio (opt-in)
     ai_title: Optional[str] = None
     ai_subtitle: Optional[str] = None
     ai_tags: Optional[List[str]] = None

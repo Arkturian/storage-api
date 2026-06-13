@@ -60,6 +60,10 @@ async def startup():
                 _conn.execute(_sql_text("ALTER TABLE storage_objects ADD COLUMN ai_quality_score INTEGER"))
                 _conn.commit()
                 print("✅ migration: added storage_objects.ai_quality_score")
+            if "audio_transcript" not in _cols:
+                _conn.execute(_sql_text("ALTER TABLE storage_objects ADD COLUMN audio_transcript TEXT"))
+                _conn.commit()
+                print("✅ migration: added storage_objects.audio_transcript")
             # Performance: index the default /storage/list sort column. Without it
             # ORDER BY created_at DESC on a large table is a full scan + temp-btree
             # sort (~10s on 30k rows) — that was the admin-panel cold-load "warmup".

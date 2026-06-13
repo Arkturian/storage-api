@@ -377,14 +377,40 @@ def process_video_analysis(object_id: int, thumb_dir: str, filename: str) -> Dic
 
     logger.info(f"   📸 Found {len(image_paths)}/5 screenshots, analyzing ALL frames with Claude...")
 
-    # Video analysis using Claude with ALL frame paths (sonnet model for quality)
     from ai_analysis.service import _run_vision_analysis_with_paths, _sanitize_for_prompt
+
+    # --- Optional audio transcription (opt-in via metadata_json.transcribe_audio) ---
+    # Demux the video's audio + transcribe via api-ai, then feed the transcript into
+    # the vision context so the description reflects what was SAID, not just shown.
+    audio_transcript = None
+    try:
+        _db0 = process_video_analysis.get_db_session()
+        try:
+            _obj0 = _db0.query(StorageObject).filter(StorageObject.id == object_id).first()
+            if _obj0 and (_obj0.metadata_json or {}).get("transcribe_audio"):
+                from ai_analysis.service import _demux_and_transcribe_audio
+                from storage.service import generic_storage
+                _vpath = generic_storage.absolute_path_for_key(
+                    _obj0.object_key, _obj0.tenant_id or "arkturian")
+                audio_transcript = _demux_and_transcribe_audio(str(_vpath))
+        finally:
+            _db0.close()
+    except Exception as _e:
+        logger.warning(f"   ⚠️ audio transcription step skipped: {_e}")
+
+    # Video analysis using Claude with ALL frame paths (sonnet model for quality)
     context_info = (
         f"Filename: {_sanitize_for_prompt(filename, label='filename')}\n"
         f"Media type: video\n"
         f"Analyzing {len(image_paths)} sampled frames from video\n"
         f"Check ALL frames for safety - if ANY frame is unsafe, mark as unsafe"
     )
+    if audio_transcript:
+        context_info += (
+            f"\nSpoken audio transcript (incorporate into title/description — this is "
+            f"what the person SAYS in the video): "
+            f"{_sanitize_for_prompt(audio_transcript[:2000], label='transcript')}"
+        )
 
     result = asyncio.run(_run_vision_analysis_with_paths(
         image_paths=image_paths,  # Pass ALL 5 frames!
@@ -420,6 +446,10 @@ def process_video_analysis(object_id: int, thumb_dir: str, filename: str) -> Dic
     quality = result.get("quality_assessment") or {}
     if quality.get("qualityScore") is not None:
         storage_obj.ai_quality_score = quality.get("qualityScore")
+
+    # Persist the spoken-audio transcript (opt-in; None if no audio / not requested)
+    if audio_transcript:
+        storage_obj.audio_transcript = audio_transcript
 
     # Build ai_context_metadata
     ai_context = {

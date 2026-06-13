@@ -1829,6 +1829,7 @@ async def upload_file(
     ai_context_role: Optional[str] = Form(None),  # product|lifestyle|doc|other
     reuse_existing: bool = Form(True),  # Auto-detect duplicate uploads by filename+tenant+owner
     ttl_hours: Optional[int] = Form(None),  # Auto-delete after N hours (None = permanent)
+    transcribe_audio: bool = Form(False),  # Video: demux audio + transcribe via api-ai → audio_transcript (needs an analysis ai_mode)
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
     api_key_header: Optional[str] = Security(_APIKeyHeader(name="X-API-KEY", auto_error=False)),
@@ -2147,6 +2148,17 @@ async def upload_file(
         if not is_temp_hls and not is_mac_hls_result:
             glogger.error(f"📤 TRIGGERING transcoding for storage object {saved_obj.id}")
             from storage.service import enqueue_ai_safety_and_transcoding
+
+            # Opt-in audio transcription: persist the flag so the async video-analysis
+            # task demuxes + transcribes (only fires when an analysis ai_mode runs).
+            if transcribe_audio:
+                _mj = dict(saved_obj.metadata_json or {})
+                _mj["transcribe_audio"] = True
+                saved_obj.metadata_json = _mj
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
 
             # DEFAULT IS NO AI PROCESSING. Callers opt in explicitly per upload —
             # storage is a generic media store; each app (Wanderlaut etc.) requests
