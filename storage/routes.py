@@ -1813,8 +1813,8 @@ async def upload_file(
     owner_email: Optional[str] = Form(None),
     collection_id: Optional[str] = Form(None),
     link_id: Optional[str] = Form(None),  # For linking related files
-    analyze: bool = Form(True),  # Flag for AI analysis - DEFAULT TRUE for comprehensive analysis (LEGACY - use ai_mode)
-    ai_mode: str = Form("safety"),  # AI analysis mode: "none", "safety" (default), "vision", "full"
+    analyze: bool = Form(False),  # LEGACY opt-in flag (prefer ai_mode). DEFAULT FALSE — no AI unless explicitly requested
+    ai_mode: str = Form("none"),  # AI analysis mode. DEFAULT "none" — caller opts in explicitly: "safety", "vision", "full"
     reference_id: Optional[str] = Form(None),  # For Mac transcoding - reference to existing storage object
     hls_result: bool = Form(False),  # Flag to indicate this ZIP contains HLS transcoding result
     skip_ai_safety: bool = Form(False),  # Allow skipping AI safety check (LEGACY - use ai_mode="none")
@@ -2148,17 +2148,20 @@ async def upload_file(
             glogger.error(f"📤 TRIGGERING transcoding for storage object {saved_obj.id}")
             from storage.service import enqueue_ai_safety_and_transcoding
 
-            # Convert legacy analyze/skip_ai_safety to ai_mode
-            # Priority: explicit ai_mode > skip_ai_safety > analyze
+            # DEFAULT IS NO AI PROCESSING. Callers opt in explicitly per upload —
+            # storage is a generic media store; each app (Wanderlaut etc.) requests
+            # exactly the checks it wants. Saves time/cost on the common path.
+            # Opt-in via modern ai_mode ("safety"/"vision"/"full") OR legacy analyze=True.
             effective_ai_mode = ai_mode
-            if ai_mode == "none":
-                # Explicit none - respect it
-                pass
-            elif not analyze:
-                # Legacy: analyze=False means no AI
+            if ai_mode in ("safety", "vision", "full"):
+                pass  # explicit modern opt-in
+            elif analyze:
+                # legacy opt-in (analyze=True, no modern ai_mode) → safety
+                effective_ai_mode = "safety"
+            else:
                 effective_ai_mode = "none"
-            elif skip_ai_safety and ai_mode not in ("safety", "vision", "full"):
-                # Only apply skip_ai_safety if ai_mode wasn't explicitly set
+            if skip_ai_safety and ai_mode not in ("safety", "vision", "full"):
+                # legacy hard skip wins unless a modern ai_mode was explicitly set
                 effective_ai_mode = "none"
 
             await enqueue_ai_safety_and_transcoding(
