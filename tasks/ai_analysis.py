@@ -638,7 +638,10 @@ def generate_embedding(object_id: int) -> Dict[str, Any]:
 
     try:
         pipeline = KnowledgeGraphPipeline()
-        kg_entry = pipeline.process_storage_object(storage_obj, db)
+        # process_storage_object is async — must be awaited via asyncio.run, otherwise
+        # it returns an un-awaited coroutine (truthy) and the body never executes:
+        # no OpenAI embedding, no ChromaDB store, yet status falsely reports "embedded".
+        kg_entry = asyncio.run(pipeline.process_storage_object(storage_obj, db))
 
         if kg_entry:
             logger.info(f"   ✅ Embedding generated and stored in ChromaDB")
