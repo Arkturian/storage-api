@@ -21,6 +21,29 @@ from knowledge_graph.embedding_service import embedding_service
 from knowledge_graph.vector_store import vector_store, get_vector_store, VectorStore
 from ai_analysis.uri_handler import select_best_uri, is_valid_url
 
+import contextlib
+import io
+
+
+@contextlib.contextmanager
+def _kg_debug_log():
+    """Best-effort debug log. Must NEVER crash the embedding pipeline — the
+    hardcoded /tmp path may be owned by another user (e.g. uvicorn=www-data vs
+    the celery worker=root), so a write here previously raised PermissionError
+    and aborted the whole embedding. Falls back to an in-memory sink."""
+    f = None
+    try:
+        f = open("/tmp/kg_pipeline_debug.log", "a")
+    except Exception:
+        f = io.StringIO()
+    try:
+        yield f
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+
 
 class KnowledgeGraphPipeline:
     """
@@ -75,7 +98,7 @@ class KnowledgeGraphPipeline:
         tenant_vector_store = get_vector_store(tenant_id=tenant_id)
         print(f"📊 Using collection: {tenant_vector_store.collection_name}")
 
-        with open("/tmp/kg_pipeline_debug.log", "a") as log:
+        with _kg_debug_log() as log:
             log.write(f"📊 KG Pipeline START for object {storage_obj.id}\n")
             log.write(f"📊 Tenant: {tenant_id}, Collection: {tenant_vector_store.collection_name}\n")
             log.flush()
@@ -96,14 +119,14 @@ class KnowledgeGraphPipeline:
                 primary_embedding_text = embedding_info.get("embeddingText")
                 embedding_quality = embedding_info.get("embeddingQuality", {})
 
-                with open("/tmp/kg_pipeline_debug.log", "a") as log:
+                with _kg_debug_log() as log:
                     log.write(f"  ai_context_metadata EXISTS\n")
                     log.write(f"  embeddings_list: {len(embeddings_list) if embeddings_list else 'None'}\n")
                     log.write(f"  primary_embedding_text: {'Yes' if primary_embedding_text else 'No'}\n")
                     log.write(f"  embedding_quality: {embedding_quality}\n")
                     log.flush()
             else:
-                with open("/tmp/kg_pipeline_debug.log", "a") as log:
+                with _kg_debug_log() as log:
                     log.write(f"  ai_context_metadata is None or empty!\n")
                     log.flush()
 
@@ -113,7 +136,7 @@ class KnowledgeGraphPipeline:
                 issues = embedding_quality.get("issues", [])
                 quality_score = embedding_quality.get("quality_score", 0)
 
-                with open("/tmp/kg_pipeline_debug.log", "a") as log:
+                with _kg_debug_log() as log:
                     log.write(f"  needs_review=True, recommendation={recommendation}\n")
                     log.flush()
 
@@ -125,13 +148,13 @@ class KnowledgeGraphPipeline:
                 # ONLY skip if recommendation is explicitly "skip_embedding"
                 # Otherwise proceed with embedding creation (with warnings logged)
                 if recommendation == "skip_embedding":
-                    with open("/tmp/kg_pipeline_debug.log", "a") as log:
+                    with _kg_debug_log() as log:
                         log.write(f"  RETURNING NONE - skip_embedding\n")
                         log.flush()
                     print(f"❌ KG Pipeline: Skipping embeddings due to skip_embedding recommendation")
                     return None
                 else:
-                    with open("/tmp/kg_pipeline_debug.log", "a") as log:
+                    with _kg_debug_log() as log:
                         log.write(f"  Proceeding despite quality warnings\n")
                         log.flush()
                     print(f"⚙️  KG Pipeline: Proceeding with embeddings despite quality warnings")
@@ -139,7 +162,7 @@ class KnowledgeGraphPipeline:
             # STEP 3: Create embeddings based on AI analysis
             if embeddings_list and len(embeddings_list) > 0:
                 # MULTI-EMBEDDING MODE: AI returned multiple embeddings to create
-                with open("/tmp/kg_pipeline_debug.log", "a") as log:
+                with _kg_debug_log() as log:
                     log.write(f"  Entering MULTI-EMBEDDING mode with {len(embeddings_list)} embeddings\n")
                     log.flush()
 
@@ -148,25 +171,25 @@ class KnowledgeGraphPipeline:
                     storage_obj, embeddings_list, db, tenant_vector_store
                 )
 
-                with open("/tmp/kg_pipeline_debug.log", "a") as log:
+                with _kg_debug_log() as log:
                     log.write(f"  _create_multiple_embeddings returned: {len(embeddings) if embeddings else 'None'}\n")
                     log.flush()
 
                 if not embeddings:
-                    with open("/tmp/kg_pipeline_debug.log", "a") as log:
+                    with _kg_debug_log() as log:
                         log.write(f"  RETURNING NONE - no embeddings created\n")
                         log.flush()
                     print(f"⚠️ KG Pipeline: Failed to create multiple embeddings")
                     return None
 
                 # STEP 3.5: Process image URIs from embeddings metadata
-                with open("/tmp/kg_pipeline_debug.log", "a") as log:
+                with _kg_debug_log() as log:
                     log.write(f"About to call process_image_uris with {len(embeddings_list)} embeddings\n")
                     log.flush()
 
                 created_ids = await self.process_image_uris(storage_obj, embeddings_list, db)
 
-                with open("/tmp/kg_pipeline_debug.log", "a") as log:
+                with _kg_debug_log() as log:
                     log.write(f"process_image_uris returned: {created_ids}\n")
                     log.flush()
 
@@ -358,7 +381,7 @@ class KnowledgeGraphPipeline:
                 print(f"  ✅ Stored embedding {chroma_id}")
 
             except Exception as e:
-                with open("/tmp/kg_pipeline_debug.log", "a") as log:
+                with _kg_debug_log() as log:
                     log.write(f"  ERROR creating embedding {idx}: {e}\n")
                     import traceback as tb
                     tb.print_exc(file=log)
@@ -366,12 +389,12 @@ class KnowledgeGraphPipeline:
                 print(f"❌ KG Pipeline: Failed to create embedding {idx}: {e}")
                 # Continue with other embeddings even if one fails
 
-        with open("/tmp/kg_pipeline_debug.log", "a") as log:
+        with _kg_debug_log() as log:
             log.write(f"  created_embeddings count: {len(created_embeddings)}\n")
             log.flush()
 
         if not created_embeddings:
-            with open("/tmp/kg_pipeline_debug.log", "a") as log:
+            with _kg_debug_log() as log:
                 log.write(f"  RETURNING NONE - no embeddings were successfully created\n")
                 log.flush()
             return None
@@ -487,7 +510,7 @@ class KnowledgeGraphPipeline:
         Returns:
             List of created storage object IDs
         """
-        with open("/tmp/kg_pipeline_debug.log", "a") as log:
+        with _kg_debug_log() as log:
             log.write(f"🖼️  process_image_uris START for object {storage_obj.id}\n")
             log.write(f"   Received {len(embeddings_list)} embeddings\n")
             log.flush()
