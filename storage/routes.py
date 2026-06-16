@@ -4154,6 +4154,7 @@ def list_objects(
     has_hls: Optional[bool] = Query(None, description="Filter to only objects that have HLS transcoded streams (true) or lack them (false)"),
     min_id: Optional[int] = Query(None, description="Only return objects with id >= min_id"),
     max_id: Optional[int] = Query(None, description="Only return objects with id <= max_id"),
+    id: Optional[int] = Query(None, description="Return only the object with this exact id (within the tenant) — exact-id lookup for admin deep-links"),
     sort: Optional[str] = Query(None, description="Sort field: 'created_at' (default), 'id', 'filename', 'file_size'. Prefix with '-' for asc, default desc."),
     offset: int = Query(0, ge=0, description="Pagination offset"),
     limit: int = Query(100, ge=1, le=5000),
@@ -4166,7 +4167,12 @@ def list_objects(
 
     # Filter by tenant_id first for performance
     q = q.filter(StorageObject.tenant_id == tenant_id)
-    
+
+    # Exact-id lookup (admin deep-link / Search-ID): the most specific filter,
+    # returns just that object regardless of pagination/other filters.
+    if id is not None:
+        q = q.filter(StorageObject.id == id)
+
     # Prioritize link_id to fetch all related items regardless of owner
     # Supports multiple link_ids separated by semicolon: "101554;101563"
     # Query for "101554" will match both "101554" and "101554;101563"

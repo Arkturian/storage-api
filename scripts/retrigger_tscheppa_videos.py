@@ -38,6 +38,11 @@ IDS = [
     36411, 36412, 36413, 36414, 36415, 36416, 36417,
 ]
 
+# Allow targeting a subset (e.g. only the failed ones) via env override.
+_override = os.getenv("RETRIGGER_IDS")
+if _override:
+    IDS = [int(x) for x in _override.split(",") if x.strip()]
+
 
 def main():
     db = SessionLocal()
