@@ -2974,12 +2974,20 @@ def _check_quarantine(obj, current_user: Optional[User]) -> None:
             },
         )
 
-    # Public asset with an analysis that hasn't completed (or failed) → block
-    if obj.is_public and obj.ai_safety_status in ("pending", "processing", "failed"):
+    # Public asset whose analysis is still IN PROGRESS → block briefly (race window
+    # between upload and AI completion). NOTE: "failed" is deliberately NOT blocked
+    # here. A `failed` status means the AI safety check could not RUN (backend 503/500,
+    # timeout, concurrency-cap) — a transient *infrastructure* error, NOT a verdict that
+    # the content is unsafe. Blocking public delivery on an infra error conflates
+    # "couldn't check" with "unsafe" and permanently bricks legitimate content on a
+    # passing AI hiccup. A genuine unsafe VERDICT is still caught above
+    # (rating == "unsafe" + danger). Strict callers that need a hard verdict can still
+    # force-block `failed` via metadata_json.requires_safety_verdict (below).
+    if obj.is_public and obj.ai_safety_status in ("pending", "processing"):
         raise HTTPException(
             status_code=451,
             detail={
-                "error": "Content unavailable: AI safety check in progress or failed",
+                "error": "Content unavailable: AI safety check in progress",
                 "ai_safety_status": obj.ai_safety_status,
                 "code": "safety_pending",
             },
