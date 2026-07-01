@@ -168,6 +168,54 @@ async def storage_media_head_headers(request: Request, call_next):
             # for cached GLB variants (X-Transcoded-Size); never report the
             # misleading raw Content-Length for an uncached/parametrized variant.
             qp = request.query_params
+
+            # Audio transcode (?format=mp3|wav|...): report the target audio mime
+            # (and, for a cached derivative, its exact size) so HEAD doesn't lie
+            # with the raw source mime — the audio analogue of the GLB path below.
+            audio_fmt = (qp.get("format") or "").lower()
+            if audio_fmt in storage_routes._AUDIO_FORMAT_SPEC:
+                src_mime = (obj.mime_type or "").lower()
+                if not (src_mime.startswith("audio/") or src_mime.startswith("video/")):
+                    # GET returns 415 for an audio format on a non-audio/video
+                    # object; HEAD advertises the same rather than a bogus 200.
+                    return Response(status_code=415, headers=_apply_cors_for_head({}, request))
+
+                aheaders = {"Content-Disposition": "inline"}
+                # Normalize bitrate exactly as the GET handler does, so the cache
+                # key matches; a malformed bitrate (GET would 400) → treat as unset.
+                raw_br = (qp.get("bitrate") or "").strip().lower()
+                norm_br = raw_br if re.fullmatch(r"\d{2,7}k?", raw_br) else None
+                _sr = qp.get("sample_rate")
+                _ac = qp.get("channels")
+                out_mime = None
+                try:
+                    resolved = storage_routes._audio_cache_path_for(
+                        obj, audio_fmt,
+                        bitrate=norm_br,
+                        sample_rate=int(_sr) if _sr else None,
+                        channels=int(_ac) if _ac else None,
+                    )
+                except Exception:
+                    resolved = None
+                if resolved:
+                    cache_path, out_mime, _ext = resolved
+                    if cache_path.exists():
+                        sz = cache_path.stat().st_size
+                        aheaders["X-Transcoded-Size"] = str(sz)
+                        aheaders["Content-Length"] = str(sz)
+                        aheaders["Accept-Ranges"] = "bytes"
+                        aheaders["X-Transcoding-Status"] = "hit"
+                    else:
+                        aheaders["X-Transcoding-Status"] = "miss"
+                if out_mime:
+                    aheaders["X-Mime-Type"] = out_mime
+                _apply_cors_for_head(aheaders, request)
+                return Response(
+                    status_code=200,
+                    media_type=(out_mime or obj.mime_type or "application/octet-stream"),
+                    headers=aheaders,
+                )
+
             has_glb = any(k in qp for k in _GLB_HEAD_PARAMS)
             has_img = any(k in qp for k in _IMG_HEAD_PARAMS)
             if has_glb or has_img:

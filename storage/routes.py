@@ -95,6 +95,37 @@ def _transcode_audio(src_path, spec, *, bitrate=None, sample_rate=None, channels
     finally:
         _FFMPEG_FRAME_SEM.release()
 
+
+def _audio_cache_path_for(obj, audio_fmt, *, bitrate=None, sample_rate=None, channels=None):
+    """Resolve the cache path + output mime for an audio transcode derivative.
+
+    Single source of truth for the audio cache key, shared by the GET media
+    handler and the HEAD-intercept middleware in main.py — so a HEAD reports
+    the exact file a GET would serve (no "HEAD lies" drift, issue #61 for audio).
+
+    Args:
+        obj: The StorageObject (uses ``id`` and ``tenant_id``).
+        audio_fmt: Requested target format (e.g. ``"mp3"``).
+        bitrate: Normalized bitrate string (lowercased, e.g. ``"192k"``) or None.
+        sample_rate: Output sample rate in Hz or None.
+        channels: Output channel count or None.
+
+    Returns:
+        ``(cache_path, mime_out, ext)`` or ``None`` if ``audio_fmt`` is not a
+        known audio target.
+    """
+    spec = _AUDIO_FORMAT_SPEC.get((audio_fmt or "").lower())
+    if not spec:
+        return None
+    _codec, ext, mime_out, _is_lossy = spec
+    br_key = bitrate or "src"
+    cache_name = (
+        f"aud_{obj.id}_{audio_fmt.lower()}_{br_key}_"
+        f"{sample_rate or 'src'}_{channels or 'src'}.{ext}"
+    )
+    cache_path = generic_storage.webview_dir / (obj.tenant_id or "arkturian") / cache_name
+    return cache_path, mime_out, ext
+
 try:
     import fitz  # type: ignore[import]
 
@@ -3462,12 +3493,10 @@ def get_media_variant(
             if is_audio_src and src_ext == ext and not any([norm_bitrate, sample_rate, channels]):
                 return FileResponse(src_path, media_type=media_type_current, headers=_media_extra_headers)
 
-            br_key = norm_bitrate or "src"
-            cache_name = (
-                f"aud_{object_id}_{audio_fmt}_{br_key}_"
-                f"{sample_rate or 'src'}_{channels or 'src'}.{ext}"
+            cache_path, mime_out, ext = _audio_cache_path_for(
+                obj, audio_fmt,
+                bitrate=norm_bitrate, sample_rate=sample_rate, channels=channels,
             )
-            cache_path = generic_storage.webview_dir / (obj.tenant_id or "arkturian") / cache_name
 
             if cache_path.exists() and not refresh:
                 return FileResponse(cache_path, media_type=mime_out, headers=_media_extra_headers)
