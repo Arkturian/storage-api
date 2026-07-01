@@ -29,6 +29,72 @@ ensure_heif_support()
 _FFMPEG_FRAME_SEM = threading.BoundedSemaphore(int(os.getenv("MEDIA_FFMPEG_CONCURRENCY", "3")))
 _FFMPEG_FRAME_WAIT = float(os.getenv("MEDIA_FFMPEG_WAIT", "45"))
 
+# --- Audio transcode support (ffmpeg-backed, mirrors the video-frame path) ---
+# The media endpoint can re-encode any audio object — or the audio track of a
+# video — to a requested container via ?format=<mp3|m4a|aac|ogg|opus|wav|flac>,
+# analogous to image ?format=jpg and video ?format=jpg frame extraction. Bounded
+# by the same ffmpeg concurrency semaphore as frame extraction and cache-keyed so
+# repeat requests never re-run ffmpeg. Without an audio format param, audio is
+# served raw (backwards compatible). Codec is the only universal knob; optional
+# ?bitrate / ?sample_rate / ?channels tune the output.
+#   format -> (ffmpeg codec, file extension, mime type, is_lossy)
+_AUDIO_FORMAT_SPEC = {
+    "mp3":  ("libmp3lame", "mp3",  "audio/mpeg", True),
+    "m4a":  ("aac",        "m4a",  "audio/mp4",  True),
+    "aac":  ("aac",        "m4a",  "audio/mp4",  True),
+    "ogg":  ("libvorbis",  "ogg",  "audio/ogg",  True),
+    "oga":  ("libvorbis",  "ogg",  "audio/ogg",  True),
+    "opus": ("libopus",    "opus", "audio/opus", True),
+    "wav":  ("pcm_s16le",  "wav",  "audio/wav",  False),
+    "flac": ("flac",       "flac", "audio/flac", False),
+}
+
+
+def _transcode_audio(src_path, spec, *, bitrate=None, sample_rate=None, channels=None, cache_path):
+    """Re-encode audio (or a video's audio track) to the target codec via ffmpeg.
+
+    Bounded by ``_FFMPEG_FRAME_SEM``. Writes the derivative to ``cache_path``.
+
+    Args:
+        src_path: Source media path (audio or video).
+        spec: One value from ``_AUDIO_FORMAT_SPEC`` — (codec, ext, mime, is_lossy).
+        bitrate: Optional target bitrate for lossy codecs, e.g. ``"192k"``.
+        sample_rate: Optional output sample rate in Hz.
+        channels: Optional output channel count (1=mono, 2=stereo).
+        cache_path: Destination ``Path`` for the encoded file.
+
+    Returns:
+        True on success.
+
+    Raises:
+        RuntimeError: Concurrency cap hit (caller may fall back to raw), or the
+            ffmpeg encode failed (caller should surface it — not silent).
+    """
+    codec, _ext, _mime_out, is_lossy = spec
+    acquired = _FFMPEG_FRAME_SEM.acquire(timeout=_FFMPEG_FRAME_WAIT)
+    if not acquired:
+        raise RuntimeError("ffmpeg audio-transcode concurrency limit reached")
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # -vn strips any video stream (so video sources demux to a pure audio file);
+        # -threads 1 keeps a burst from saturating the box (same guard as frames).
+        cmd = ["ffmpeg", "-nostdin", "-threads", "1", "-y", "-i", str(src_path), "-vn", "-c:a", codec]
+        if is_lossy and bitrate:
+            cmd += ["-b:a", bitrate]
+        if sample_rate:
+            cmd += ["-ar", str(sample_rate)]
+        if channels:
+            cmd += ["-ac", str(channels)]
+        cmd.append(str(cache_path))
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        if result.returncode != 0 or not cache_path.exists():
+            cache_path.unlink(missing_ok=True)
+            err = (result.stderr or b"")[-400:].decode("utf-8", "replace")
+            raise RuntimeError(f"ffmpeg audio transcode failed (rc={result.returncode}): {err}")
+        return True
+    finally:
+        _FFMPEG_FRAME_SEM.release()
+
 try:
     import fitz  # type: ignore[import]
 
@@ -3116,8 +3182,11 @@ def get_media_variant(
         None,
         description="Optional canvas aspect ratio (e.g., '1:1' or '16:9') applied via letterboxing without stretching",
     ),
-    format: Optional[str] = Query(None, description="jpg | png | webp"),
+    format: Optional[str] = Query(None, description="Images/video-frame: jpg | png | webp. Audio (or a video's audio track): mp3 | m4a | aac | ogg | opus | wav | flac"),
     quality: Optional[int] = Query(None, ge=1, le=100),
+    bitrate: Optional[str] = Query(None, description="Audio only: target bitrate for lossy formats, e.g. '192k' or '192000' (ignored for wav/flac)"),
+    sample_rate: Optional[int] = Query(None, ge=8000, le=192000, description="Audio only: output sample rate in Hz, e.g. 44100"),
+    channels: Optional[int] = Query(None, ge=1, le=2, description="Audio only: output channels (1=mono, 2=stereo)"),
     trim: Optional[bool] = Query(None, description="Set true to crop using stored trim bounds (if available)"),
     refresh: bool = Query(False, description="When true, clears cached derivatives before rendering"),
     # GLB / 3D model optimization params — forwarded to 3D-API /optimize/glb
@@ -3160,6 +3229,24 @@ def get_media_variant(
 
     media_type_current = (obj.mime_type or "application/octet-stream")
     mime = media_type_current.lower()
+
+    # Audio-format params (?format=mp3|wav|...) only make sense for an audio object
+    # or a video's audio track. Reject early with 415 for anything else — image,
+    # pdf, glb, json — so a nonsensical ?format=mp3 on a picture fails honestly
+    # instead of silently falling through to the image pipeline (which would return
+    # a webp). Images never enter the non-image block below, so this guard must live
+    # here, before the type-specific branches. Positive audio/video handling happens
+    # in the non-image block further down.
+    if (format or "").lower() in _AUDIO_FORMAT_SPEC and not (
+        mime.startswith("audio/") or mime.startswith("video/")
+    ):
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Audio format {format!r} was requested but object {object_id} is "
+                f"{mime!r}, not an audio or video source."
+            ),
+        )
 
     # Build extra headers for downstream consumers (HLS-aware frontends, etc.).
     # CORSMiddleware exposes these via Access-Control-Expose-Headers (see main.py).
@@ -3340,6 +3427,72 @@ def get_media_variant(
         return Response(content=resp.content, media_type=media_type_glb, headers=_media_extra_headers)
 
     if not mime.startswith("image/"):
+        # === AUDIO TRANSCODE ===
+        # ?format=<mp3|m4a|aac|ogg|opus|wav|flac> re-encodes an audio object — or
+        # the audio track of a video — to the requested container via ffmpeg. This
+        # is the audio analogue of image ?format=jpg. Without an audio format param
+        # audio is served raw below (backwards compatible). Image formats (jpg/png/
+        # webp) are NOT in _AUDIO_FORMAT_SPEC, so a video ?format=jpg still routes to
+        # frame extraction — the two never collide.
+        audio_fmt = (format or "").lower()
+        audio_spec = _AUDIO_FORMAT_SPEC.get(audio_fmt)
+        if audio_spec:
+            import re as _re
+
+            # Non-audio/video sources were already rejected (415) upstream, so here
+            # the object is guaranteed to be audio or video.
+            is_audio_src = mime.startswith("audio/")
+
+            # Validate optional encode params. subprocess uses list-args (no shell),
+            # so this is for clean 400s rather than injection defence.
+            norm_bitrate = None
+            if bitrate:
+                norm_bitrate = bitrate.strip().lower()
+                if not _re.fullmatch(r"\d{2,7}k?", norm_bitrate):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="bitrate must look like '192k' or '192000'",
+                    )
+
+            codec, ext, mime_out, is_lossy = audio_spec
+
+            # Short-circuit: source already IS the requested container and no
+            # re-encode knobs supplied → serve raw (no needless ffmpeg pass).
+            src_ext = Path(obj.original_filename or "").suffix.lower().lstrip(".")
+            if is_audio_src and src_ext == ext and not any([norm_bitrate, sample_rate, channels]):
+                return FileResponse(src_path, media_type=media_type_current, headers=_media_extra_headers)
+
+            br_key = norm_bitrate or "src"
+            cache_name = (
+                f"aud_{object_id}_{audio_fmt}_{br_key}_"
+                f"{sample_rate or 'src'}_{channels or 'src'}.{ext}"
+            )
+            cache_path = generic_storage.webview_dir / (obj.tenant_id or "arkturian") / cache_name
+
+            if cache_path.exists() and not refresh:
+                return FileResponse(cache_path, media_type=mime_out, headers=_media_extra_headers)
+            if refresh:
+                cache_path.unlink(missing_ok=True)
+
+            try:
+                _transcode_audio(
+                    src_path,
+                    audio_spec,
+                    bitrate=norm_bitrate,
+                    sample_rate=sample_rate,
+                    channels=channels,
+                    cache_path=cache_path,
+                )
+                return FileResponse(cache_path, media_type=mime_out, headers=_media_extra_headers)
+            except RuntimeError as exc:
+                # Concurrency cap → fall back to raw (like the frame path, OOM guard).
+                # Genuine encode failure → surface 500 so it is never a silent no-op.
+                if "concurrency limit" in str(exc):
+                    print(f"⚠️ Audio transcode concurrency cap for object {object_id}; serving raw")
+                    return FileResponse(src_path, media_type=media_type_current, headers=_media_extra_headers)
+                print(f"⚠️ Audio transcode failed for object {object_id}: {exc}")
+                raise HTTPException(status_code=500, detail=f"Audio transcode failed: {exc}")
+
         # Handle video frame extraction if image format is requested OR variant=thumbnail
         should_extract_frame = mime.startswith("video/") and (
             (format and format.lower() in ["jpg", "jpeg", "png", "webp"]) or
