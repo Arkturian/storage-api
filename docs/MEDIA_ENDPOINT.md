@@ -13,8 +13,11 @@ The media endpoint serves optimized media variants with on-demand transformation
 | `variant` | string | - | `thumbnail` (320px), `medium` (1920px), `full` (original) |
 | `width` | int | - | Custom width in pixels |
 | `height` | int | - | Custom height in pixels |
-| `format` | string | original | `jpg`, `png`, `webp` |
+| `format` | string | original | Images/video-frame: `jpg`, `png`, `webp`. Audio (or a video's audio track): `mp3`, `m4a`, `aac`, `ogg`, `opus`, `wav`, `flac` |
 | `quality` | int | 85 | 1-100 (JPEG/WebP compression quality) |
+| `bitrate` | string | codec default | Audio only: target bitrate for lossy formats, e.g. `192k` or `192000` (ignored for `wav`/`flac`) |
+| `sample_rate` | int | source | Audio only: output sample rate in Hz, e.g. `44100` |
+| `channels` | int | source | Audio only: output channels (`1`=mono, `2`=stereo) |
 | `aspect_ratio` | string | - | e.g., `1:1`, `16:9` (letterboxing without stretch) |
 | `trim` | bool | false | Crop using stored trim bounds |
 | `refresh` | bool | false | Clear cache and regenerate |
@@ -119,6 +122,48 @@ const preview = `/storage/media/${id}?variant=medium&format=jpg`
 
 // WebP for modern browsers
 const webpThumb = `/storage/media/${id}?variant=thumbnail&format=webp&quality=80`
+```
+
+## Audio Handling
+
+### Audio Codec Conversion
+
+The endpoint transcodes audio on the fly — the audio analogue of image `?format=jpg`.
+Request any target container via `?format=`:
+
+```typescript
+// Opus voice note → MP3 (universally playable)
+const mp3 = `/storage/media/${id}?format=mp3`
+
+// → WAV (uncompressed PCM), FLAC (lossless), M4A/AAC, OGG/Vorbis, Opus
+const wav = `/storage/media/${id}?format=wav`
+
+// Tune the lossy output: bitrate, sample rate, channels
+const small = `/storage/media/${id}?format=m4a&bitrate=96k&sample_rate=22050&channels=1`
+```
+
+Supported target formats: `mp3`, `m4a`, `aac`, `ogg`, `opus`, `wav`, `flac`.
+
+### Details
+
+- ffmpeg-backed, bounded by the same concurrency semaphore as video frame extraction.
+- Derivatives are **cache-keyed** by `(id, format, bitrate, sample_rate, channels)`, so
+  repeat requests never re-run ffmpeg.
+- Works on **video sources too**: `?format=mp3` on a video demuxes and encodes its
+  audio track (`-vn`). `?format=jpg` still extracts a frame — the two never collide.
+- **Without** an audio `format` param, audio is served **raw** (backwards compatible).
+- `bitrate`/`sample_rate`/`channels` are ignored for lossless `wav`/`flac`.
+- Requesting an audio `format` on a non-audio/non-video object (image, PDF, GLB)
+  returns **415** rather than a silent wrong response.
+- If the source already **is** the requested container and no re-encode knobs are
+  supplied, the original is served unchanged (no needless transcode pass).
+
+```typescript
+// WRONG - image cannot become audio → 415 Unsupported Media Type
+const bad = `/storage/media/${imageId}?format=mp3`
+
+// CORRECT - audio (or a video's audio track) → MP3
+const good = `/storage/media/${audioId}?format=mp3`
 ```
 
 ## TypeScript/Frontend Usage
