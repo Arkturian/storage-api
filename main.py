@@ -169,6 +169,16 @@ async def storage_media_head_headers(request: Request, call_next):
             # misleading raw Content-Length for an uncached/parametrized variant.
             qp = request.query_params
 
+            # ?download=1 → Content-Disposition: attachment (mirror GET's download
+            # param) so HEAD advertises the same download intent + filename.
+            if (qp.get("download") or "").strip().lower() in ("1", "true", "yes", "on"):
+                from urllib.parse import quote as _quote
+                _dl_raw = os.path.basename(obj.original_filename or f"file_{object_id}")
+                _dl_ascii = re.sub(r"[^A-Za-z0-9._ -]", "_", _dl_raw).strip() or f"file_{object_id}"
+                _dl_cd = f"attachment; filename=\"{_dl_ascii}\"; filename*=UTF-8''{_quote(_dl_raw)}"
+            else:
+                _dl_cd = "inline"
+
             # Audio transcode (?format=mp3|wav|...): report the target audio mime
             # (and, for a cached derivative, its exact size) so HEAD doesn't lie
             # with the raw source mime — the audio analogue of the GLB path below.
@@ -180,7 +190,7 @@ async def storage_media_head_headers(request: Request, call_next):
                     # object; HEAD advertises the same rather than a bogus 200.
                     return Response(status_code=415, headers=_apply_cors_for_head({}, request))
 
-                aheaders = {"Content-Disposition": "inline"}
+                aheaders = {"Content-Disposition": _dl_cd}
                 # Normalize bitrate exactly as the GET handler does, so the cache
                 # key matches; a malformed bitrate (GET would 400) → treat as unset.
                 raw_br = (qp.get("bitrate") or "").strip().lower()
@@ -219,7 +229,7 @@ async def storage_media_head_headers(request: Request, call_next):
             has_glb = any(k in qp for k in _GLB_HEAD_PARAMS)
             has_img = any(k in qp for k in _IMG_HEAD_PARAMS)
             if has_glb or has_img:
-                vheaders = {"Content-Disposition": "inline"}
+                vheaders = {"Content-Disposition": _dl_cd}
                 status = "dynamic"
                 transcoded_size = None
                 out_mime = None
@@ -258,7 +268,7 @@ async def storage_media_head_headers(request: Request, call_next):
                     headers=vheaders,
                 )
 
-            headers = {"Content-Disposition": "inline", "Accept-Ranges": "bytes"}
+            headers = {"Content-Disposition": _dl_cd, "Accept-Ranges": "bytes"}
             if obj.mime_type:
                 headers["X-Mime-Type"] = obj.mime_type
             if obj.transcoding_status:

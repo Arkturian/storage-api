@@ -21,6 +21,7 @@ The media endpoint serves optimized media variants with on-demand transformation
 | `aspect_ratio` | string | - | e.g., `1:1`, `16:9` (letterboxing without stretch) |
 | `trim` | bool | false | Crop using stored trim bounds |
 | `refresh` | bool | false | Clear cache and regenerate |
+| `download` | bool | false | Serve `Content-Disposition: attachment` (browser "Save As" with the real filename) instead of inline render/play. Keyless for public objects. |
 
 ## Variants
 
@@ -123,6 +124,28 @@ const preview = `/storage/media/${id}?variant=medium&format=jpg`
 // WebP for modern browsers
 const webpThumb = `/storage/media/${id}?variant=thumbnail&format=webp&quality=80`
 ```
+
+## Keyless Download / Share Links
+
+`GET /storage/media/{id}` is the canonical **keyless public read** path for any
+object with `is_public=true` (200, no `X-API-KEY`). There is no separate signed /
+expiring / VOD share endpoint — these links are permanent while the object stays
+public. (`GET /storage/files/{id}` is key-gated; do not use it for public links.)
+
+By default the file is served **inline** (the browser plays/renders it). Append
+`?download=1` to force a clean **"Save As" with the original filename**:
+
+```typescript
+// Inline (browser plays the mp3 in its audio player)
+const play = `https://api-storage.arkserver.arkturian.com/storage/media/${id}`
+
+// Download as "Artist - Song.mp3" (Content-Disposition: attachment, keyless)
+const dl = `https://api-storage.arkserver.arkturian.com/storage/media/${id}?download=1`
+```
+
+`download=1` emits both a sanitized `filename=` and an RFC 5987 `filename*=UTF-8''`
+so unicode names survive. It composes with `format` (e.g. `?format=mp3&download=1`
+downloads a converted derivative). HEAD mirrors the attachment disposition.
 
 ## Audio Handling
 

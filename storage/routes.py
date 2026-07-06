@@ -3220,6 +3220,7 @@ def get_media_variant(
     channels: Optional[int] = Query(None, ge=1, le=2, description="Audio only: output channels (1=mono, 2=stereo)"),
     trim: Optional[bool] = Query(None, description="Set true to crop using stored trim bounds (if available)"),
     refresh: bool = Query(False, description="When true, clears cached derivatives before rendering"),
+    download: bool = Query(False, description="When true, serve with Content-Disposition: attachment so the browser downloads the file (named after its original filename) instead of rendering/playing it inline. Keyless for public objects."),
     # GLB / 3D model optimization params — forwarded to 3D-API /optimize/glb
     decimate: Optional[float] = Query(None, ge=0, le=1.0, description="GLB: Blender keep-ratio (fraction of triangles kept). 1.0 = keep all = no decimation (default); 0.5 = keep 50%; 0 = legacy alias for 1.0 (keep all)"),
     texture_format: Optional[str] = Query(None, description="GLB: webp | jpg | png"),
@@ -3281,7 +3282,24 @@ def get_media_variant(
 
     # Build extra headers for downstream consumers (HLS-aware frontends, etc.).
     # CORSMiddleware exposes these via Access-Control-Expose-Headers (see main.py).
-    _media_extra_headers: Dict[str, str] = {"Content-Disposition": "inline"}
+    if download:
+        # Force a browser "Save As" with the object's real filename instead of
+        # inline render/play. Emit both an ASCII-sanitized filename= (legacy
+        # fallback) and an RFC 5987 filename*= (UTF-8) so unicode names like
+        # "Ólafur Arnalds …" survive. Keyless for public objects — the canonical
+        # share/download link is /storage/media/{id}?download=1.
+        import re as _re
+        from urllib.parse import quote as _quote
+        _raw_name = os.path.basename(obj.original_filename or f"file_{object_id}")
+        _ascii_name = _re.sub(r"[^A-Za-z0-9._ -]", "_", _raw_name).strip() or f"file_{object_id}"
+        _disposition = (
+            f"attachment; filename=\"{_ascii_name}\"; "
+            f"filename*=UTF-8''{_quote(_raw_name)}"
+        )
+    else:
+        _disposition = "inline"
+
+    _media_extra_headers: Dict[str, str] = {"Content-Disposition": _disposition}
     if obj.mime_type:
         _media_extra_headers["X-Mime-Type"] = obj.mime_type
     if obj.transcoding_status:
