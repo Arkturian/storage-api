@@ -536,8 +536,10 @@ class SearchResultChunk(BaseModel):
     # Chunk metadata
     metadata: Optional[dict] = None  # row_hash, timestamps, etc.
 
-    # Source file context
-    source_file: StorageObjectResponse
+    # Source file context (omitted by default — see include_source_file on /kg/search;
+    # a search result only needs content+metadata+distance, and the full object is
+    # ~30k chars each which blows response/token budgets for consumers)
+    source_file: Optional[StorageObjectResponse] = None
 
     # Search relevance
     distance: float
@@ -1056,7 +1058,8 @@ async def kg_text_search(
     query: str = Query(..., description="Text to search by"),
     limit: int = Query(10, ge=1, le=50),
     collection_like: Optional[str] = Query(None, description="Optional filter: collection id contains"),
-    mine: bool = True,
+    mine: bool = False,
+    include_source_file: bool = Query(False, description="Include the full source StorageObject per result. Default off = slim response (content+metadata+distance only); the full object is ~30k chars each and blows token budgets. Fetch /objects/{id} if you need it."),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     api_key_header: str = Security(_APIKeyHeader(name="X-API-KEY", auto_error=True)),
@@ -1064,6 +1067,11 @@ async def kg_text_search(
 ):
     """
     Semantic search across assets by text query using the Knowledge Graph vector store.
+
+    Scope default is tenant-wide (`mine=false`) — the vector collection is already
+    tenant-isolated (tenant_{id}_knowledge), so owner-scoping (`mine=true`) is opt-in
+    for "only my own objects". A shared catalog KG must be searchable across the
+    tenant regardless of which key ingested the objects.
 
     Scoping:
     - Admin: global unless mine=true, then owner-only
@@ -1125,6 +1133,7 @@ async def kg_text_search(
             q = q.filter(StorageObject.collection_id.ilike(like))
 
         rows = q.all()
+        allowed_ids = set()
         objects_map = {}
         for so, owner_email in rows:
             # Access control: allow owner, public, or admin
@@ -1133,16 +1142,18 @@ async def kg_text_search(
                     continue
             except Exception:
                 pass
-            # Attach owner_email
-            resp = StorageObjectResponse.from_orm(so)
-            resp.owner_email = owner_email
-            objects_map[so.id] = resp
+            allowed_ids.add(so.id)
+            # Only serialize the (heavy, ~30k-char) full object when explicitly requested.
+            if include_source_file:
+                resp = StorageObjectResponse.from_orm(so)
+                resp.owner_email = owner_email
+                objects_map[so.id] = resp
 
         # Build chunk-level results
         results: List[SearchResultChunk] = []
         for r in vs_results:
             object_id = r["object_id"]
-            if object_id not in objects_map:
+            if object_id not in allowed_ids:
                 continue  # Skip if no access
 
             # Extract chunk data
@@ -1160,7 +1171,7 @@ async def kg_text_search(
                 embedding_type=metadata.get("embedding_type"),
                 embedding_index=metadata.get("embedding_index"),
                 metadata=metadata,
-                source_file=objects_map[object_id],
+                source_file=(objects_map.get(object_id) if include_source_file else None),
                 distance=distance,
                 similarity_score=round(similarity_score, 1)
             )
@@ -1180,7 +1191,7 @@ async def kg_vibe_search(
     query: str = Query(..., description="Vibe/style/mood query (e.g., 'aggressive racing style')"),
     limit: int = Query(10, ge=1, le=50),
     collection_like: Optional[str] = Query(None),
-    mine: bool = True,
+    mine: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     api_key_header: str = Security(_APIKeyHeader(name="X-API-KEY", auto_error=True)),
