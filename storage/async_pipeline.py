@@ -9,6 +9,7 @@ It supports two modes:
 
 import asyncio
 import os
+import gc
 import uuid
 import json
 import traceback
@@ -580,6 +581,18 @@ class AsyncPipelineManager:
 
             error_trace = traceback.format_exc()
             self._log(f"Task {task_id}: Failed with error: {e}\n{error_trace}")
+
+        finally:
+            # Break reference cycles and force their release before the next
+            # object. Each object decodes its full-res original (~120 MB PIL for a
+            # 6336x6336 asset) to produce the downscaled vision variant; PIL images
+            # opened from a BytesIO keep an fp back-ref and exception tracebacks
+            # retain frame locals, so those decodes sit in cycles that the periodic
+            # cyclic GC doesn't collect fast enough under sustained bulk ingest →
+            # uvicorn RSS climbed to ~9 GB and was OOM-killed (2026-07-10). The
+            # concurrency semaphore bounds *peak*; this bounds *cumulative*
+            # retention so RSS stays flat across the whole ingest.
+            gc.collect()
 
     async def _process_fast_mode(
         self,
