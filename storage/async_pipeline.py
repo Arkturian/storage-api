@@ -8,6 +8,7 @@ It supports two modes:
 """
 
 import asyncio
+import os
 import uuid
 import json
 import traceback
@@ -97,6 +98,12 @@ class AsyncPipelineManager:
 
         # Only track running tasks in memory (not persistent)
         self.running_tasks: Dict[str, asyncio.Task] = {}
+        # Bound how many tasks run their heavy image-download + vision + embed work
+        # at once. analyze-async returns immediately after create_task, so a client
+        # cannot throttle server-side concurrency — without this cap a burst of
+        # hundreds of concurrent _process_task OOM-killed uvicorn at ~9 GB RSS (2x
+        # on 2026-07-10). Python 3.10+ asyncio.Semaphore is loop-agnostic at ctor.
+        self._concurrency = asyncio.Semaphore(int(os.getenv("ANALYZE_ASYNC_CONCURRENCY", "3")))
         self._initialized = True
 
         # Log file for debugging
@@ -542,11 +549,15 @@ class AsyncPipelineManager:
             if not storage_obj:
                 raise ValueError(f"Storage object {task_info.object_id} not found")
 
-            # Process based on mode
-            if task_info.mode == AnalysisMode.FAST:
-                result = await self._process_fast_mode(task_info, storage_obj, db)
-            else:
-                result = await self._process_quality_mode(task_info, storage_obj, db)
+            # Process based on mode — gated by the concurrency semaphore so a burst
+            # of created tasks doesn't run their heavy image-download + vision +
+            # embed work all at once (OOM guard, see __init__). Only the heavy work
+            # is gated; task creation / status updates stay non-blocking.
+            async with self._concurrency:
+                if task_info.mode == AnalysisMode.FAST:
+                    result = await self._process_fast_mode(task_info, storage_obj, db)
+                else:
+                    result = await self._process_quality_mode(task_info, storage_obj, db)
 
             # Mark as completed
             task_info.status = TaskStatus.COMPLETED
