@@ -14,6 +14,13 @@ from functools import lru_cache
 import os
 
 
+# Hard cap on how many bytes we pull into RAM for one external ref. A single
+# oversized ref (e.g. a 19 GB ZIP mislabeled as image/jpg in a marketing set)
+# must never OOM the process — reject it instead of loading it. Default 100 MB,
+# far above any real image; raise EXTERNAL_MAX_FETCH_MB if you truly need bigger.
+_MAX_FETCH_BYTES = int(os.getenv("EXTERNAL_MAX_FETCH_MB", "100")) * 1024 * 1024
+
+
 class ExternalProxyCache:
     """
     LRU Cache for external files with size limits.
@@ -232,16 +239,39 @@ async def fetch_external_file(uri: str, use_cache: bool = True) -> Tuple[bytes, 
     print(f"🌐 Fetching external URI: {uri[:80]}...")
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-        response = await client.get(uri)
-        response.raise_for_status()
+        # Stream + size-guard: never pull an oversized ref fully into RAM. Reject
+        # via Content-Length up front, and hard-stop the stream if a server omits
+        # or understates it (2026-07-10: 19 GB ZIPs mislabeled as images OOM-killed
+        # uvicorn). Raises ValueError → the analysis pipeline marks the object
+        # failed instead of crashing the process.
+        async with client.stream("GET", uri) as response:
+            response.raise_for_status()
 
-        data = response.content
-        metadata = {
-            'content-type': response.headers.get('content-type', 'application/octet-stream'),
-            'content-length': str(len(data)),
-            'etag': response.headers.get('etag', ''),
-            'last-modified': response.headers.get('last-modified', ''),
-        }
+            clen = response.headers.get('content-length')
+            if clen and clen.isdigit() and int(clen) > _MAX_FETCH_BYTES:
+                raise ValueError(
+                    f"External file too large ({int(clen)} bytes > {_MAX_FETCH_BYTES}) "
+                    f"— refusing to load into RAM: {uri[:80]}"
+                )
+
+            chunks = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > _MAX_FETCH_BYTES:
+                    raise ValueError(
+                        f"External file exceeded {_MAX_FETCH_BYTES} bytes mid-download "
+                        f"— aborting: {uri[:80]}"
+                    )
+                chunks.append(chunk)
+            data = b"".join(chunks)
+
+            metadata = {
+                'content-type': response.headers.get('content-type', 'application/octet-stream'),
+                'content-length': str(len(data)),
+                'etag': response.headers.get('etag', ''),
+                'last-modified': response.headers.get('last-modified', ''),
+            }
 
         # Cache the result
         if use_cache:

@@ -220,6 +220,29 @@ def _apply_letterbox_aspect_ratio(image: Image.Image, desired_ratio: Optional[fl
     return canvas
 
 
+def _evict_share_proxy_cache(cache_dir: Path) -> None:
+    """Keep /tmp/share_proxy_cache (a RAM-backed tmpfs) bounded: delete oldest
+    entries once total size exceeds the cap. Without this the cache grew to
+    multiple GB of RAM during a bulk ingest (2026-07-10). Best-effort / never
+    raises. Cap via SHARE_PROXY_CACHE_MAX_MB (default 1024)."""
+    try:
+        cap = int(os.getenv("SHARE_PROXY_CACHE_MAX_MB", "1024")) * 1024 * 1024
+        files = [p for p in cache_dir.glob("obj_*") if p.is_file()]
+        files.sort(key=lambda p: p.stat().st_mtime)
+        total = sum(p.stat().st_size for p in files)
+        for p in files:
+            if total <= cap:
+                break
+            try:
+                sz = p.stat().st_size
+                p.unlink(missing_ok=True)
+                total -= sz
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _resolve_storage_object_path(obj: Any, refresh: bool = False) -> Path:
     """
     Resolve file path for a storage object, handling both local and external URIs.
@@ -250,19 +273,43 @@ def _resolve_storage_object_path(obj: Any, refresh: bool = False) -> Path:
             meta_candidate = cache_dir / f"obj_{obj.id}.meta"
             meta_candidate.unlink(missing_ok=True)
 
-        # Download if not cached
+        # Download if not cached — STREAM to the cache file with a hard size guard.
+        # The old client.get().content pulled the whole body into RAM in one shot,
+        # and /tmp/share_proxy_cache is a RAM-backed tmpfs, so a 12 GB ZIP
+        # mislabeled as image/zip ballooned RSS and OOM-killed uvicorn (2026-07-10).
+        # Reject via Content-Length up front, hard-stop the stream if a server
+        # omits it, write straight to disk (no full-body copy in RAM), and keep the
+        # tmpfs cache bounded.
         if not cache_file.exists():
+            _max_bytes = int(os.getenv("EXTERNAL_MAX_FETCH_MB", "100")) * 1024 * 1024
+            _evict_share_proxy_cache(cache_dir)
+            tmp_file = cache_dir / f"obj_{obj.id}.part"
             try:
-                with httpx.Client(timeout=30.0) as client:
-                    response = client.get(obj.external_uri)
-                    if response.status_code == 200:
-                        cache_file.write_bytes(response.content)
+                with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+                    with client.stream("GET", obj.external_uri) as response:
+                        if response.status_code != 200:
+                            raise HTTPException(
+                                status_code=502,
+                                detail=f"Failed to fetch external URI: HTTP {response.status_code}"
+                            )
+                        clen = response.headers.get("content-length")
+                        if clen and clen.isdigit() and int(clen) > _max_bytes:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=f"External file too large ({int(clen)} bytes > {_max_bytes})"
+                            )
+                        total = 0
+                        with open(tmp_file, "wb") as fh:
+                            for chunk in response.iter_bytes():
+                                total += len(chunk)
+                                if total > _max_bytes:
+                                    raise HTTPException(
+                                        status_code=413,
+                                        detail=f"External file exceeded {_max_bytes} bytes"
+                                    )
+                                fh.write(chunk)
+                        tmp_file.replace(cache_file)
                         src_path = cache_file
-                    else:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"Failed to fetch external URI: HTTP {response.status_code}"
-                        )
             except HTTPException:
                 raise
             except Exception as e:
@@ -270,6 +317,11 @@ def _resolve_storage_object_path(obj: Any, refresh: bool = False) -> Path:
                     status_code=502,
                     detail=f"Failed to fetch external URI: {str(e)}"
                 )
+            finally:
+                try:
+                    tmp_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
         else:
             src_path = cache_file
 

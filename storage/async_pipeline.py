@@ -647,6 +647,16 @@ class AsyncPipelineManager:
             if not file_path.exists():
                 raise FileNotFoundError(f"File missing from storage: {file_path}")
 
+            # Size guard: never read a whole oversized file into RAM for analysis
+            # (a 19 GB ZIP mislabeled as an image OOM-killed the process 2026-07-10).
+            _max_bytes = int(os.getenv("ANALYZE_MAX_FILE_MB", "100")) * 1024 * 1024
+            _fsize = file_path.stat().st_size
+            if _fsize > _max_bytes:
+                raise ValueError(
+                    f"File too large for analysis ({_fsize} bytes > {_max_bytes}) "
+                    f"— skipping object {getattr(storage_obj, 'id', '?')}"
+                )
+
             with open(file_path, "rb") as f:
                 data = f.read()
 
@@ -802,6 +812,16 @@ class AsyncPipelineManager:
             file_path = generic_storage.absolute_path_for_key(object_key, tenant_id)
             if not file_path.exists():
                 raise FileNotFoundError(f"File missing from storage: {file_path}")
+
+            # Size guard: never read a whole oversized file into RAM for analysis
+            # (a 19 GB ZIP mislabeled as an image OOM-killed the process 2026-07-10).
+            _max_bytes = int(os.getenv("ANALYZE_MAX_FILE_MB", "100")) * 1024 * 1024
+            _fsize = file_path.stat().st_size
+            if _fsize > _max_bytes:
+                raise ValueError(
+                    f"File too large for analysis ({_fsize} bytes > {_max_bytes}) "
+                    f"— skipping object {getattr(storage_obj, 'id', '?')}"
+                )
 
             with open(file_path, "rb") as f:
                 data = f.read()
