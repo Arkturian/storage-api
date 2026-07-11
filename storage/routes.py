@@ -1,5 +1,5 @@
 from fastapi import BackgroundTasks
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query, Request, Body
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query, Request, Body, Header
 from fastapi.responses import FileResponse
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
@@ -1990,6 +1990,7 @@ async def upload_file(
     reuse_existing: bool = Form(True),  # Auto-detect duplicate uploads by filename+tenant+owner
     ttl_hours: Optional[int] = Form(None),  # Auto-delete after N hours (None = permanent)
     transcribe_audio: bool = Form(False),  # Video: demux audio + transcribe via api-ai → audio_transcript (needs an analysis ai_mode)
+    x_compute_focal: Optional[str] = Header(None),  # Opt-in: "true"/"1" → compute face focal point at upload (images only, AI-cost-free, default off)
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
     api_key_header: Optional[str] = Security(_APIKeyHeader(name="X-API-KEY", auto_error=False)),
@@ -2349,6 +2350,16 @@ async def upload_file(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+    # Opt-in face focal point at upload (X-Compute-Focal: true). AI-cost-free,
+    # images only, and strictly best-effort — a detection failure must never
+    # break the upload itself.
+    if str(x_compute_focal or "").strip().lower() in ("1", "true", "yes") \
+            and (saved_obj.mime_type or "").lower().startswith("image/"):
+        try:
+            _compute_and_store_focal(saved_obj, db, saved_obj.id)
+        except Exception as _focal_exc:  # noqa: BLE001
+            glogger.error(f"⚠️ X-Compute-Focal failed for {saved_obj.id} (upload unaffected): {_focal_exc}")
 
     _resp = StorageObjectResponse.from_orm(saved_obj)
     _hydrate_storage_urls(_resp, saved_obj, request)
@@ -4157,6 +4168,160 @@ def get_media_trim_bounds(
     result["scale_y"] = round(th / h, 4) if h else 1.0
     result["scale"] = round(max(tw / w, th / h), 4) if w and h else 1.0
     return result
+
+
+# ---------------------------------------------------------------------------
+# Face-detection focal point (AI-cost-free, opt-in) — Content-Post #4225.
+#
+# Computes the center of the primary face in an image so downstream consumers
+# (e.g. WebConverter) can set object-position for portrait crops instead of
+# blindly cropping to the middle/top. Runs entirely locally via OpenCV-YuNet
+# (see storage/face_focal.py) — no external AI, no network. Default-off: the
+# focal point is only computed when a caller explicitly asks (lazy GET below,
+# force POST, or the X-Compute-Focal upload header). Once computed it is cached
+# in ai_context_metadata["focal_point"], so site-rebuilds pay zero CPU.
+# ---------------------------------------------------------------------------
+
+def _compute_and_store_focal(obj: Any, db: Session, object_id: int) -> Dict[str, Any]:
+    """Detect faces on the object's image, persist + return the focal result.
+
+    Raises HTTPException with an honest status on decode/model failure.
+    """
+    from storage.face_focal import compute_focal_point, FaceDetectionUnavailable
+
+    src_path = _resolve_storage_object_path(obj)
+    try:
+        result = compute_focal_point(src_path)
+    except FaceDetectionUnavailable as exc:
+        raise HTTPException(status_code=501, detail=f"Face detection unavailable: {exc}")
+    except ValueError as exc:
+        # Empty/corrupt/undecodable file — honest 422 instead of a 500.
+        raise HTTPException(status_code=422, detail=f"Cannot compute focal point: {exc}")
+
+    context_meta = obj.ai_context_metadata or {}
+    if not isinstance(context_meta, dict):
+        context_meta = {}
+    context_meta["focal_point"] = result
+    try:
+        db.query(StorageObject).filter(StorageObject.id == object_id).update(
+            {"ai_context_metadata": context_meta},
+            synchronize_session=False,
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to persist focal point: {exc}")
+    print(f"✅ Computed focal point for object {object_id}: {result.get('focal_point')}")
+    return result
+
+
+def _focal_access_check(object_id: int, db: Session, current_user: Optional[User]) -> Any:
+    """Load an image object for focal ops (public-by-ID like the media endpoint)."""
+    obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Storage object not found")
+    # Same safety gate as the media endpoint (451 if quarantined, owner/admin bypass).
+    _check_quarantine(obj, current_user)
+    mime = (obj.mime_type or "").lower()
+    if not mime.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Focal point is only available for images")
+    return obj
+
+
+@router.get("/media/{object_id}/focal")
+def get_media_focal_point(
+    object_id: int,
+    generate: bool = Query(True, description="Auto-compute focal point if missing (cached after)"),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    tenant_id: Optional[str] = Depends(get_tenant_id_optional),
+) -> Dict[str, Any]:
+    """Get the face-detection focal point for an image.
+
+    Response::
+
+        {
+          "focal_point": {"x_pct": 50.2, "y_pct": 24.7} | null,
+          "faces_detected": 1,
+          "faces": [{"x_pct", "y_pct", "w_pct", "h_pct", "confidence", "is_primary"}],
+          "image_width", "image_height", "model", "computed_at"
+        }
+
+    ``focal_point`` is the center of the primary (largest, center-tiebreak) face,
+    ``x_pct``/``y_pct`` in 0-100. ``null`` when no face is found — consumers then
+    fall back to ``object-position: top``. Computed lazily on first call (unless
+    ``generate=false``) and cached; use POST to force a recompute.
+    """
+    obj = _focal_access_check(object_id, db, current_user)
+
+    context_meta = obj.ai_context_metadata or {}
+    if not isinstance(context_meta, dict):
+        context_meta = {}
+    cached = context_meta.get("focal_point")
+    if isinstance(cached, dict) and cached.get("computed_at"):
+        return cached
+
+    if not generate:
+        raise HTTPException(status_code=404, detail="Focal point not computed yet")
+
+    return _compute_and_store_focal(obj, db, object_id)
+
+
+@router.post("/media/{object_id}/focal")
+def recompute_media_focal_point(
+    object_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    tenant_id: Optional[str] = Depends(get_tenant_id_optional),
+) -> Dict[str, Any]:
+    """Force-recompute the focal point (invalidate cache) and return the fresh result."""
+    obj = _focal_access_check(object_id, db, current_user)
+    return _compute_and_store_focal(obj, db, object_id)
+
+
+@router.get("/batch/focal")
+def get_batch_focal_points(
+    object_ids: List[int] = Query(..., alias="id", description="List of storage object IDs"),
+    generate: bool = Query(False, description="Auto-compute focal point for objects that lack it"),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    tenant_id: Optional[str] = Depends(get_tenant_id_optional),
+) -> Dict[str, Any]:
+    """Batch focal points: map of object_id -> focal result.
+
+    Efficient path for site-builds that iterate over many portraits. With
+    ``generate=false`` (default) only already-cached focal points are returned;
+    missing ones are omitted. With ``generate=true`` missing focal points are
+    computed + cached on the fly. Per-object failures are reported under
+    ``errors`` instead of failing the whole batch.
+
+    Example: ``/storage/media/batch/focal?id=1763&id=3571&generate=true``
+    """
+    result: Dict[str, Any] = {}
+    errors: Dict[str, str] = {}
+    for oid in object_ids:
+        try:
+            obj = _focal_access_check(oid, db, current_user)
+        except HTTPException as exc:
+            errors[str(oid)] = str(exc.detail)
+            continue
+        context_meta = obj.ai_context_metadata or {}
+        if not isinstance(context_meta, dict):
+            context_meta = {}
+        cached = context_meta.get("focal_point")
+        if isinstance(cached, dict) and cached.get("computed_at"):
+            result[str(oid)] = cached
+            continue
+        if not generate:
+            continue
+        try:
+            result[str(oid)] = _compute_and_store_focal(obj, db, oid)
+        except HTTPException as exc:
+            errors[str(oid)] = str(exc.detail)
+    payload: Dict[str, Any] = {"focal_points": result}
+    if errors:
+        payload["errors"] = errors
+    return payload
 
 
 @router.get("/batch/trim-bounds")
