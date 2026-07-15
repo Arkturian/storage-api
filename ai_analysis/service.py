@@ -20,6 +20,7 @@ from ai_analysis.prompts import (
     EMBEDDING_PROMPT,
     CHUNKED_CSV_PROMPT,
     VISION_ANALYSIS_PROMPT,
+    LEAN_VISION_PROMPT,
     build_context_info,
 )
 
@@ -751,7 +752,14 @@ async def _analyze_vision_comprehensive(
         Dict with comprehensive vision analysis and embedding data
     """
     context_info = build_context_info(context)
-    prompt_text = VISION_ANALYSIS_PROMPT.format(context_info=context_info)
+    # VISION_LEAN_MODE (opt-in, default off): swap the token-heavy comprehensive
+    # prompt for the lean description-only prompt. ~14× less output → ~4× faster
+    # under a token/s cap, no usable quality loss (only the catalog-unconsumed
+    # structure is dropped). See LEAN_VISION_PROMPT + Content-Post #3999.
+    _lean = os.getenv("VISION_LEAN_MODE", "0").strip().lower() in ("1", "true", "yes")
+    prompt_text = (LEAN_VISION_PROMPT if _lean else VISION_ANALYSIS_PROMPT).format(context_info=context_info)
+    if _lean:
+        print("🎯 Vision LEAN mode active (VISION_LEAN_MODE=1)", flush=True)
 
     # Deliver the image to the (CLI-based) AI backend as a downscaled HTTPS
     # storage URL embedded in the prompt — the codex/claude CLI fetches it
