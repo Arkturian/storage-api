@@ -203,6 +203,11 @@ async def _call_chatgpt_with_images(
     payload = {
         "prompt": prompt,
         "image_paths": image_paths,
+        # effort=low: codex-Vision-Analyse braucht kein deep-reasoning (AiApi
+        # 2026-07-14 verifiziert: akkurat bei low). Senkt Token-Last/Laufzeit
+        # der schweren comprehensive-Extraktion. Via .env CODEX_VISION_EFFORT
+        # uebersteuerbar (z.B. "medium", falls Qualitaet leidet).
+        "effort": os.getenv("CODEX_VISION_EFFORT", "low"),
     }
     headers = {"X-API-KEY": INTERNAL_API_KEY, "Content-Type": "application/json"}
     url = f"{API_BASE_URL}/ai/chatgpt"
@@ -752,14 +757,10 @@ async def _analyze_vision_comprehensive(
         Dict with comprehensive vision analysis and embedding data
     """
     context_info = build_context_info(context)
-    # VISION_LEAN_MODE (opt-in, default off): swap the token-heavy comprehensive
-    # prompt for the lean description-only prompt. ~14× less output → ~4× faster
-    # under a token/s cap, no usable quality loss (only the catalog-unconsumed
-    # structure is dropped). See LEAN_VISION_PROMPT + Content-Post #3999.
     _lean = os.getenv("VISION_LEAN_MODE", "0").strip().lower() in ("1", "true", "yes")
     prompt_text = (LEAN_VISION_PROMPT if _lean else VISION_ANALYSIS_PROMPT).format(context_info=context_info)
     if _lean:
-        print("🎯 Vision LEAN mode active (VISION_LEAN_MODE=1)", flush=True)
+        print("\U0001F3AF Vision LEAN mode active (VISION_LEAN_MODE=1)", flush=True)
 
     # Deliver the image to the (CLI-based) AI backend as a downscaled HTTPS
     # storage URL embedded in the prompt — the codex/claude CLI fetches it

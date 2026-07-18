@@ -564,17 +564,6 @@ ANTWORT FORMAT (JSON):
 
 
 # LEAN VISION MODE: description-only, opt-in via VISION_LEAN_MODE=1.
-#
-# The comprehensive VISION_ANALYSIS_PROMPT above emits a huge structured JSON
-# (productAnalysis, visualAnalysis, layoutIntelligence, technicalMetadata,
-# annotations, …) that the O'Neal catalog does NOT consume — it only uses the
-# embedding vector + the description text (code-verified by OnealServ-clone,
-# Content-Post #3999). Under a ChatGPT-Pro token/s throttle that unread output
-# is the throughput bottleneck. This lean prompt keeps the rich, fully-searchable
-# `embeddingText` (drives the embedding) and drops everything unconsumed →
-# ~14× less output, ~4× faster per call, more robust on large assets, with no
-# usable quality loss (A/B verified on real O'Neal assets, #3999). Default OFF;
-# the pipeline picks it only when VISION_LEAN_MODE is truthy.
 LEAN_VISION_PROMPT = """
 Analysiere dieses Bild und erzeuge eine REICHE, suchbare Beschreibung für semantische Suche + Katalog-Anzeige.
 
@@ -585,29 +574,10 @@ Nutze alle bereitgestellten Kontextinformationen. Erzeuge einen dichten deutsche
 
 ANTWORT FORMAT (NUR dieses JSON, keine Markdown-Fences, keine Erklärungen):
 {{
-  "safetyCheck": {{
-    "isSafe": boolean,
-    "confidence": number (0.0-1.0),
-    "reasoning": "string (1 Satz)",
-    "flags": []
-  }},
-  "classification": {{
-    "category": "product|person|event|landscape|art|document|other",
-    "dangerPotential": integer (1-10)
-  }},
-  "mediaAnalysis": {{
-    "suggestedTitle": "string (max 60 Zeichen)",
-    "tags": ["tag1", "tag2", "tag3"]
-  }},
-  "embeddingInfo": {{
-    "embeddingText": "reiche, suchbare Beschreibung mit allen relevanten Begriffen",
-    "embeddingQuality": {{
-      "quality_score": integer (1-10),
-      "needs_review": false,
-      "issues": [],
-      "recommendation": "auto_embed"
-    }}
-  }}
+  "safetyCheck": {{"isSafe": boolean, "confidence": number (0.0-1.0), "reasoning": "string (1 Satz)", "flags": []}},
+  "classification": {{"category": "product|person|event|landscape|art|document|other", "dangerPotential": integer (1-10)}},
+  "mediaAnalysis": {{"suggestedTitle": "string (max 60 Zeichen)", "tags": ["tag1", "tag2", "tag3"]}},
+  "embeddingInfo": {{"embeddingText": "reiche, suchbare Beschreibung mit allen relevanten Begriffen", "embeddingQuality": {{"quality_score": integer (1-10), "needs_review": false, "issues": [], "recommendation": "auto_embed"}}}}
 }}
 """
 
