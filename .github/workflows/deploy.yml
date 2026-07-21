@@ -65,12 +65,13 @@ jobs:
   # ============================================================================
   deploy-arkturian:
     name: Deploy to arkturian.com
+    # DISABLED 2026-07-21: storage consolidated onto arkserver (Phase 1-3).
+    # The VPS runs only an nginx reverse-proxy for api-storage.arkturian.com /
+    # vod.arkturian.com; its storage services are masked. Deploying/restarting
+    # here would resurrect the frozen pre-merge instance. Set false -> true only
+    # if the VPS ever becomes a storage host again.
+    if: ${{ false }}
     needs: test
-    if: |
-      vars.ENABLE_ARKTURIAN_DEPLOY == 'true' &&
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      (github.event_name != 'workflow_dispatch' || inputs.deploy_arkturian)
     runs-on: ubuntu-latest
     environment:
       name: production
