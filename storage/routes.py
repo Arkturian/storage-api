@@ -5808,6 +5808,14 @@ async def update_embedding_text(
 
     db.commit()
 
+    # Snapshot plain values for the background task: after db.commit() +
+    # request teardown the ORM instance is expired/detached, so attribute
+    # access inside the task would raise DetachedInstanceError.
+    _obj_id = obj.id
+    _obj_title = obj.title
+    _obj_category = obj.ai_category
+    _obj_tags = obj.ai_tags or []
+
     # Regenerate embedding in background
     async def regenerate_embedding_task():
         """Background task to regenerate embedding in tenant-specific collection."""
@@ -5820,24 +5828,27 @@ async def update_embedding_text(
 
             # Create EmbeddingVector model
             embedding = EmbeddingVector(
-                storage_object_id=obj.id,
+                object_id=_obj_id,
                 vector=vector,
                 embedding_text=new_text,
                 metadata={
-                    "object_id": obj.id,
+                    "object_id": _obj_id,
                     "tenant_id": tenant_id,
-                    "title": obj.title,
-                    "ai_category": obj.ai_category,
-                    "ai_tags": obj.ai_tags or []
+                    "title": _obj_title,
+                    "ai_category": _obj_category,
+                    "ai_tags": _obj_tags
                 }
             )
 
             # Upsert into tenant-specific Chroma collection
             tenant_vector_store.upsert_embedding(embedding)
-            
-            print(f"✅ [Embedding Update] Object {obj.id}: Updated {len(vector)}-dim vector in Knowledge Graph")
+
+            # flush=True: gunicorn buffers stdout — without it, background-task
+            # outcomes (incl. the ❌ path) never surface in the journal, which is
+            # how the storage_object_id TypeError stayed invisible for months.
+            print(f"✅ [Embedding Update] Object {_obj_id}: Updated {len(vector)}-dim vector in Knowledge Graph", flush=True)
         except Exception as e:
-            print(f"❌ [Embedding Update] Object {obj.id}: Failed to regenerate - {e}")
+            print(f"❌ [Embedding Update] Object {_obj_id}: Failed to regenerate - {e}", flush=True)
             import traceback
             traceback.print_exc()
     
