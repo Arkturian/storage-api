@@ -3497,6 +3497,12 @@ def get_media_variant(
         media_type_glb = "application/zip" if glb_output == "zip" else "model/gltf-binary"
 
         if glb_cache_path.exists():
+            # Derivative is content-addressed server-side (checksum+pipeline+params)
+            # but the URL itself is NOT immutable (source may be replaced), so a
+            # moderate max-age + the existing ETag revalidation is the safe cache
+            # contract for browsers/CDNs (requested by CHAP2/Alex for the 67
+            # pre-warmed Flora/Fauna GLBs, 2026-07-22).
+            _media_extra_headers["Cache-Control"] = "public, max-age=86400"
             return FileResponse(glb_cache_path, media_type=media_type_glb, headers=_media_extra_headers)
 
         # Forward to 3D-API via multipart upload (portable across storage instances).
@@ -3547,6 +3553,7 @@ def get_media_variant(
         except Exception:
             pass  # Best-effort cache write — still serve the response
 
+        _media_extra_headers["Cache-Control"] = "public, max-age=86400"
         return Response(content=resp.content, media_type=media_type_glb, headers=_media_extra_headers)
 
     if not mime.startswith("image/"):
