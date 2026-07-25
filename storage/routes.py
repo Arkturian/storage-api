@@ -3173,12 +3173,24 @@ def _check_quarantine(obj, current_user: Optional[User]) -> None:
     if isinstance(md, dict):
         requires_verdict = bool(md.get("requires_safety_verdict"))
     if requires_verdict and obj.ai_safety_status != "completed":
+        # "failed" is TERMINAL (retries exhausted, on_failure hook fired) —
+        # give it a distinct code so pollers can stop waiting and surface the
+        # error to the user instead of letting a TTL silently reap the asset
+        # (guide-api photo-submission incident 2026-07-23: failed looked like
+        # pending, submissions hung until the 1h TTL deleted the photos).
+        _is_terminal_failure = obj.ai_safety_status == "failed"
         raise HTTPException(
             status_code=451,
             detail={
-                "error": "Content unavailable: safety verdict required before public delivery",
+                "error": (
+                    "Content unavailable: safety check failed permanently"
+                    if _is_terminal_failure
+                    else "Content unavailable: safety verdict required before public delivery"
+                ),
                 "ai_safety_status": obj.ai_safety_status or "missing",
-                "code": "safety_required",
+                "ai_safety_error": (getattr(obj, "ai_safety_error", None) or None) if _is_terminal_failure else None,
+                "code": "safety_failed" if _is_terminal_failure else "safety_required",
+                "terminal": _is_terminal_failure,
             },
         )
 
