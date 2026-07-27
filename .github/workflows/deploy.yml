@@ -197,16 +197,21 @@ jobs:
             fi
             git fetch origin && git checkout main && git reset --hard origin/main
 
-            # Python venv (use --without-pip to avoid ensurepip issues on some systems)
-            rm -rf venv
-            if [ -f ~/.pyenv/versions/3.11.9/bin/python3.11 ]; then
-              ~/.pyenv/versions/3.11.9/bin/python3.11 -m venv venv --without-pip
+            # Python venv — REUSE existing venv; full rebuild only when missing/broken.
+            # (The old rm -rf + get-pip + full pip install on every deploy took up
+            # to 2h on a loaded box for a one-line code change.)
+            if [ ! -x venv/bin/python ]; then
+              rm -rf venv
+              if [ -f ~/.pyenv/versions/3.11.9/bin/python3.11 ]; then
+                ~/.pyenv/versions/3.11.9/bin/python3.11 -m venv venv --without-pip
+              else
+                python3 -m venv venv --without-pip
+              fi
+              source venv/bin/activate
+              curl -sS https://bootstrap.pypa.io/get-pip.py | python3
             else
-              python3 -m venv venv --without-pip
+              source venv/bin/activate
             fi
-            source venv/bin/activate
-            curl -sS https://bootstrap.pypa.io/get-pip.py | python3
-            pip install --upgrade pip
 
             # mac-transcoding-api dependency
             mkdir -p /var/code
@@ -217,7 +222,19 @@ jobs:
             fi
             sed -i 's|git+https://github.com/apopovic77/mac-transcoding-api.git@[a-z]*|/var/code/mac-transcoding-api|g' requirements.txt
 
-            pip install --no-cache-dir -r requirements.txt
+            # Install deps only when requirements.txt (post-sed) or the
+            # mac-transcoding-api checkout actually changed — code-only deploys
+            # skip pip entirely.
+            MAC_SHA=$(git -C /var/code/mac-transcoding-api rev-parse HEAD 2>/dev/null || echo none)
+            REQ_HASH="$(sha256sum requirements.txt | cut -d' ' -f1)-$MAC_SHA"
+            STAMP_FILE=venv/.deps-stamp
+            if [ "$(cat "$STAMP_FILE" 2>/dev/null || true)" != "$REQ_HASH" ]; then
+              pip install --upgrade pip
+              pip install -r requirements.txt
+              echo "$REQ_HASH" > "$STAMP_FILE"
+            else
+              echo "Dependencies unchanged ($REQ_HASH) — skipping pip install"
+            fi
 
             # Fix chroma_db permissions - both www-data (storage-api) and root (celery) need access
             mkdir -p "$TARGET_DIR/chroma_db"
