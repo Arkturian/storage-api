@@ -7,6 +7,7 @@ from sqlalchemy import func, or_
 from typing import Optional, List, Any, Dict, Tuple
 import json
 import os
+import re
 import shutil
 import hashlib
 import base64
@@ -179,10 +180,83 @@ def _parse_aspect_ratio_value(raw_value: Optional[str]) -> Optional[float]:
     return numerator / denominator
 
 
-def _apply_letterbox_aspect_ratio(image: Image.Image, desired_ratio: Optional[float], target_format: str) -> Image.Image:
+def _parse_bg_color_value(raw_value: Optional[str]) -> Optional[tuple]:
+    """Parse a hex background color ('fff', 'ffffff', '#f0f0f0', 'ffffff80'
+    with alpha) into an RGBA tuple. Returns None when no color was given."""
+    if raw_value is None:
+        return None
+    value = raw_value.strip().lstrip("#").lower()
+    if not value:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8}", value):
+        raise ValueError("expected bg_color as hex, e.g. 'ffffff', '#f0f0f0' or 'ffffff80' (with alpha)")
+    if len(value) in (3, 4):
+        value = "".join(ch * 2 for ch in value)
+    r, g, b = int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+    a = int(value[6:8], 16) if len(value) == 8 else 255
+    return (r, g, b, a)
+
+
+def _parse_margin_value(raw_value: Optional[str]) -> Optional[tuple]:
+    """Parse the margin query param: plain pixels ('32') or percent ('10%',
+    relative to the longer image edge). Returns ('px'|'pct', number) or None."""
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    if not value:
+        return None
+    try:
+        if value.endswith("%"):
+            pct = float(value[:-1])
+            if not (0 < pct <= 100):
+                raise ValueError
+            return ("pct", pct)
+        px = int(value)
+        if not (0 < px <= 4096):
+            raise ValueError
+        return ("px", px)
+    except ValueError as exc:
+        raise ValueError("expected margin as pixels ('32', max 4096) or percent ('10%', max 100%)") from exc
+
+
+def _bg_fill_for_format(target_format: str, bg_rgba: Optional[tuple]) -> tuple:
+    """Resolve the canvas fill: explicit bg_color wins; default stays the
+    historical behavior (transparent for alpha formats, white for JPEG)."""
+    supports_alpha = target_format not in {"jpg", "jpeg"}
+    if bg_rgba is not None:
+        return bg_rgba if supports_alpha else bg_rgba[:3]
+    return (255, 255, 255, 0) if supports_alpha else (255, 255, 255)
+
+
+def _apply_margin(image: Image.Image, margin_spec: Optional[tuple], target_format: str, bg_rgba: Optional[tuple]) -> Image.Image:
+    """Grow the canvas by a uniform margin around the image ('Arbeitsfläche
+    vergrößern'), filled with bg_color (default: transparent/white like the
+    letterbox). Percent margins are relative to the longer edge."""
+    if not margin_spec:
+        return image
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return image
+    kind, amount = margin_spec
+    margin_px = int(round(max(width, height) * amount / 100.0)) if kind == "pct" else int(amount)
+    if margin_px <= 0:
+        return image
+
+    supports_alpha = target_format not in {"jpg", "jpeg"}
+    canvas_mode = "RGBA" if supports_alpha else "RGB"
+    canvas = Image.new(canvas_mode, (width + 2 * margin_px, height + 2 * margin_px), _bg_fill_for_format(target_format, bg_rgba))
+    paste_img = image if image.mode == canvas_mode else image.convert(canvas_mode)
+    if supports_alpha and paste_img.mode in {"RGBA", "LA"}:
+        canvas.paste(paste_img, (margin_px, margin_px), paste_img)
+    else:
+        canvas.paste(paste_img, (margin_px, margin_px))
+    return canvas
+
+
+def _apply_letterbox_aspect_ratio(image: Image.Image, desired_ratio: Optional[float], target_format: str, bg_rgba: Optional[tuple] = None) -> Image.Image:
     """
-    Pad an image with transparent (PNG/WebP) or white (JPEG) background
-    to achieve the requested aspect ratio without stretching.
+    Pad an image to the requested aspect ratio without stretching. Fill is
+    bg_rgba when given, else transparent (PNG/WebP) or white (JPEG).
     """
     if not desired_ratio:
         return image
@@ -204,7 +278,7 @@ def _apply_letterbox_aspect_ratio(image: Image.Image, desired_ratio: Optional[fl
 
     supports_alpha = target_format not in {"jpg", "jpeg"}
     canvas_mode = "RGBA" if supports_alpha else "RGB"
-    background_color = (255, 255, 255, 0) if supports_alpha else (255, 255, 255)
+    background_color = _bg_fill_for_format(target_format, bg_rgba)
     canvas = Image.new(canvas_mode, (final_width, final_height), background_color)
 
     paste_img = image
@@ -3305,6 +3379,8 @@ def get_media_variant(
     sample_rate: Optional[int] = Query(None, ge=8000, le=192000, description="Audio only: output sample rate in Hz, e.g. 44100"),
     channels: Optional[int] = Query(None, ge=1, le=2, description="Audio only: output channels (1=mono, 2=stereo)"),
     trim: Optional[bool] = Query(None, description="Set true to crop using stored trim bounds (if available)"),
+    margin: Optional[str] = Query(None, description="Images: grow the canvas by a uniform margin around the image — pixels ('32') or percent of the longer edge ('10%'). Fill via bg_color; applied before aspect_ratio letterboxing"),
+    bg_color: Optional[str] = Query(None, description="Images: hex fill color for margin + aspect_ratio padding, e.g. 'ffffff', '#f0f0f0', 'ffffff80' (with alpha). Default: transparent (png/webp) or white (jpg)"),
     refresh: bool = Query(False, description="When true, clears cached derivatives before rendering"),
     download: bool = Query(False, description="When true, serve with Content-Disposition: attachment so the browser downloads the file (named after its original filename) instead of rendering/playing it inline. Keyless for public objects."),
     # GLB / 3D model optimization params — forwarded to 3D-API /optimize/glb
@@ -3335,6 +3411,14 @@ def get_media_variant(
         target_aspect_ratio_value = _parse_aspect_ratio_value(aspect_ratio)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid aspect_ratio: {exc}") from exc
+    try:
+        margin_spec_value = _parse_margin_value(margin)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid margin: {exc}") from exc
+    try:
+        bg_rgba_value = _parse_bg_color_value(bg_color)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid bg_color: {exc}") from exc
 
     # Public endpoint - allow access to any storage object by globally unique ID
     obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
@@ -3833,7 +3917,8 @@ def get_media_variant(
                     img = img.convert('RGBA')
                 img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
-            img = _apply_letterbox_aspect_ratio(img, target_aspect_ratio, target_format_value)
+            img = _apply_margin(img, margin_spec_value, target_format_value, bg_rgba_value)
+            img = _apply_letterbox_aspect_ratio(img, target_aspect_ratio, target_format_value, bg_rgba_value)
 
             save_format = {
                 "jpg": "JPEG",
@@ -3946,7 +4031,10 @@ def get_media_variant(
         # Pre-generated thumbnails are deprecated - all thumbnails are now dynamic
         max_edge = 320  # Default thumbnail width (increased from 300 to match video frame extraction)
     elif variant == "full":
-        if not apply_trim:
+        # margin/bg_color need the derivative pipeline too — full + margin
+        # means "original size, canvas grown by margin" (no resize below
+        # because max_edge stays None).
+        if not apply_trim and not margin_spec_value:
             return _serve_oriented_original(src_path)
         max_edge = None
     else:
@@ -3970,7 +4058,13 @@ def get_media_variant(
         f"_ar{int(round(target_aspect_ratio_value * 1000))}" if target_aspect_ratio_value else ""
     )
     trim_token = "_trim" if apply_trim else ""
-    dest_name = f"web_{base_name}_{max_edge}e{aspect_ratio_token}{trim_token}_q{q}.{suffix}"
+    margin_token = ""
+    if margin_spec_value:
+        _mk, _mv = margin_spec_value
+        margin_token = f"_m{'p' if _mk == 'pct' else ''}{int(_mv)}"
+    if bg_rgba_value:
+        margin_token += f"_bg{''.join(f'{c:02x}' for c in bg_rgba_value)}"
+    dest_name = f"web_{base_name}_{max_edge}e{aspect_ratio_token}{trim_token}{margin_token}_q{q}.{suffix}"
     # Webview derivatives are now stored in tenant subdirectories
     dest_path = generic_storage.webview_dir / obj.tenant_id / dest_name
 
@@ -4044,7 +4138,8 @@ def get_media_variant(
 
             out = img.convert("RGB") if img.mode in ("RGBA", "LA", "P") and target_format in {"jpg", "jpeg"} else img.copy()
             out = out.resize((target_w, target_h), Image.Resampling.LANCZOS)
-            out = _apply_letterbox_aspect_ratio(out, target_aspect_ratio_value, target_format)
+            out = _apply_margin(out, margin_spec_value, target_format, bg_rgba_value)
+            out = _apply_letterbox_aspect_ratio(out, target_aspect_ratio_value, target_format, bg_rgba_value)
             save_kwargs = {}
             if target_format in {"jpg", "jpeg"}:
                 save_kwargs = {"quality": q, "optimize": True}
