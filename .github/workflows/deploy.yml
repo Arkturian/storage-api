@@ -148,8 +148,14 @@ jobs:
 
             systemctl restart storage-api.service
             systemctl restart celery-worker.service || true
-            sleep 3
-            curl -fsS --max-time 10 http://127.0.0.1:8080/health
+            # Cold start (ChromaDB load) can exceed a fixed sleep — retry up to 90s
+            for i in $(seq 1 18); do
+              if curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null 2>&1; then
+                echo "health OK after ~$((i*5))s"; exit 0
+              fi
+              sleep 5
+            done
+            echo "health check failed after 90s"; exit 1
 
   # ============================================================================
   # STAGING: arkserver.arkturian.com (api-storage.arkserver.arkturian.com)
@@ -260,8 +266,14 @@ jobs:
 
             systemctl restart storage-api.service
             systemctl restart celery-worker.service || true
-            sleep 3
-            curl -fsS --max-time 10 http://127.0.0.1:8080/health
+            # Cold start (ChromaDB load) can exceed a fixed sleep — retry up to 90s
+            for i in $(seq 1 18); do
+              if curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null 2>&1; then
+                echo "health OK after ~$((i*5))s"; exit 0
+              fi
+              sleep 5
+            done
+            echo "health check failed after 90s"; exit 1
 
   # ============================================================================
   # O'NEAL: aiserver.oneal.eu (via arkturian.com jump host)
