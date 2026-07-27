@@ -3200,6 +3200,19 @@ def _check_quarantine(obj, current_user: Optional[User]) -> None:
     # query the DB directly and don't go through this gate.
     if getattr(obj, "tombstoned_at", None) is not None:
         raise HTTPException(status_code=404, detail={"error": "asset not found", "code": "tombstoned"})
+    # Per-object opt-in privacy (Issue #420): metadata_json.private_media=true
+    # closes the public-by-ID hole for genuinely confidential uploads without
+    # changing the default contract the public frontends rely on. Only the
+    # owner or an admin may fetch such an object via the media endpoints.
+    _md_priv = getattr(obj, "metadata_json", None)
+    if isinstance(_md_priv, dict) and _md_priv.get("private_media"):
+        _is_admin = current_user is not None and getattr(current_user, "trust_level", None) == "admin"
+        _is_owner = current_user is not None and getattr(obj, "owner_user_id", None) == current_user.id
+        if not (_is_admin or _is_owner):
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "This object is private", "code": "private_media"},
+            )
     # Owner / admin bypass
     if current_user is not None:
         if getattr(current_user, "trust_level", None) == "admin":

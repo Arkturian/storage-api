@@ -153,6 +153,12 @@ async def storage_media_head_headers(request: Request, call_next):
             # gets the public-only quarantine policy. Owner/admin clients
             # can still GET (auth via X-API-KEY in the route handler) and
             # will see the actual file.
+            # Per-object opt-in privacy (Issue #420) — middleware has no
+            # current_user, so HEAD on a private_media object is always 403.
+            _md_priv = obj.metadata_json if isinstance(obj.metadata_json, dict) else {}
+            if _md_priv.get("private_media"):
+                return Response(status_code=403, headers=_apply_cors_for_head({}, request))
+
             danger = obj.ai_danger_potential or 0
             threshold = int(os.getenv("QUARANTINE_DANGER_THRESHOLD", "7"))
             is_unsafe_blocked = (obj.ai_safety_rating == "unsafe" and danger >= threshold)
