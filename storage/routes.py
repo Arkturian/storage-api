@@ -2063,6 +2063,7 @@ async def upload_file(
     ai_context_role: Optional[str] = Form(None),  # product|lifestyle|doc|other
     reuse_existing: bool = Form(True),  # Auto-detect duplicate uploads by filename+tenant+owner
     ttl_hours: Optional[int] = Form(None),  # Auto-delete after N hours (None = permanent)
+    private: bool = Form(False),  # Issue #420: set metadata_json.private_media → /storage/media serves this object only to owner/admin (403 for everyone else). Set AT UPLOAD to avoid the window where a confidential file is enumerable before a follow-up PATCH lands.
     transcribe_audio: bool = Form(False),  # Video: demux audio + transcribe via api-ai → audio_transcript (needs an analysis ai_mode)
     x_compute_focal: Optional[str] = Header(None),  # Opt-in: "true"/"1" → compute face focal point at upload (images only, AI-cost-free, default off)
     db: Session = Depends(get_db),
@@ -2369,6 +2370,18 @@ async def upload_file(
                     db.refresh(saved_obj)
             except Exception:
                 pass
+
+            # Issue #420: confidential upload → gate the media endpoint from the
+            # very first request, no PATCH race window.
+            if private:
+                _mj_priv = dict(saved_obj.metadata_json or {})
+                _mj_priv["private_media"] = True
+                saved_obj.metadata_json = _mj_priv
+                try:
+                    db.commit()
+                    db.refresh(saved_obj)
+                except Exception:
+                    db.rollback()
 
         # --- AI Analysis handled by async worker system (check_safety_ai.py) ---
         # The async worker will perform comprehensive analysis with unified Gemini prompt
