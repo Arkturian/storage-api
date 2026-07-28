@@ -61,6 +61,17 @@ class User(Base):
 
 class StorageObject(Base):
     __tablename__ = "storage_objects"
+    # /storage/list filters tenant + (collection_id | owner | context) with an
+    # ORDER BY created_at DESC LIMIT — without these composites SQLite walks the
+    # created_at index over the WHOLE table (42k rows) whenever a collection has
+    # fewer rows than the limit, which under host load turned into 40s hangs
+    # (Unity incident 2026-07-28).
+    __table_args__ = (
+        Index("ix_storage_tenant_collection_created", "tenant_id", "collection_id", "created_at"),
+        Index("ix_storage_tenant_owner_created", "tenant_id", "owner_user_id", "created_at"),
+        Index("ix_storage_tenant_context", "tenant_id", "context"),
+        Index("ix_storage_tenant_created", "tenant_id", "created_at"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     owner_user_id = Column(Integer, ForeignKey("users.id"), index=True)
