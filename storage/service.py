@@ -213,6 +213,26 @@ class GenericStorageService:
                     width, height = img.size
                     original_format = img.format
 
+                    # GPS fallback via Pillow: piexif only parses JPEG/TIFF and
+                    # raises InvalidImageDataError on PNG/WebP/HEIF — so GPS in
+                    # a PNG eXIf chunk was silently dropped. Pillow's getexif()
+                    # reads the GPS IFD format-independently.
+                    if not gps_data:
+                        try:
+                            _pil_gps = img.getexif().get_ifd(0x8825)
+                            # GPS IFD tags: 1=LatRef 2=Lat 3=LonRef 4=Lon; values
+                            # are IFDRational triplets (deg, min, sec).
+                            if _pil_gps.get(2) and _pil_gps.get(4):
+                                def _dms(v):
+                                    d, m, s = (float(x) for x in v)
+                                    return d + m / 60.0 + s / 3600.0
+                                _lat = _dms(_pil_gps[2]) * (-1 if str(_pil_gps.get(1, "N")).strip() == "S" else 1)
+                                _lon = _dms(_pil_gps[4]) * (-1 if str(_pil_gps.get(3, "E")).strip() == "W" else 1)
+                                gps_data = (_lat, _lon)
+                                print(f"--- GPS extracted via Pillow fallback: {gps_data}")
+                        except Exception as _pil_gps_exc:
+                            print(f"--- Pillow GPS fallback failed: {_pil_gps_exc}")
+
                     # DEPRECATED: Thumbnails are now generated on-demand via /storage/media endpoint
                     # No longer pre-generating thumbnails at upload time
                     # Old code (kept for reference):
