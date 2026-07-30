@@ -74,7 +74,11 @@ def verify_api_key(api_key: str, db: Session) -> Optional[User]:
                 display_name=display_name,
                 password_hash="",
                 api_key=api_key,
-                trust_level="admin",
+                # NOT admin: tenant keys ship in public browser bundles, so an
+                # admin bypass would hand every confidential object to anyone
+                # who reads a frontend's JS. Tenant scoping happens via
+                # tenant_id, not trust level.
+                trust_level="user",
                 device_ids=[],
             )
             db.add(user)

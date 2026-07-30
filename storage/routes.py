@@ -1621,7 +1621,7 @@ async def proxy_external_file(
         raise HTTPException(status_code=404, detail="Storage object not found")
 
     # Safety quarantine — same policy as /storage/media
-    _check_quarantine(obj, current_user)
+    _check_quarantine(obj, current_user, db)
 
     # Access control
     if not obj.is_public:
@@ -3139,7 +3139,7 @@ def head_media_variant(
         raise HTTPException(status_code=404, detail="Not found")
 
     # Safety gate — same policy as GET. 451 instead of 200 for blocked content.
-    _check_quarantine(obj, current_user)
+    _check_quarantine(obj, current_user, db)
 
     # Re-use original resolver so we report actual file details.
     # For HEAD it is enough to resolve the source path without heavy processing.
@@ -3174,7 +3174,7 @@ QUARANTINE_DANGER_THRESHOLD = int(os.getenv("QUARANTINE_DANGER_THRESHOLD", "7"))
 STRICT_PUBLIC_NULL_SAFETY = os.getenv("STRICT_PUBLIC_NULL_SAFETY", "false").lower() in ("1", "true", "yes")
 
 
-def _check_quarantine(obj, current_user: Optional[User]) -> None:
+def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] = None) -> None:
     """
     Block public delivery of an asset whose AI safety verdict is unsafe, failed,
     or still pending. Raises HTTPException(451 Unavailable For Legal Reasons)
@@ -3220,6 +3220,17 @@ def _check_quarantine(obj, current_user: Optional[User]) -> None:
     _md_priv = getattr(obj, "metadata_json", None)
     if isinstance(_md_priv, dict) and _md_priv.get("private_media"):
         _is_admin = current_user is not None and getattr(current_user, "trust_level", None) == "admin"
+        # A tenant API key auto-provisions its user with trust_level="admin"
+        # (auth.py) — and such keys ship inside public browser bundles. They
+        # must NOT inherit the admin bypass for confidential objects, or the
+        # gate is void for anyone who reads a frontend's JS (Tschepp finding
+        # 2026-07-30: the Tscheppa bundle key returned a private KPMG PDF).
+        if _is_admin and db is not None and getattr(current_user, "api_key", None):
+            try:
+                if tenant_id_for_api_key(current_user.api_key, db):
+                    _is_admin = False
+            except Exception:
+                _is_admin = False
         _is_owner = current_user is not None and getattr(obj, "owner_user_id", None) == current_user.id
         if not (_is_admin or _is_owner):
             raise HTTPException(
@@ -3453,7 +3464,7 @@ def get_media_variant(
         raise HTTPException(status_code=404, detail="Not found")
 
     # Safety gate (raises 451 if blocked, bypassed for owner/admin)
-    _check_quarantine(obj, current_user)
+    _check_quarantine(obj, current_user, db)
 
     media_type_current = (obj.mime_type or "application/octet-stream")
     mime = media_type_current.lower()
@@ -4361,7 +4372,7 @@ def _focal_access_check(object_id: int, db: Session, current_user: Optional[User
     if not obj:
         raise HTTPException(status_code=404, detail="Storage object not found")
     # Same safety gate as the media endpoint (451 if quarantined, owner/admin bypass).
-    _check_quarantine(obj, current_user)
+    _check_quarantine(obj, current_user, db)
     mime = (obj.mime_type or "").lower()
     if not mime.startswith("image/"):
         raise HTTPException(status_code=400, detail="Focal point is only available for images")
@@ -4967,7 +4978,7 @@ def download_file(
         raise HTTPException(status_code=404, detail="Not found")
 
     # Safety quarantine
-    _check_quarantine(obj, current_user)
+    _check_quarantine(obj, current_user, db)
 
     # Check permissions
     if not obj.is_public:
