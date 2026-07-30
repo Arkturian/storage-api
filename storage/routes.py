@@ -3232,6 +3232,17 @@ def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] =
             except Exception:
                 _is_admin = False
         _is_owner = current_user is not None and getattr(obj, "owner_user_id", None) == current_user.id
+        # As long as this deployment still runs the HARDCODED default master key
+        # (config.py fallback "Inetpass1"), that key is publicly known — it ships
+        # inside browser bundles — and it authenticates as system@api, the owner
+        # of nearly every object. Honouring owner/admin here would void the gate
+        # for anyone who reads a frontend's JS (verified 2026-07-30). So while the
+        # master key is the known default, the system@api identity gets NO bypass
+        # for confidential objects. Setting a real API_KEY env var restores it
+        # automatically — the restriction is tied to the actual risk condition.
+        if settings.API_KEY == "Inetpass1" and getattr(current_user, "email", None) == "system@api":
+            _is_admin = False
+            _is_owner = False
         if not (_is_admin or _is_owner):
             raise HTTPException(
                 status_code=403,
