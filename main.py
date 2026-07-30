@@ -44,6 +44,25 @@ app = FastAPI(
 # Database lifecycle events
 @app.on_event("startup")
 async def startup():
+    # A silent fallback is worse than a missing key: if API_KEY is unset we run
+    # on config.py's hardcoded default, which is publicly known (it shipped in a
+    # browser bundle, 2026-07-30). After a rotation, a lost .env or a fresh host
+    # would revert to it WITHOUT any error — and everyone would believe the
+    # rotation still held. So say it loudly on every start instead. The value is
+    # never logged; only the fact that it is the known default.
+    try:
+        from config import settings as _s
+        if _s.API_KEY == "Inetpass1":
+            import logging as _lg
+            _lg.getLogger("uvicorn.error").critical(
+                "SECURITY: API_KEY is unset — running on the PUBLIC hardcoded default. "
+                "Confidential objects (metadata_json.private_media) are therefore denied "
+                "to the master key. Set API_KEY in the service environment to restore "
+                "normal owner/admin access."
+            )
+            print("🔴 SECURITY: master API_KEY is the public hardcoded default — set API_KEY in the env", flush=True)
+    except Exception:
+        pass
     await connect_db()
     # Idempotent schema migration (no Alembic): add the tombstoned_at column for
     # two-phase / cascade delete if it doesn't exist yet. SQLite ALTER ADD COLUMN.
