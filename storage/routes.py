@@ -19,6 +19,7 @@ from datetime import datetime
 
 from PIL import Image
 from storage.pillow_plugins import ensure_heif_support
+from upload_contract import is_hls_result_archive
 
 ensure_heif_support()
 
@@ -2115,7 +2116,23 @@ async def upload_file(
         data = await file.read()
         glogger.error(f"🚀 UPLOAD_FILE: after read, size={len(data)}, context={context}")
 
+    normalized_hls_result = is_hls_result_archive(
+        requested=hls_result,
+        content_type=file.content_type,
+        filename=file.filename,
+    )
+    if hls_result and not normalized_hls_result:
+        glogger.warning(
+            "Ignoring hls_result=true for non-ZIP upload %s (%s)",
+            file.filename,
+            file.content_type,
+        )
+    hls_result = normalized_hls_result
+
     try:
+        original_video = None
+        reference_id_int = None
+
         # Special handling for HLS results: get tenant/owner from original video
         if reference_id and hls_result:
             print(f"📦 HLS Result Upload: reference_id={reference_id}, getting tenant from original video")
@@ -2176,10 +2193,22 @@ async def upload_file(
                 q = q.filter(StorageObject.mime_type.isnot(None)).filter(StorageObject.mime_type.like("video/%"))
                 candidate = q.order_by(StorageObject.created_at.desc()).first()
                 if candidate:
+                    original_video = candidate
+                    reference_id_int = candidate.id
                     reference_id = str(candidate.id)
                     print(f"📦 Auto-resolved original video by {'link_id' if link_id else 'owner'}: {reference_id}")
             except Exception as _e:
                 print(f"📦 WARN: Auto-resolve original video failed: {_e}")
+
+        if hls_result and (
+            not reference_id
+            or original_video is None
+            or reference_id_int is None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="HLS result upload requires a matching source video",
+            )
 
         # Handle Mac transcoding completion: process HLS ZIP and add to original video
         print(f"🔍 DEBUG: reference_id={reference_id}, context={context}, hls_result={hls_result}")
