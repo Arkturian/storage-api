@@ -1144,7 +1144,7 @@ def bulk_delete_objects(
             # Extract tenant_id from obj or default to arkturian
             tenant_id = getattr(obj, 'tenant_id', 'arkturian')
             if not tenant_id and hasattr(obj, 'metadata_json') and obj.metadata_json:
-                tenant_id = obj.metadata_json.get('tenant_id', 'arkturian')
+                tenant_id = getattr(obj, 'tenant_id', None) or (obj.metadata_json or {}).get('tenant_id') or 'arkturian'
             if not tenant_id:
                 tenant_id = 'arkturian'
 
@@ -1404,7 +1404,7 @@ async def enqueue_ai_safety_and_transcoding(storage_obj, db=None, skip_ai_safety
         # Extract tenant_id from storage_obj or default to arkturian
         tenant_id = getattr(storage_obj, 'tenant_id', 'arkturian')
         if not tenant_id and storage_obj.metadata_json:
-            tenant_id = storage_obj.metadata_json.get('tenant_id', 'arkturian')
+            tenant_id = getattr(storage_obj, 'tenant_id', None) or (storage_obj.metadata_json or {}).get('tenant_id') or 'arkturian'
         if not tenant_id:
             tenant_id = 'arkturian'
 

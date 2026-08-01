@@ -66,7 +66,16 @@ def _process_video_transcoding_impl(storage_object_id: int) -> dict:
             return {"success": False, "error": "Cannot transcode external storage"}
         else:
             # Standard copy mode - file is in uploads directory
-            tenant_id = storage_obj.metadata_json.get("tenant_id", "arkturian") if storage_obj.metadata_json else "arkturian"
+            # The authoritative tenant is the COLUMN — metadata_json["tenant_id"]
+            # is only written when the upload came through a tenant API key, so
+            # relying on it silently sent every other tenant's videos to the
+            # "arkturian" directory and failed with "Source file not found"
+            # (verified on object 116760, tenant=arkserver, 2026-08-01).
+            tenant_id = (
+                getattr(storage_obj, "tenant_id", None)
+                or (storage_obj.metadata_json or {}).get("tenant_id")
+                or "arkturian"
+            )
             uploads_dir = Path(settings.STORAGE_UPLOAD_DIR)
             source_path = uploads_dir / "media" / tenant_id / storage_obj.object_key
 
