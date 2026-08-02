@@ -4658,8 +4658,12 @@ def get_object_metadata(
     object_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    tenant_id: str = Depends(get_tenant_id),
+    # Optional auth: the handler below already gates non-public objects itself
+    # ("if not obj.is_public: 401/403"). The mandatory dependency rejected the
+    # request before that logic ran, so metadata for a PUBLIC object needed a
+    # key even though its bytes were freely fetchable via /storage/media/{id}.
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    tenant_id: Optional[str] = Depends(get_tenant_id_optional),
 ):
     # Try tenant-specific first, then public
     obj = None
@@ -4685,6 +4689,10 @@ def get_object_metadata(
             raise HTTPException(status_code=401, detail="Authentication required")
         if obj.owner_user_id != current_user.id and current_user.trust_level != "admin":
             raise HTTPException(status_code=403, detail="Forbidden")
+    # Confidential objects never leak metadata to anonymous callers either.
+    _md = obj.metadata_json if isinstance(obj.metadata_json, dict) else {}
+    if _md.get("private_media") and current_user is None:
+        raise HTTPException(status_code=403, detail={"error": "This object is private", "code": "private_media"})
 
     response_obj = StorageObjectResponse.from_orm(obj)
 
