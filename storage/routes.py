@@ -2337,10 +2337,26 @@ async def upload_file(
                 ai_context_metadata["context_text"] = ai_context_text
 
             if existing:
-                saved_obj = await update_file_and_record(
-                    db, storage_obj=existing, data=data, context=context
-                )
-            else:
+                # IMMUTABILITY (Issue #772): /storage/media/{id} is referenced by
+                # manifests, SHA-pinned URLs and published links. A same-named
+                # upload must therefore NEVER change what an existing id serves.
+                #   - identical bytes  -> safe replay: return the existing object
+                #     untouched (keeps reuse_existing idempotent for sync scripts)
+                #   - different bytes  -> create a NEW object instead of mutating
+                #     the old one (Issue #512 lost an image exactly this way)
+                import hashlib as _hl
+                _incoming = _hl.sha256(data).hexdigest()
+                if (existing.checksum or "") == _incoming:
+                    glogger.error(f"♻️  Replay: identical content for object {existing.id} — returning it unchanged")
+                    saved_obj = existing
+                else:
+                    glogger.error(
+                        f"🛡️  Immutability guard: '{file.filename}' matches object {existing.id} by name but "
+                        f"content differs ({(existing.checksum or '')[:8]} != {_incoming[:8]}) — creating a new object"
+                    )
+                    existing = None
+
+            if not existing:
                 saved_obj = await save_file_and_record(
                     db,
                     owner_user_id=target_owner_id,
