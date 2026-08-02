@@ -2852,7 +2852,7 @@ def get_asset_variant_references(
         q = q.filter(pattern.like(f'%;{link_id};%'))
     elif collection_id:
         q = q.filter(StorageObject.collection_id == collection_id)
-    elif not mine and current_user.trust_level == "admin":
+    elif not mine and _is_privileged_admin(current_user, db):
         pass
     else:
         q = q.filter(StorageObject.owner_user_id == current_user.id)
@@ -3188,6 +3188,28 @@ QUARANTINE_DANGER_THRESHOLD = int(os.getenv("QUARANTINE_DANGER_THRESHOLD", "7"))
 # public assets (e.g. arkturian had ~7k images NULL before the redis-auth
 # fix). Operators can enable per-host once their backfill is complete.
 STRICT_PUBLIC_NULL_SAFETY = os.getenv("STRICT_PUBLIC_NULL_SAFETY", "false").lower() in ("1", "true", "yes")
+
+
+
+def _is_privileged_admin(current_user, db) -> bool:
+    """True only for a REAL admin identity — never for a tenant API key.
+
+    auth.py auto-provisions tenant keys with trust_level="admin", and those
+    keys ship inside public browser bundles (3DPresenter, vod, Tscheppa). A
+    logged-out visitor could therefore reach admin-only paths: listing foreign
+    inventory via mine=false, DELETE and PATCH on objects they do not own
+    (Issue #799). Uploading on someone's behalf (owner_email) stays allowed —
+    that is normal tenant work and breaking it would take out real pipelines.
+    """
+    if current_user is None or getattr(current_user, "trust_level", None) != "admin":
+        return False
+    key = getattr(current_user, "api_key", None)
+    if not key or db is None:
+        return True
+    try:
+        return not tenant_id_for_api_key(key, db)
+    except Exception:
+        return False
 
 
 def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] = None) -> None:
@@ -4842,7 +4864,7 @@ def list_objects(
         q = q.filter(StorageObject.collection_id.ilike(like))
     elif anonymous:
         pass  # no ownership concept without a key — the public filter above rules
-    elif not mine and current_user.trust_level == "admin":
+    elif not mine and _is_privileged_admin(current_user, db):
         pass
     else:
         q = q.filter(StorageObject.owner_user_id == current_user.id)
@@ -5306,7 +5328,7 @@ def delete_object(
     current_user: User = Depends(get_current_user),
 ):
     """Delete storage object (legacy path without /objects/)."""
-    is_admin = current_user.trust_level == "admin"
+    is_admin = _is_privileged_admin(current_user, db)
     return _perform_delete(object_id, db, current_user.id, is_admin)
 
 
@@ -5317,7 +5339,7 @@ def delete_object_alt(
     current_user: User = Depends(get_current_user),
 ):
     """Delete storage object (intuitive path with /objects/)."""
-    is_admin = current_user.trust_level == "admin"
+    is_admin = _is_privileged_admin(current_user, db)
     return _perform_delete(object_id, db, current_user.id, is_admin)
 
 
