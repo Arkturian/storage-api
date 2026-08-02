@@ -4756,6 +4756,7 @@ def list_objects(
     sort: Optional[str] = Query(None, description="Sort field: 'created_at' (default), 'id', 'filename', 'file_size'. Prefix with '-' for asc, default desc."),
     offset: int = Query(0, ge=0, description="Pagination offset"),
     limit: int = Query(100, ge=1, le=5000),
+    tenant: Optional[str] = Query(None, description="Keyless calls only: restrict the public listing to one tenant (with a key the tenant comes from the key)"),
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
     tenant_id: Optional[str] = Depends(get_tenant_id_optional),
@@ -4774,8 +4775,15 @@ def list_objects(
     # Join with User table to get owner email
     q = db.query(StorageObject, User.email.label('owner_email')).outerjoin(User, StorageObject.owner_user_id == User.id)
 
-    # Filter by tenant_id first for performance
-    q = q.filter(StorageObject.tenant_id == tenant_id)
+    # Filter by tenant_id first for performance. Skipped for anonymous callers:
+    # without a key the tenant dependency falls back to DEFAULT_TENANT_ID, which
+    # would silently hide every public object stored under a different tenant
+    # (arkturian's FloraFauna vs. arkserver's default → 0 results). Public is
+    # public regardless of tenant; callers can still narrow with ?tenant=.
+    if not anonymous:
+        q = q.filter(StorageObject.tenant_id == tenant_id)
+    elif tenant:
+        q = q.filter(StorageObject.tenant_id == tenant)
 
     if anonymous:
         q = q.filter(StorageObject.is_public.is_(True))
