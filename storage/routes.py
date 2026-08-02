@@ -4788,12 +4788,13 @@ def list_objects(
     if anonymous:
         q = q.filter(StorageObject.is_public.is_(True))
         q = q.filter(StorageObject.tombstoned_at.is_(None))
-        # private_media is stored inside metadata_json — exclude it explicitly.
+        # private_media lives inside metadata_json. COALESCE is essential: for a
+        # row that HAS metadata_json but no private_media key, json_extract
+        # returns NULL, and `NOT (NULL = 1)` is NULL — i.e. not true — so a naive
+        # filter silently dropped every object carrying any metadata at all
+        # (12,657 public objects collapsed to the 321 with metadata_json IS NULL).
         q = q.filter(
-            or_(
-                StorageObject.metadata_json.is_(None),
-                not_(func.json_extract(StorageObject.metadata_json, "$.private_media") == 1),
-            )
+            func.coalesce(func.json_extract(StorageObject.metadata_json, "$.private_media"), 0) != 1
         )
 
     # Exact-id lookup (admin deep-link / Search-ID): the most specific filter,
