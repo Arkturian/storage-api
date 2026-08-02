@@ -3,7 +3,7 @@ from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Q
 from fastapi.responses import FileResponse
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, not_
 from typing import Optional, List, Any, Dict, Tuple
 import json
 import os
@@ -4757,14 +4757,36 @@ def list_objects(
     offset: int = Query(0, ge=0, description="Pagination offset"),
     limit: int = Query(100, ge=1, le=5000),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    tenant_id: str = Depends(get_tenant_id),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    tenant_id: Optional[str] = Depends(get_tenant_id_optional),
 ):
+    # Keyless public listing: /storage/media/{id} has always been public-by-ID,
+    # but listing required a key — so every browser gallery had to ship one,
+    # which in practice meant the MASTER key sitting in a public JS bundle
+    # (vod, 2026-08-02). Without a key we now serve a strictly narrowed view:
+    # only is_public=true, never private_media, never tombstoned, and the
+    # ownership filter is meaningless (there is no "mine"). Everything an
+    # anonymous caller can see here, it could already fetch by ID.
+    anonymous = current_user is None
+    if anonymous:
+        mine = False
+
     # Join with User table to get owner email
     q = db.query(StorageObject, User.email.label('owner_email')).outerjoin(User, StorageObject.owner_user_id == User.id)
 
     # Filter by tenant_id first for performance
     q = q.filter(StorageObject.tenant_id == tenant_id)
+
+    if anonymous:
+        q = q.filter(StorageObject.is_public.is_(True))
+        q = q.filter(StorageObject.tombstoned_at.is_(None))
+        # private_media is stored inside metadata_json — exclude it explicitly.
+        q = q.filter(
+            or_(
+                StorageObject.metadata_json.is_(None),
+                not_(func.json_extract(StorageObject.metadata_json, "$.private_media") == 1),
+            )
+        )
 
     # Exact-id lookup (admin deep-link / Search-ID): the most specific filter,
     # returns just that object regardless of pagination/other filters.
@@ -4785,6 +4807,8 @@ def list_objects(
     elif collection_like:
         like = f"%{collection_like}%"
         q = q.filter(StorageObject.collection_id.ilike(like))
+    elif anonymous:
+        pass  # no ownership concept without a key — the public filter above rules
     elif not mine and current_user.trust_level == "admin":
         pass
     else:
