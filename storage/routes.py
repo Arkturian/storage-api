@@ -4829,7 +4829,8 @@ def list_objects(
     # Full-text search across multiple fields
     if search:
         like_search = f"%{search}%"
-        from sqlalchemy import or_
+        # NOTE: no local `from sqlalchemy import or_` here — that made `or_`
+        # function-local and broke the anonymous-filter block above.
         q = q.filter(or_(
             StorageObject.original_filename.ilike(like_search),
             StorageObject.title.ilike(like_search),
