@@ -7,6 +7,9 @@ import string
 from typing import Optional
 
 from database import get_db
+import logging
+
+logger = logging.getLogger(__name__)
 from models import User
 from config import settings
 from tenancy.config import tenant_id_for_api_key
@@ -103,11 +106,78 @@ def verify_api_key(api_key: str, db: Session) -> Optional[User]:
 
     return None
 
+
+
+# --- X-On-Behalf-Of: service keys acting for a verified user (3DPresenter BFF) ---
+# Contract agreed with 3DPresenter-Codex (Post 4437 q-7db4946ae2fd, 2026-08-03):
+#   * ONLY a key explicitly flagged is_service in tenant_api_keys may set the
+#     header. Master, admin or plain tenant keys alone are NOT enough.
+#   * The value is a canonical e-mail (Storage provisions/resolves owners by
+#     e-mail today). Unknown or inactive -> fail closed with 403.
+#   * The resolved user authorises the request COMPLETELY — and never inherits
+#     the service key's admin rights (see _ON_BEHALF_FLAG below).
+#   * Presenting the header with a non-service key -> 403, never a silent ignore.
+_ON_BEHALF_FLAG = "_storage_on_behalf_of"
+
+
+def _key_is_service(api_key: str, db: Session) -> bool:
+    """True only for a tenant key explicitly marked is_service."""
+    if not api_key:
+        return False
+    try:
+        from models import TenantAPIKey
+        row = (
+            db.query(TenantAPIKey)
+            .filter(TenantAPIKey.api_key == api_key, TenantAPIKey.is_active.is_(True))
+            .one_or_none()
+        )
+        return bool(row and getattr(row, "is_service", False))
+    except Exception:
+        return False
+
+
+def resolve_on_behalf_of(api_key: Optional[str], on_behalf: Optional[str], db: Session) -> Optional[User]:
+    """Resolve X-On-Behalf-Of to the acting user, or raise 403.
+
+    Returns None when the header was not supplied at all.
+    """
+    if not on_behalf:
+        return None
+    value = on_behalf.strip()
+    if not value:
+        return None
+    if not _key_is_service(api_key, db):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "X-On-Behalf-Of requires a service key", "code": "not_a_service_key"},
+        )
+    user = db.query(User).filter(User.email == value).first()
+    if not user:
+        # Fail closed: never auto-provision from a header, that would let a
+        # service key mint identities.
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "X-On-Behalf-Of user unknown", "code": "unknown_principal"},
+        )
+    # The acting user must not inherit admin powers from the service key, and an
+    # admin principal must not be impersonated into admin-wide operations either.
+    setattr(user, _ON_BEHALF_FLAG, True)
+    logger.warning(
+        "on-behalf-of: service_key=%s… acting_as=%s (user_id=%s)",
+        (api_key or "")[:6], user.email, user.id,
+    )
+    return user
+
+
 def get_current_user(
     api_key: str = Header(None, alias="X-API-KEY"),
+    on_behalf_of: str = Header(None, alias="X-On-Behalf-Of"),
     db: Session = Depends(get_db)
 ) -> User:
-    """Get current user from API key"""
+    """Get current user from API key (or the principal a service key acts for)"""
+    acting = resolve_on_behalf_of(api_key, on_behalf_of, db)
+    if acting is not None:
+        return acting
     user = verify_api_key(api_key, db)
     if not user:
         raise HTTPException(
@@ -119,9 +189,17 @@ def get_current_user(
 
 def get_current_user_optional(
     api_key: str = Header(None, alias="X-API-KEY"),
+    on_behalf_of: str = Header(None, alias="X-On-Behalf-Of"),
     db: Session = Depends(get_db)
 ) -> Optional[User]:
-    """Get current user from API key (optional - returns None if not authenticated)"""
+    """Get current user from API key (optional - returns None if not authenticated).
+
+    An X-On-Behalf-Of header is still validated strictly: a non-service key
+    presenting it gets 403 rather than being silently downgraded to anonymous.
+    """
+    acting = resolve_on_behalf_of(api_key, on_behalf_of, db)
+    if acting is not None:
+        return acting
     return verify_api_key(api_key, db)
 
 def get_user_by_email(db: Session, email: str) -> Optional[User]:

@@ -31,6 +31,9 @@ class TenantAPIKey(Base):
     tenant_id = Column(String(50), ForeignKey("tenants.id"), index=True, nullable=False)
     label = Column(String(255), nullable=True)
     is_active = Column(Boolean, default=True)
+    # Service keys may act on behalf of a user via X-On-Behalf-Of. Off by
+    # default: an ordinary tenant key must never be able to impersonate.
+    is_service = Column(Boolean, default=False, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
 

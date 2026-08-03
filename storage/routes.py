@@ -3203,6 +3203,11 @@ def _is_privileged_admin(current_user, db) -> bool:
     """
     if current_user is None or getattr(current_user, "trust_level", None) != "admin":
         return False
+    # An impersonated principal (X-On-Behalf-Of) never gets admin-wide powers,
+    # even if that user happens to be an admin — the service key must not be
+    # able to widen its reach by picking a privileged principal.
+    if getattr(current_user, "_storage_on_behalf_of", False):
+        return False
     key = getattr(current_user, "api_key", None)
     if not key or db is None:
         return True
