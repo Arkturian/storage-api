@@ -48,3 +48,7 @@ redis>=5.0.0
 
 # Transcoding (deployment scripts convert this to local path)
 git+https://github.com/apopovic77/mac-transcoding-api.git@dev
+# Content-based MIME detection. Without it storage falls back to guessing
+# by file extension, so a HEIC/PNG announced as *.jpg was stored and served
+# with a Content-Type that lies (found 2026-08-04 via the upload-ticket path).
+python-magic>=0.4.27
