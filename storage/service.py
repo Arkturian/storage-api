@@ -539,8 +539,25 @@ class GenericStorageService:
 
         mime = self._detect_mime_type(data, file_path.name)
 
-        async with aiofiles.open(file_path, "wb") as f:
-            await f.write(data)
+        # Write to a sibling temp file and rename into place instead of
+        # truncating the target. Two reasons:
+        #   1. atomic — a crash mid-write can no longer leave a half-written
+        #      object where the DB still claims the old size/checksum;
+        #   2. it breaks any hardlink instead of writing THROUGH it, which is
+        #      the precondition for deduplicating the 2,092 groups of
+        #      byte-identical files (up to 240 copies of the same 1.9 MB image)
+        #      without one object's replacement silently altering another's.
+        _tmp = file_path.with_name(f".{file_path.name}.tmp")
+        try:
+            async with aiofiles.open(_tmp, "wb") as f:
+                await f.write(data)
+            os.replace(_tmp, file_path)
+        finally:
+            try:
+                if _tmp.exists():
+                    _tmp.unlink()
+            except Exception:
+                pass
 
         checksum = self._checksum(data)
 
