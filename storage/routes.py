@@ -8,6 +8,7 @@ from typing import Optional, List, Any, Dict, Tuple
 import json
 import os
 import re
+import time
 import shutil
 import hashlib
 import base64
@@ -2035,6 +2036,115 @@ def _hydrate_storage_urls(response_obj, storage_obj, request) -> None:
         logging.getLogger("gunicorn.error").warning(
             f"_hydrate_storage_urls failed for obj {getattr(storage_obj, 'id', None)}: {_e}"
         )
+
+
+# --- Upload tickets: put a file into Storage over plain HTTP, no base64 -----
+# MCP clients (ChatGPT mobile) cannot pass a multi-MB photo as a base64 tool
+# argument — base64 inflates it by a third and the whole payload has to travel
+# through the tool channel. A ticket decouples that: the client asks for a
+# one-shot URL and then PUTs the raw bytes to it like any normal upload.
+# Tickets are short-lived, single-use and carry the upload parameters, so the
+# URL itself grants nothing beyond creating exactly one object.
+_UPLOAD_TICKETS: Dict[str, Dict[str, Any]] = {}
+_TICKET_TTL_SECONDS = 900
+
+
+def _purge_expired_tickets() -> None:
+    now = time.time()
+    for token in [t for t, v in _UPLOAD_TICKETS.items() if v.get("expires_at", 0) < now]:
+        _UPLOAD_TICKETS.pop(token, None)
+
+
+@router.post("/upload-ticket")
+def create_upload_ticket(
+    request: Request,
+    filename: str = Query(..., description="Name the stored object should carry, e.g. 'photo.jpg'"),
+    context: Optional[str] = Query(None),
+    collection_id: Optional[str] = Query(None),
+    is_public: bool = Query(False),
+    private: bool = Query(False, description="Mark confidential — media endpoint then serves it to owner/admin only"),
+    ai_mode: str = Query("none", description="none | safety | vision | full — AI analysis costs money, default off"),
+    ttl_hours: Optional[int] = Query(None, description="Auto-delete the uploaded object after N hours"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """Issue a one-shot URL for uploading a single file without base64.
+
+    Returns {upload_url, token, expires_in}. PUT or POST the raw file bytes to
+    that URL within the TTL — no API key needed on that request, the token IS
+    the authorisation, and it dies on first use.
+    """
+    import secrets as _secrets
+
+    _purge_expired_tickets()
+    token = _secrets.token_urlsafe(32)
+    _UPLOAD_TICKETS[token] = {
+        "owner_user_id": current_user.id,
+        "tenant_id": tenant_id,
+        "filename": filename,
+        "context": context,
+        "collection_id": collection_id,
+        "is_public": bool(is_public),
+        "private": bool(private),
+        "ai_mode": ai_mode,
+        "ttl_hours": ttl_hours,
+        "expires_at": time.time() + _TICKET_TTL_SECONDS,
+    }
+    base = str(request.base_url).rstrip("/")
+    return {
+        "upload_url": f"{base}/storage/upload-ticket/{token}",
+        "token": token,
+        "expires_in": _TICKET_TTL_SECONDS,
+        "method": "PUT",
+        "hint": "PUT the raw file bytes (no multipart, no base64) to upload_url",
+    }
+
+
+@router.put("/upload-ticket/{token}", response_model=StorageObjectResponse)
+async def consume_upload_ticket(
+    token: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Consume a ticket: the request body IS the file."""
+    _purge_expired_tickets()
+    ticket = _UPLOAD_TICKETS.pop(token, None)  # single use, even on failure
+    if not ticket:
+        raise HTTPException(status_code=404, detail={"error": "unknown or already used ticket", "code": "ticket_invalid"})
+
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail={"error": "empty body — PUT the raw file bytes", "code": "empty_upload"})
+
+    saved_obj = await save_file_and_record(
+        db,
+        owner_user_id=ticket["owner_user_id"],
+        data=data,
+        original_filename=ticket["filename"],
+        context=ticket["context"],
+        is_public=ticket["is_public"],
+        collection_id=ticket["collection_id"],
+        tenant_id=ticket["tenant_id"],
+        ttl_hours=ticket["ttl_hours"],
+    )
+    if ticket["private"]:
+        _mj = dict(saved_obj.metadata_json or {})
+        _mj["private_media"] = True
+        saved_obj.metadata_json = _mj
+        db.commit()
+        db.refresh(saved_obj)
+
+    if ticket["ai_mode"] and ticket["ai_mode"] != "none":
+        try:
+            from storage.service import enqueue_ai_safety_and_transcoding
+            await enqueue_ai_safety_and_transcoding(saved_obj, db=db, ai_mode=ticket["ai_mode"])
+        except Exception as exc:  # never fail the upload over analysis
+            print(f"⚠️ ticket upload: analysis enqueue failed for {saved_obj.id}: {exc}")
+
+    _resp = StorageObjectResponse.from_orm(saved_obj)
+    _hydrate_storage_urls(_resp, saved_obj, request)
+    return _resp
 
 
 @router.post("/upload", response_model=StorageObjectResponse)
