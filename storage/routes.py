@@ -2159,6 +2159,128 @@ async def consume_upload_ticket(
     return _resp
 
 
+# --- Chunked base64 upload: for clients with no network and small arg limits --
+# ChatGPT's sandbox has NO outbound network at all (verified 2026-08-04:
+# `curl https://1.1.1.1` → Connection refused), so the upload-ticket + PUT path
+# is unusable there. The only channel that carries file content into Storage is
+# a tool argument, i.e. base64 — and a whole photo may exceed what one argument
+# takes. Split it: the client picks the chunk size it can actually serialise,
+# Storage reassembles. Pure JSON, no network egress required on the client.
+_UPLOAD_CHUNKS: Dict[str, Dict[str, Any]] = {}
+_CHUNK_SESSION_TTL = 1800
+
+
+def _purge_expired_chunk_sessions() -> None:
+    now = time.time()
+    for sid in [k for k, v in _UPLOAD_CHUNKS.items() if v.get("expires_at", 0) < now]:
+        _UPLOAD_CHUNKS.pop(sid, None)
+
+
+@router.post("/upload-chunk")
+async def upload_chunk(
+    request: Request,
+    upload_id: str = Query(..., description="Client-chosen id grouping the chunks of ONE file"),
+    index: int = Query(..., ge=0, description="0-based index of this chunk"),
+    total_chunks: int = Query(..., ge=1, description="How many chunks the file has in total"),
+    filename: str = Query(..., description="Name the finished object should carry"),
+    context: Optional[str] = Query(None),
+    collection_id: Optional[str] = Query(None),
+    is_public: bool = Query(False),
+    private: bool = Query(False),
+    ai_mode: str = Query("none"),
+    ttl_hours: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """Accept one base64 chunk. The last one (by count) assembles and stores the file.
+
+    Body: the raw base64 text of this chunk. Chunks may arrive in any order;
+    what matters is that every index 0..total_chunks-1 has been seen exactly once.
+    Returns {received, missing} while incomplete, and the storage object once done.
+    """
+    import base64 as _b64
+
+    _purge_expired_chunk_sessions()
+    if index >= total_chunks:
+        raise HTTPException(status_code=400, detail={"error": "index must be < total_chunks", "code": "bad_index"})
+
+    body = (await request.body()).decode("utf-8", errors="ignore").strip()
+    if not body:
+        raise HTTPException(status_code=400, detail={"error": "empty chunk body", "code": "empty_chunk"})
+
+    sess = _UPLOAD_CHUNKS.setdefault(upload_id, {
+        "owner_user_id": current_user.id,
+        "tenant_id": tenant_id,
+        "filename": filename,
+        "context": context,
+        "collection_id": collection_id,
+        "is_public": bool(is_public),
+        "private": bool(private),
+        "ai_mode": ai_mode,
+        "ttl_hours": ttl_hours,
+        "total_chunks": total_chunks,
+        "parts": {},
+        "expires_at": time.time() + _CHUNK_SESSION_TTL,
+    })
+    # A session belongs to whoever started it — nobody else may add to it.
+    if sess["owner_user_id"] != current_user.id:
+        raise HTTPException(status_code=403, detail={"error": "upload_id belongs to another user", "code": "not_your_upload"})
+
+    sess["parts"][index] = body
+    missing = [i for i in range(total_chunks) if i not in sess["parts"]]
+    if missing:
+        return {"upload_id": upload_id, "received": len(sess["parts"]), "total_chunks": total_chunks,
+                "missing": missing[:20], "complete": False}
+
+    # Complete — assemble in index order, then decode ONCE (splitting base64
+    # mid-stream is only safe when reassembled before decoding).
+    _UPLOAD_CHUNKS.pop(upload_id, None)
+    try:
+        data = _b64.b64decode("".join(sess["parts"][i] for i in range(total_chunks)))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail={"error": f"chunks do not form valid base64: {exc}", "code": "bad_base64"})
+    if not data:
+        raise HTTPException(status_code=400, detail={"error": "assembled file is empty", "code": "empty_upload"})
+
+    _sniffed = None
+    try:
+        import magic as _magic
+        _sniffed = _magic.from_buffer(data, mime=True)
+    except Exception:
+        pass
+
+    saved_obj = await save_file_and_record(
+        db,
+        owner_user_id=sess["owner_user_id"],
+        data=data,
+        original_filename=sess["filename"],
+        context=sess["context"],
+        is_public=sess["is_public"],
+        collection_id=sess["collection_id"],
+        tenant_id=sess["tenant_id"],
+        ttl_hours=sess["ttl_hours"],
+        mime_type=_sniffed,
+    )
+    if sess["private"]:
+        _mj = dict(saved_obj.metadata_json or {})
+        _mj["private_media"] = True
+        saved_obj.metadata_json = _mj
+        db.commit()
+        db.refresh(saved_obj)
+
+    if sess["ai_mode"] and sess["ai_mode"] != "none":
+        try:
+            from storage.service import enqueue_ai_safety_and_transcoding
+            await enqueue_ai_safety_and_transcoding(saved_obj, db=db, ai_mode=sess["ai_mode"])
+        except Exception as exc:
+            print(f"⚠️ chunk upload: analysis enqueue failed for {saved_obj.id}: {exc}")
+
+    _resp = StorageObjectResponse.from_orm(saved_obj)
+    _hydrate_storage_urls(_resp, saved_obj, request)
+    return _resp
+
+
 @router.post("/upload", response_model=StorageObjectResponse)
 async def upload_file(
     request: Request,
