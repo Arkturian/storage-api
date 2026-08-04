@@ -2117,6 +2117,17 @@ async def consume_upload_ticket(
     if not data:
         raise HTTPException(status_code=400, detail={"error": "empty body — PUT the raw file bytes", "code": "empty_upload"})
 
+    # Trust the BYTES, not the name. A ticket client states the filename up
+    # front and often guesses wrong — a phone photo announced as "photo.jpg"
+    # can easily be HEIC or PNG. Deriving the type from the extension would
+    # ship a Content-Type that lies, and browsers then refuse to render it.
+    _sniffed = None
+    try:
+        import magic as _magic
+        _sniffed = _magic.from_buffer(data, mime=True)
+    except Exception as _mexc:
+        print(f"⚠️ ticket upload: mime sniff failed, falling back to filename: {_mexc}")
+
     saved_obj = await save_file_and_record(
         db,
         owner_user_id=ticket["owner_user_id"],
@@ -2127,6 +2138,7 @@ async def consume_upload_ticket(
         collection_id=ticket["collection_id"],
         tenant_id=ticket["tenant_id"],
         ttl_hours=ticket["ttl_hours"],
+        mime_type=_sniffed,
     )
     if ticket["private"]:
         _mj = dict(saved_obj.metadata_json or {})
