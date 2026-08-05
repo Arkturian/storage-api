@@ -4989,6 +4989,16 @@ def get_object_metadata(
             StorageObject.is_public == True
         ).first()
 
+    # Still nothing, but the caller is a real admin: look it up across tenants.
+    # Without this the metadata view contradicted the media view — /storage/
+    # media/101999 served a 3.5 MB PNG while this endpoint answered 404 for the
+    # same id, because the object lives in tenant "arkturian" while a caller
+    # without a tenant key resolves to the default tenant (3dApi report
+    # 2026-08-05). Callers that decide on the metadata whether an object is
+    # usable were being told "does not exist" about a perfectly good file.
+    if not obj and _is_privileged_admin(current_user, db):
+        obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
+
     if not obj:
         raise HTTPException(status_code=404, detail="Not found")
 
