@@ -3805,6 +3805,27 @@ def get_media_variant(
         _disposition = "inline"
 
     _media_extra_headers: Dict[str, str] = {"Content-Disposition": _disposition}
+
+    # Caching. Media responses carried an ETag but no Cache-Control, and the
+    # conditional request did not work either (measured 2026-08-05: GET with
+    # If-None-Match returned 200 and the full 732 KB, not 304). Every replay of
+    # a clip therefore re-downloaded it — expensive for visitors on a weak
+    # mobile link (Tscheppaschlucht avatar: 10 clips, 0.6-2.4 MB, reloaded on
+    # every role change).
+    #
+    # How long we may promise depends on whether the URL identifies the bytes:
+    #   ?v=<checksum> present  -> content-addressed: a replaced source yields a
+    #                             different URL, so the response is genuinely
+    #                             immutable and may be cached for a year.
+    #   no ?v=                 -> the id alone can serve new bytes after a
+    #                             replace-image, so only a short max-age plus
+    #                             revalidation is honest.
+    _v_param = (request.query_params.get("v") or "").strip()
+    if _v_param and obj.checksum and _v_param == obj.checksum:
+        _media_extra_headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
+        _media_extra_headers["Cache-Control"] = "public, max-age=3600"
+
     if obj.mime_type:
         _media_extra_headers["X-Mime-Type"] = obj.mime_type
     if obj.transcoding_status:
