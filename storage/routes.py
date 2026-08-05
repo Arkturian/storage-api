@@ -3726,6 +3726,7 @@ def get_media_variant(
     mesh_compression: Optional[str] = Query(None, description="GLB: none | meshopt | draco"),
     output: Optional[str] = Query(None, description="GLB: glb | zip (re-bundled vs. split)"),
     preset: Optional[str] = Query(None, description="GLB: web | mobile | preview (param shortcut)"),
+    v: Optional[str] = Query(None, description="Cache-busting checksum. When it matches the object's checksum the URL is content-addressed and the response may be cached immutably"),
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
     tenant_id: Optional[str] = Depends(get_tenant_id_optional),
@@ -3820,7 +3821,7 @@ def get_media_variant(
     #   no ?v=                 -> the id alone can serve new bytes after a
     #                             replace-image, so only a short max-age plus
     #                             revalidation is honest.
-    _v_param = (request.query_params.get("v") or "").strip()
+    _v_param = (v or "").strip()
     if _v_param and obj.checksum and _v_param == obj.checksum:
         _media_extra_headers["Cache-Control"] = "public, max-age=31536000, immutable"
     else:
