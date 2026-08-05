@@ -189,6 +189,7 @@ async def storage_media_head_headers(request: Request, call_next):
             is_pending_public = (obj.is_public and obj.ai_safety_status in ("pending", "processing", "failed"))
             if is_unsafe_blocked or is_pending_public:
                 quarantine_headers = _apply_cors_for_head({}, request)
+                quarantine_headers["Cache-Control"] = "no-store"
                 if obj.ai_safety_status:
                     quarantine_headers["X-Transcoding-Status"] = obj.ai_safety_status
                 return Response(status_code=451, headers=quarantine_headers)
@@ -198,6 +199,20 @@ async def storage_media_head_headers(request: Request, call_next):
             # for cached GLB variants (X-Transcoded-Size); never report the
             # misleading raw Content-Length for an uncached/parametrized variant.
             qp = request.query_params
+
+            # HEAD must answer like GET minus the body (RFC 9110). This middleware
+            # bypasses the route handler, so the caching headers set there were
+            # absent here — a client probing with `curl -I` saw no Cache-Control
+            # and reasonably concluded the fix had not landed (Tscheppaschlucht,
+            # 2026-08-05). Same rule as the handler: a matching ?v=<checksum>
+            # makes the URL content-addressed, so the answer is immutable;
+            # without it the id alone can serve new bytes after a replace.
+            _v = (qp.get("v") or "").strip()
+            _head_cache = (
+                "public, max-age=31536000, immutable"
+                if (_v and obj.checksum and _v == obj.checksum)
+                else "public, max-age=3600"
+            )
 
             # ?download=1 → Content-Disposition: attachment (mirror GET's download
             # param) so HEAD advertises the same download intent + filename.
@@ -249,6 +264,7 @@ async def storage_media_head_headers(request: Request, call_next):
                         aheaders["X-Transcoding-Status"] = "miss"
                 if out_mime:
                     aheaders["X-Mime-Type"] = out_mime
+                aheaders.setdefault("Cache-Control", _head_cache)
                 _apply_cors_for_head(aheaders, request)
                 return Response(
                     status_code=200,
@@ -291,6 +307,7 @@ async def storage_media_head_headers(request: Request, call_next):
                     vheaders["X-Transcoded-Size"] = str(transcoded_size)
                     vheaders["Content-Length"] = str(transcoded_size)
                     vheaders["Accept-Ranges"] = "bytes"
+                vheaders.setdefault("Cache-Control", _head_cache)
                 _apply_cors_for_head(vheaders, request)
                 return Response(
                     status_code=200,
@@ -307,6 +324,7 @@ async def storage_media_head_headers(request: Request, call_next):
                 headers["X-HLS-URL"] = obj.hls_url
             if obj.file_size_bytes:
                 headers["Content-Length"] = str(obj.file_size_bytes)
+            headers.setdefault("Cache-Control", _head_cache)
             _apply_cors_for_head(headers, request)
             return Response(
                 status_code=200,
