@@ -3727,6 +3727,7 @@ def get_media_variant(
     output: Optional[str] = Query(None, description="GLB: glb | zip (re-bundled vs. split)"),
     preset: Optional[str] = Query(None, description="GLB: web | mobile | preview (param shortcut)"),
     v: Optional[str] = Query(None, description="Cache-busting checksum. When it matches the object's checksum the URL is content-addressed and the response may be cached immutably"),
+    if_none_match: Optional[str] = Header(None, alias="If-None-Match"),
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
     tenant_id: Optional[str] = Depends(get_tenant_id_optional),
@@ -3826,6 +3827,26 @@ def get_media_variant(
         _media_extra_headers["Cache-Control"] = "public, max-age=31536000, immutable"
     else:
         _media_extra_headers["Cache-Control"] = "public, max-age=3600"
+
+    # Conditional requests. Starlette's FileResponse sets an ETag but never
+    # evaluates If-None-Match, so a revalidating client got 200 plus the full
+    # payload — a 1.9 MB clip re-downloaded after its max-age expired, although
+    # nothing had changed (Tscheppaschlucht measurement 2026-08-05). Build the
+    # tag from the CONTENT checksum plus every parameter that changes the
+    # representation: a thumbnail request must not be answered 304 because the
+    # original is unchanged.
+    if obj.checksum:
+        _repr_key = "|".join(str(x) for x in (
+            obj.checksum, variant, display_for, width, height, format, quality,
+            aspect_ratio, trim, margin, bg_color, download,
+            decimate, texture_format, texture_quality, texture_max_size,
+            mesh_compression, output, preset, bitrate, sample_rate, channels,
+        ))
+        _etag = '"' + hashlib.md5(_repr_key.encode()).hexdigest() + '"'
+        _media_extra_headers["ETag"] = _etag
+        _inm = (if_none_match or "").strip()
+        if _inm and _etag in [t.strip() for t in _inm.split(",")]:
+            return Response(status_code=304, headers=_media_extra_headers)
 
     if obj.mime_type:
         _media_extra_headers["X-Mime-Type"] = obj.mime_type
