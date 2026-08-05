@@ -3461,6 +3461,21 @@ def _is_privileged_admin(current_user, db) -> bool:
         return False
 
 
+def media_repr_etag(obj, **repr_params) -> Optional[str]:
+    """ETag for a media representation: content checksum + the parameters that
+    change it.
+
+    Shared by the GET handler and the HEAD middleware so the two can never
+    disagree again — HEAD diverging from GET has now caused three separate
+    false reports (missing Cache-Control, missing ETag, RFC 9110 says HEAD must
+    answer like GET minus the body).
+    """
+    if not getattr(obj, "checksum", None):
+        return None
+    key = "|".join(str(repr_params.get(k)) for k in sorted(repr_params))
+    return '"' + hashlib.md5(f"{obj.checksum}|{key}".encode()).hexdigest() + '"'
+
+
 def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] = None) -> None:
     """
     Block public delivery of an asset whose AI safety verdict is unsafe, failed,
@@ -3835,14 +3850,16 @@ def get_media_variant(
     # tag from the CONTENT checksum plus every parameter that changes the
     # representation: a thumbnail request must not be answered 304 because the
     # original is unchanged.
-    if obj.checksum:
-        _repr_key = "|".join(str(x) for x in (
-            obj.checksum, variant, display_for, width, height, format, quality,
-            aspect_ratio, trim, margin, bg_color, download,
-            decimate, texture_format, texture_quality, texture_max_size,
-            mesh_compression, output, preset, bitrate, sample_rate, channels,
-        ))
-        _etag = '"' + hashlib.md5(_repr_key.encode()).hexdigest() + '"'
+    _etag = media_repr_etag(
+        obj, variant=variant, display_for=display_for, width=width, height=height,
+        format=format, quality=quality, aspect_ratio=aspect_ratio, trim=trim,
+        margin=margin, bg_color=bg_color, download=download, decimate=decimate,
+        texture_format=texture_format, texture_quality=texture_quality,
+        texture_max_size=texture_max_size, mesh_compression=mesh_compression,
+        output=output, preset=preset, bitrate=bitrate, sample_rate=sample_rate,
+        channels=channels,
+    )
+    if _etag:
         _media_extra_headers["ETag"] = _etag
         _inm = (if_none_match or "").strip()
         if _inm and _etag in [t.strip() for t in _inm.split(",")]:
