@@ -146,6 +146,17 @@ jobs:
             EXISTING_CRON=$(crontab -u "$CRON_USER" -l 2>/dev/null | grep -v cleanup_expired || true)
             { [ -n "$EXISTING_CRON" ] && echo "$EXISTING_CRON"; echo "$CRON_CMD"; } | crontab -u "$CRON_USER" -
 
+            # Syntax gate: never restart on code that cannot even be imported.
+            # A malformed patch took the whole service down on 2026-08-05 —
+            # the process died before binding the port, so /health was gone too
+            # and systemd looped every 10s. compileall costs milliseconds and
+            # shows ALL offending lines at once instead of revealing them one
+            # restart at a time (3dApi's suggestion after that outage).
+            if ! ./venv/bin/python -m compileall -q -x '(^|/)(venv|\.venv|__pycache__|\.git)(/|$)' .; then
+              echo "❌ syntax check failed — NOT restarting the service"
+              exit 1
+            fi
+
             systemctl restart storage-api.service
             systemctl restart celery-worker.service || true
             # Cold start (ChromaDB load) can exceed a fixed sleep — retry up to 90s
@@ -264,6 +275,17 @@ jobs:
             EXISTING_CRON=$(crontab -u "$CRON_USER" -l 2>/dev/null | grep -v cleanup_expired || true)
             { [ -n "$EXISTING_CRON" ] && echo "$EXISTING_CRON"; echo "$CRON_CMD"; } | crontab -u "$CRON_USER" -
 
+            # Syntax gate: never restart on code that cannot even be imported.
+            # A malformed patch took the whole service down on 2026-08-05 —
+            # the process died before binding the port, so /health was gone too
+            # and systemd looped every 10s. compileall costs milliseconds and
+            # shows ALL offending lines at once instead of revealing them one
+            # restart at a time (3dApi's suggestion after that outage).
+            if ! ./venv/bin/python -m compileall -q -x '(^|/)(venv|\.venv|__pycache__|\.git)(/|$)' .; then
+              echo "❌ syntax check failed — NOT restarting the service"
+              exit 1
+            fi
+
             systemctl restart storage-api.service
             systemctl restart celery-worker.service || true
             # Cold start (ChromaDB load) can exceed a fixed sleep — retry up to 90s
@@ -353,6 +375,17 @@ jobs:
             { [ -n "$EXISTING_CRON" ] && echo "$EXISTING_CRON"; echo "$CRON_CMD"; } | crontab -
 
             echo "=== Restarting services ==="
+            # Syntax gate: never restart on code that cannot even be imported.
+            # A malformed patch took the whole service down on 2026-08-05 —
+            # the process died before binding the port, so /health was gone too
+            # and systemd looped every 10s. compileall costs milliseconds and
+            # shows ALL offending lines at once instead of revealing them one
+            # restart at a time (3dApi's suggestion after that outage).
+            if ! ./venv/bin/python -m compileall -q -x '(^|/)(venv|\.venv|__pycache__|\.git)(/|$)' .; then
+              echo "❌ syntax check failed — NOT restarting the service"
+              exit 1
+            fi
+
             sudo systemctl restart storage-api.service
             sudo systemctl restart celery-worker.service || true
             sleep 3
