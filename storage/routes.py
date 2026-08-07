@@ -2055,6 +2055,82 @@ def _purge_expired_tickets() -> None:
         _UPLOAD_TICKETS.pop(token, None)
 
 
+class PrincipalEnsureRequest(BaseModel):
+    """Explicit, service-only onboarding of a verified user."""
+    email: str
+    display_name: Optional[str] = None
+
+
+@router.post("/principals/ensure")
+def ensure_principal(
+    payload: PrincipalEnsureRequest,
+    api_key: Optional[str] = Header(None, alias="X-API-KEY"),
+    db: Session = Depends(get_db),
+):
+    """Create the Storage principal for an already-authenticated user.
+
+    Background: X-On-Behalf-Of deliberately FAILS for an unknown e-mail — a
+    header must never be able to mint identities. That is right for the request
+    path, but it leaves a first-login gap: a fresh AuthAPI user does not exist
+    here yet and gets 403 on everything. This endpoint closes exactly that gap,
+    and nothing more:
+
+      * only a key flagged is_service may call it (not the master key, not a
+        plain tenant key) — the caller must have proven it is a backend;
+      * the created principal gets trust_level="user", never admin;
+      * idempotent: an existing e-mail returns the existing principal
+        unchanged, so a BFF may call it on every login;
+      * it grants no access by itself — the caller still has to pass the normal
+        X-On-Behalf-Of ownership checks afterwards.
+
+    Agreed with 3DPresenter-Codex (post 4437, 2026-08-07).
+    """
+    from auth import _key_is_service
+
+    if not _key_is_service(api_key or "", db):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "principal provisioning requires a service key", "code": "not_a_service_key"},
+        )
+
+    email = (payload.email or "").strip().lower()
+    if not email or "@" not in email or len(email) > 320:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "a canonical e-mail address is required", "code": "invalid_email"},
+        )
+
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
+        logger_msg = f"principal ensure: {email} already present (id={existing.id})"
+        print(logger_msg, flush=True)
+        return {"id": existing.id, "email": existing.email, "created": False}
+
+    user = User(
+        email=email,
+        display_name=(payload.display_name or email.split("@")[0])[:255],
+        password_hash="",           # no local login — AuthAPI owns authentication
+        api_key=generate_api_key(),  # distinct per principal, never handed out here
+        trust_level="user",
+        device_ids=[],
+    )
+    db.add(user)
+    try:
+        db.commit()
+        db.refresh(user)
+    except Exception:
+        # Concurrent first login for the same address: fall back to the row the
+        # other request created instead of failing the user's very first visit.
+        db.rollback()
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=500, detail={"error": "could not create principal", "code": "create_failed"})
+        return {"id": user.id, "email": user.email, "created": False}
+
+    print(f"principal ensure: created {email} (id={user.id}) via service key {(api_key or '')[:6]}…", flush=True)
+    return {"id": user.id, "email": user.email, "created": True}
+
+
 @router.post("/upload-ticket")
 def create_upload_ticket(
     request: Request,
