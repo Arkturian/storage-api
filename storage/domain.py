@@ -174,7 +174,22 @@ async def update_file_and_record(
     storage_obj.file_url = updated["file_url"]
     storage_obj.thumbnail_url = updated.get("thumbnail_url")
     storage_obj.webview_url = updated.get("webview_url")
-    storage_obj.mime_type = updated["mime_type"]
+    # Never let a replace DOWNGRADE the type. libmagic reports markdown, yaml
+    # and similar as the generic "text/plain"; overwriting a specific
+    # text/markdown with that loses information the object already had and
+    # changes how consumers treat the file (3DPresenter, 2026-08-07). Keep the
+    # existing type when the freshly detected one is merely the generic
+    # fallback for the same family.
+    _new_mime = updated["mime_type"]
+    _old_mime = storage_obj.mime_type
+    _is_downgrade = (
+        _new_mime == "text/plain"
+        and _old_mime
+        and _old_mime != "text/plain"
+        and _old_mime.startswith("text/")
+    )
+    if not _is_downgrade:
+        storage_obj.mime_type = _new_mime
     storage_obj.file_size_bytes = updated["file_size_bytes"]
     storage_obj.checksum = updated["checksum"]
     storage_obj.width = updated.get("width")

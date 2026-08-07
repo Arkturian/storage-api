@@ -6093,12 +6093,21 @@ async def replace_file(
     # /storage/objects/{id}/analyze explicitly afterwards.
     try:
         from storage.service import enqueue_ai_safety_and_transcoding
-        await enqueue_ai_safety_and_transcoding(updated_obj, db=db, ai_mode="safety")
+        # ai_mode="none" like every other write path: AI analysis costs real
+        # money and is opt-in per call. Hardcoding "safety" here billed an
+        # analysis on EVERY replace — including a plain document save.
+        await enqueue_ai_safety_and_transcoding(updated_obj, db=db, ai_mode="none")
     except Exception as e:
         print(f"⚠️ PUT /files re-enqueue failed for {updated_obj.id}: {e}")
 
-    # Auto-trigger AI analysis for CSV files to enable differential updates
-    if updated_obj.mime_type and ("csv" in updated_obj.mime_type.lower() or "text/plain" in updated_obj.mime_type.lower()):
+    # Auto-trigger AI analysis for CSV files to enable differential updates.
+    # Restricted to ACTUAL csv: the condition used to include text/plain, and
+    # libmagic reports markdown as text/plain — so saving a presentation
+    # document ran a synchronous Gemini call plus an OpenAI embedding inline,
+    # ~42 s and real API cost for a plain save (3DPresenter E2E, 2026-08-07).
+    # A save must be a deterministic blob replace; analysis belongs in the
+    # async pipeline, requested explicitly.
+    if updated_obj.mime_type and "csv" in updated_obj.mime_type.lower():
         try:
             print(f"🔄 Auto-triggering differential update for CSV file: {updated_obj.id}")
 
