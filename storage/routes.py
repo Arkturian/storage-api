@@ -2252,6 +2252,111 @@ def _purge_expired_chunk_sessions() -> None:
         _UPLOAD_CHUNKS.pop(sid, None)
 
 
+_B64_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n"
+)
+
+
+def _looks_like_base64_text(data: bytes, probe: int = 4096) -> bool:
+    """True when `data` is plausibly base64 SOURCE TEXT rather than real bytes.
+
+    Base64 has no spaces and no bytes outside its alphabet, so a sizeable run
+    that stays inside it is almost never natural prose or binary content.
+    """
+    head = data[:probe]
+    if len(head) < 64:
+        return False
+    try:
+        text = head.decode("ascii")
+    except UnicodeDecodeError:
+        return False  # real binary — decodes as ascii only by accident
+    return all(ch in _B64_ALPHABET for ch in text)
+
+
+# Extension -> how the file MUST begin. Only formats with a mandatory
+# signature are listed: the check has to be provably wrong-or-right, never a
+# guess. Text-ish formats (.txt, .pem, .svg, .json, .csv) are deliberately
+# absent — a PEM certificate is legitimately nothing but base64 characters,
+# so judging them by content would reject valid uploads.
+_MAGIC_BY_EXT: Dict[str, Tuple[Tuple[int, bytes], ...]] = {
+    ".png":  ((0, b"\x89PNG\r\n\x1a\n"),),
+    ".jpg":  ((0, b"\xff\xd8\xff"),),
+    ".jpeg": ((0, b"\xff\xd8\xff"),),
+    ".gif":  ((0, b"GIF8"),),
+    ".bmp":  ((0, b"BM"),),
+    ".webp": ((0, b"RIFF"), (8, b"WEBP")),
+    ".ico":  ((0, b"\x00\x00\x01\x00"),),
+    ".pdf":  ((0, b"%PDF-"),),
+    ".gz":   ((0, b"\x1f\x8b"),),
+    ".zip":  ((0, b"PK\x03\x04"),),
+    ".docx": ((0, b"PK\x03\x04"),),
+    ".xlsx": ((0, b"PK\x03\x04"),),
+    ".pptx": ((0, b"PK\x03\x04"),),
+    ".mp4":  ((4, b"ftyp"),),
+    ".m4v":  ((4, b"ftyp"),),
+    ".m4a":  ((4, b"ftyp"),),
+    ".mov":  ((4, b"ftyp"),),
+    ".heic": ((4, b"ftyp"),),
+    ".avif": ((4, b"ftyp"),),
+    ".glb":  ((0, b"glTF"),),
+    ".wav":  ((0, b"RIFF"), (8, b"WAVE")),
+    ".avi":  ((0, b"RIFF"), (8, b"AVI ")),
+    ".ogg":  ((0, b"OggS"),),
+    ".flac": ((0, b"fLaC"),),
+    ".mp3":  ((0, b"ID3"),),  # bare-frame MP3s exist; see _MAGIC_SOFT below
+}
+# Formats whose signature is conventional rather than mandatory: a missing
+# match is not proof of corruption, so it must not fail the upload on its own.
+_MAGIC_SOFT = {".mp3"}
+
+
+def _assert_upload_plausible(data: bytes, filename: str, sniffed_mime: Optional[str]) -> None:
+    """Reject an assembled upload whose bytes contradict its filename.
+
+    Incident 2026-08-09 (object 118592): a client base64-encoded an already
+    base64-encoded PNG. Storage decoded ONCE, got the base64 text back, and
+    stored 2.3 MB of ASCII as `text/plain` under a `.png` name — silently. A
+    caller that mis-assembles its chunks must fail loudly, not leave litter.
+
+    Judged by signature, not by sniffed MIME: only an extension with a
+    mandatory magic number is checked, so the verdict is never a guess.
+    """
+    import os as _os
+
+    ext = _os.path.splitext(filename)[1].lower()
+    signature = _MAGIC_BY_EXT.get(ext)
+    if not signature:
+        return  # no mandatory signature for this type — nothing provable
+
+    if all(data[off:off + len(sig)] == sig for off, sig in signature):
+        return  # begins exactly as this format must
+
+    if ext in _MAGIC_SOFT:
+        return  # signature optional for this format — absence proves nothing
+
+    # It is NOT the format it claims. Name the likely cause: a client that
+    # encoded twice leaves the base64 source text behind, which is the single
+    # most useful thing to tell the caller.
+    if _looks_like_base64_text(data):
+        raise HTTPException(status_code=400, detail={
+            "error": (
+                f"assembled content is base64 TEXT, but '{filename}' must start with "
+                f"{signature[0][1]!r}. Your chunks were most likely encoded twice — send "
+                "the base64 of the RAW file bytes, not the base64 of a base64 string."
+            ),
+            "code": "double_encoded",
+        })
+
+    raise HTTPException(status_code=400, detail={
+        "error": (
+            f"assembled content does not start like {ext} "
+            f"(sniffed as {sniffed_mime or 'unknown'}) — the chunks did not reassemble "
+            "into the file they claim to be."
+        ),
+        "code": "content_type_mismatch",
+    })
+
+
 @router.post("/upload-chunk")
 async def upload_chunk(
     request: Request,
@@ -2259,6 +2364,7 @@ async def upload_chunk(
     index: int = Query(..., ge=0, description="0-based index of this chunk"),
     total_chunks: int = Query(..., ge=1, description="How many chunks the file has in total"),
     filename: str = Query(..., description="Name the finished object should carry"),
+    sha256: Optional[str] = Query(None, description="Optional sha256 of the RAW file — verified after reassembly"),
     context: Optional[str] = Query(None),
     collection_id: Optional[str] = Query(None),
     is_public: bool = Query(False),
@@ -2312,12 +2418,28 @@ async def upload_chunk(
     # Complete — assemble in index order, then decode ONCE (splitting base64
     # mid-stream is only safe when reassembled before decoding).
     _UPLOAD_CHUNKS.pop(upload_id, None)
+    # validate=True matters: without it b64decode SILENTLY DROPS characters
+    # outside the alphabet, so a corrupted transfer yields plausible-looking
+    # garbage instead of an error. Strip all whitespace first — chunks may
+    # legitimately carry line breaks, which validate=True would else reject.
+    _joined = "".join(sess["parts"][i] for i in range(total_chunks))
+    _joined = "".join(_joined.split())
     try:
-        data = _b64.b64decode("".join(sess["parts"][i] for i in range(total_chunks)))
+        data = _b64.b64decode(_joined, validate=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail={"error": f"chunks do not form valid base64: {exc}", "code": "bad_base64"})
     if not data:
         raise HTTPException(status_code=400, detail={"error": "assembled file is empty", "code": "empty_upload"})
+
+    # Optional end-to-end integrity proof: the only check that catches a
+    # reassembly error the content itself cannot reveal.
+    if sha256:
+        _actual = hashlib.sha256(data).hexdigest()
+        if _actual.lower() != sha256.strip().lower():
+            raise HTTPException(status_code=400, detail={
+                "error": f"assembled file hash {_actual} does not match expected {sha256}",
+                "code": "checksum_mismatch",
+            })
 
     _sniffed = None
     try:
@@ -2325,6 +2447,8 @@ async def upload_chunk(
         _sniffed = _magic.from_buffer(data, mime=True)
     except Exception:
         pass
+
+    _assert_upload_plausible(data, sess["filename"], _sniffed)
 
     saved_obj = await save_file_and_record(
         db,
