@@ -562,56 +562,16 @@ def process_text_analysis(object_id: int, file_path: str, filename: str) -> Dict
     }
 
 
-# --- Federation event emitter: storage.embedding_completed -------------------
-# Published after a successful ChromaDB store so SWFME workflows can WaitForEvent
-# instead of polling. Spec locked in Content post #1094 §4 (Knowledge/SWFME):
-# channel swfme.webhook.storage.embedding_completed on the IACP/arkturian Redis
-# bus; matching reads from `payload` (storage_id + host required). Best-effort,
-# fire-and-forget — never fails the embedding task.
-_iacp_redis_client = None
-
-
-def _get_iacp_redis():
-    global _iacp_redis_client
-    if _iacp_redis_client is None:
-        import os
-        import redis
-        url = os.getenv("IACP_REDIS_URL")
-        if not url:
-            return None
-        _iacp_redis_client = redis.from_url(url, socket_timeout=3, socket_connect_timeout=3)
-    return _iacp_redis_client
-
-
-def _emit_embedding_completed(storage_id: int, tenant_id: str, vector_dim: int) -> None:
-    try:
-        import os
-        import json
-        import uuid
-        from datetime import datetime, timezone
-        r = _get_iacp_redis()
-        if r is None:
-            logger.warning("   ⚠️ IACP_REDIS_URL unset — skipping embedding_completed emit")
-            return
-        event_id = str(uuid.uuid4())
-        host = os.getenv("CLOUD_NODE_NAME", "arkserver")
-        envelope = {
-            "event": "storage.embedding_completed",
-            "source_service": "storage",
-            "tenant_id": tenant_id or "arkturian",
-            "event_id": event_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "idempotency_key": event_id,
-            "payload": {
-                "storage_id": storage_id,
-                "host": host,
-                "vector_dim": vector_dim,
-            },
-        }
-        r.publish("swfme.webhook.storage.embedding_completed", json.dumps(envelope))
-        logger.info(f"   📢 emitted storage.embedding_completed for {storage_id} (host={host})")
-    except Exception as e:
-        logger.warning(f"   ⚠️ embedding_completed emit failed for {storage_id}: {e}")
+# A federation event emitter for storage.embedding_completed lived here until
+# 2026-08-11. It published to swfme.webhook.storage.embedding_completed per
+# Content post #1094 §4 and was dead on all three legs: knowledge-api has no bus
+# consumer at all (Knowledge verified in code), no sWFME workflow declares a
+# trigger for it (SWFME verified three ways), and no embedding had been produced
+# here in 14 days — ai_mode defaults to "none" because AI costs money, so the
+# emitter was never even reached. Removed rather than revived: an emitter whose
+# call returns without effect reads as working to the next person.
+# If embedding-driven features become real, wire it deliberately — a consumer on
+# Knowledge's side first, plus a decision on when embeddings get produced.
 
 
 @app.task(base=BaseStorageTask, name='tasks.ai_analysis.generate_embedding', queue='embeddings')
@@ -645,7 +605,6 @@ def generate_embedding(object_id: int) -> Dict[str, Any]:
 
         if kg_entry:
             logger.info(f"   ✅ Embedding generated and stored in ChromaDB")
-            _emit_embedding_completed(object_id, storage_obj.tenant_id, 3072)
             return {
                 "object_id": object_id,
                 "status": "embedded",
