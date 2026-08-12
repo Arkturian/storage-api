@@ -4801,9 +4801,12 @@ def get_media_trim_bounds(
         raise HTTPException(status_code=404, detail="Storage object not found")
 
     # Check permissions
-    tenant_id = current_user.tenant_id if current_user else "public"
+    # Tenant ownership is resolved from the API key by the dedicated tenancy
+    # dependency above. The legacy User model has no tenant_id attribute;
+    # reading it here made every authenticated trim-bounds request crash.
+    resolved_tenant_id = tenant_id or "public"
     if obj.tenant_id != "public":
-        if not tenant_id or tenant_id != obj.tenant_id:
+        if resolved_tenant_id != obj.tenant_id:
             raise HTTPException(status_code=403, detail="Access denied")
 
     # Check if it's an image
