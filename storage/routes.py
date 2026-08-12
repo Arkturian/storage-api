@@ -3872,13 +3872,32 @@ _GLB_PRESET_DEFAULTS = {
     "web":     {"decimate": 0.0,  "texture_format": "webp", "texture_quality": 85, "texture_max_size": 2048, "mesh_compression": "meshopt", "output": "glb"},
     "mobile":  {"decimate": 0.5,  "texture_format": "webp", "texture_quality": 75, "texture_max_size": 1024, "mesh_compression": "meshopt", "output": "glb"},
     "preview": {"decimate": 0.85, "texture_format": "webp", "texture_quality": 60, "texture_max_size": 512,  "mesh_compression": "meshopt", "output": "glb"},
+    # Art/sculpture viewing: keep the silhouette. Requested by AnnaSacher
+    # 2026-08-12 to unify four consumers that each carried their own parameter
+    # chain (website, kunstpfad knowledge items, Tschepp viewer, Tschepp AR).
+    # Differs from "web" in decimate alone (0.99 vs 0.0 = keep-all) — that is
+    # deliberate on their side and 3D-API has already warmed this exact
+    # combination for 68 models.
+    "sculpture": {"decimate": 0.99, "texture_format": "webp", "texture_quality": 85, "texture_max_size": 2048, "mesh_compression": "meshopt", "output": "glb"},
 }
 
 
 def _resolve_glb_params(decimate, texture_format, texture_quality, texture_max_size,
                         mesh_compression, output, preset) -> Dict[str, Any]:
     """Resolve GLB transform params, applying preset defaults for anything not
-    explicitly supplied. Returns the concrete params that key the derivative cache."""
+    explicitly supplied. Returns the concrete params that key the derivative cache.
+
+    An unknown preset name is an ERROR, not a silent fallback. Until 2026-08-12
+    a typo like ?preset=quatsch returned 200 with the untouched original — Tschepp
+    ran a 25-minute batch against ?preset=/usr/bin/node without a single failure
+    and had every reason to believe it was optimising. Fail loudly instead.
+    """
+    if preset and preset not in _GLB_PRESET_DEFAULTS:
+        raise HTTPException(status_code=400, detail={
+            "error": f"unknown preset '{preset}'",
+            "code": "unknown_preset",
+            "valid_presets": sorted(_GLB_PRESET_DEFAULTS.keys()),
+        })
     d = _GLB_PRESET_DEFAULTS.get(preset or "", {})
     # decimate is a keep-ratio (fraction of triangles kept): 1.0 = keep all = no
     # decimation. 3D-API treats 0.0 as a legacy alias for 1.0 (keep all), so we
