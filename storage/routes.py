@@ -3959,7 +3959,7 @@ def get_media_variant(
     texture_max_size: Optional[int] = Query(None, ge=0, description="GLB: max texture edge in px (0 = no downscale)"),
     mesh_compression: Optional[str] = Query(None, description="GLB: none | meshopt | draco"),
     output: Optional[str] = Query(None, description="GLB: glb | zip (re-bundled vs. split)"),
-    preset: Optional[str] = Query(None, description="GLB: web | mobile | preview (param shortcut)"),
+    preset: Optional[str] = Query(None, description="GLB: web | mobile | preview | sculpture (param shortcut; an unknown name is rejected with 400 and the valid list)"),
     v: Optional[str] = Query(None, description="Cache-busting checksum. When it matches the object's checksum the URL is content-addressed and the response may be cached immutably"),
     if_none_match: Optional[str] = Header(None, alias="If-None-Match"),
     db: Session = Depends(get_db),
@@ -4820,9 +4820,12 @@ def get_media_trim_bounds(
         raise HTTPException(status_code=404, detail="Storage object not found")
 
     # Check permissions
-    tenant_id = current_user.tenant_id if current_user else "public"
+    # Tenant ownership is resolved from the API key by the dedicated tenancy
+    # dependency above. The legacy User model has no tenant_id attribute;
+    # reading it here made every authenticated trim-bounds request crash.
+    resolved_tenant_id = tenant_id or "public"
     if obj.tenant_id != "public":
-        if not tenant_id or tenant_id != obj.tenant_id:
+        if resolved_tenant_id != obj.tenant_id:
             raise HTTPException(status_code=403, detail="Access denied")
 
     # Check if it's an image

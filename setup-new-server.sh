@@ -137,10 +137,23 @@ DATABASE_URL=sqlite:///${INSTALL_DIR}/storage.db
 OPENAI_API_KEY=${OPENAI_API_KEY}
 
 # ChromaDB
-CHROMA_PERSIST_DIR=${INSTALL_DIR}/chroma_data
+# NOTE: the code reads CHROMA_DB_PATH. An earlier version of this script wrote
+# CHROMA_PERSIST_DIR, which appears nowhere in the codebase — the setting was
+# silently ignored and Chroma landed on its built-in default path.
+CHROMA_DB_PATH=${INSTALL_DIR}/chroma_data
+
+# File storage — absolute, so it never depends on the working directory
+STORAGE_UPLOAD_DIR=${INSTALL_DIR}/uploads/storage
 
 # Security
 SECRET_KEY=$(openssl rand -hex 32)
+# API_KEY gates the whole API. Without it config.py falls back to a value that
+# is public in our own docs and treated as compromised — a customer install
+# must never run on it. Generated fresh per install.
+API_KEY=$(openssl rand -hex 32)
+# Belongs to a DIFFERENT tenant of ours and defaults to a demo token in
+# config.py. Emptied explicitly so no foreign tenant key is carried along.
+ONEAL_API_KEY=
 
 # Logging
 LOG_LEVEL=INFO
