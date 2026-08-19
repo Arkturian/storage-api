@@ -3959,7 +3959,7 @@ def get_media_variant(
     texture_max_size: Optional[int] = Query(None, ge=0, description="GLB: max texture edge in px (0 = no downscale)"),
     mesh_compression: Optional[str] = Query(None, description="GLB: none | meshopt | draco"),
     output: Optional[str] = Query(None, description="GLB: glb | zip (re-bundled vs. split)"),
-    preset: Optional[str] = Query(None, description="GLB: web | mobile | preview (param shortcut)"),
+    preset: Optional[str] = Query(None, description="GLB: web | mobile | preview | sculpture (param shortcut; an unknown name is rejected with 400 and the valid list)"),
     v: Optional[str] = Query(None, description="Cache-busting checksum. When it matches the object's checksum the URL is content-addressed and the response may be cached immutably"),
     if_none_match: Optional[str] = Header(None, alias="If-None-Match"),
     db: Session = Depends(get_db),
