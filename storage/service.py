@@ -1,3 +1,4 @@
+import re
 import os
 import shutil
 import aiofiles
@@ -171,7 +172,18 @@ class GenericStorageService:
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         ext = Path(original_filename).suffix.lower()
         uid = str(uuid.uuid4())[:8]
-        safe_ctx = (context or "").strip().replace("/", "-").replace(" ", "_")
+        safe_ctx = (context or "").strip()
+        # Restrict to a portable character set. macOS nodes (mac, tommy) treat
+        # ":" as a historical path separator, and parentheses/commas are awkward
+        # for any tool that passes names through a shell unquoted. 240 existing
+        # keys carry a colon, 189 parentheses (3dApi, 2026-08-20). Umlauts are
+        # transliterated rather than dropped, so the name stays readable — and
+        # it avoids the macOS NFD trap, where "ä" is stored decomposed and a
+        # name-based lookup from Linux then misses. Existing objects are NOT
+        # renamed: their key is what ties row and file together.
+        for _a, _b in (("ä","ae"),("ö","oe"),("ü","ue"),("Ä","Ae"),("Ö","Oe"),("Ü","Ue"),("ß","ss")):
+            safe_ctx = safe_ctx.replace(_a, _b)
+        safe_ctx = re.sub(r"[^A-Za-z0-9._-]+", "_", safe_ctx).strip("_")
         # context is a DESCRIPTION field, and nothing tells the caller it lands
         # in the filename — long prose is the natural way to use it. Unbounded,
         # it pushed the name past the filesystem's 255-byte limit and the upload
