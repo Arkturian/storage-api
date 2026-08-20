@@ -2801,7 +2801,8 @@ async def upload_file(
                     existing = None
 
             if not existing:
-                saved_obj = await save_file_and_record(
+                try:
+                    saved_obj = await save_file_and_record(
                     db,
                     owner_user_id=target_owner_id,
                     data=data,
@@ -2817,7 +2818,20 @@ async def upload_file(
                     tenant_id=tenant_id,
                     mime_type=file.content_type,
                     ttl_hours=ttl_hours,
-                )
+                    )
+                except OSError as exc:
+                    # A too-long name is the CALLER's problem and must say so. It used to
+                    # surface as a bare 500, which points at the file rather than at the
+                    # metadata field that actually caused it (3dApi, 2026-08-20). The
+                    # context is now truncated upstream, so this is a backstop — but any
+                    # remaining ENAMETOOLONG should still be answerable, not mysterious.
+                    import errno as _errno
+                    if exc.errno == _errno.ENAMETOOLONG:
+                        raise HTTPException(status_code=400, detail={
+                            "error": "the generated filename exceeds the filesystem limit — shorten the context parameter",
+                            "code": "filename_too_long",
+                        })
+                    raise
 
             # Attach tenant_id derived from API key for downstream KG processing
             try:

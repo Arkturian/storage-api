@@ -172,10 +172,28 @@ class GenericStorageService:
         ext = Path(original_filename).suffix.lower()
         uid = str(uuid.uuid4())[:8]
         safe_ctx = (context or "").strip().replace("/", "-").replace(" ", "_")
+        # context is a DESCRIPTION field, and nothing tells the caller it lands
+        # in the filename — long prose is the natural way to use it. Unbounded,
+        # it pushed the name past the filesystem's 255-byte limit and the upload
+        # died as a bare 500 (3dApi, 2026-08-20: a 4.7 MB GLB, where the error
+        # pointed at the file and cost him a round of halving sizes and swapping
+        # extensions). Truncate by BYTES, not characters: umlauts cost two, so a
+        # German context blows the limit far earlier than its length suggests.
+        # The full text stays in the database column either way.
+        if safe_ctx:
+            safe_ctx = safe_ctx.encode("utf-8")[:60].decode("utf-8", errors="ignore")
         prefix = f"u{owner_user_id}"
         if safe_ctx:
             prefix += f"_{safe_ctx}"
-        return f"{prefix}_{ts}_{uid}{ext}"
+        name = f"{prefix}_{ts}_{uid}{ext}"
+        # Belt and braces: an extreme original extension could still overshoot.
+        if len(name.encode("utf-8")) > 255:
+            fixed = f"u{owner_user_id}_{ts}_{uid}{ext}"
+            keep = max(255 - len(fixed.encode("utf-8")) - 1, 0)
+            safe_ctx = safe_ctx.encode("utf-8")[:keep].decode("utf-8", errors="ignore")
+            prefix = f"u{owner_user_id}" + (f"_{safe_ctx}" if safe_ctx else "")
+            name = f"{prefix}_{ts}_{uid}{ext}"
+        return name
 
     async def _extract_metadata(self, file_path: Path, mime_type: str, tenant_id: str = "arkturian") -> dict:
         width, height, duration, bit_rate = None, None, None, None
