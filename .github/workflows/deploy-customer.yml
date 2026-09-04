@@ -69,6 +69,16 @@ jobs:
         with:
           ref: ${{ env.DEPLOY_REF }}
 
+      - name: Guard - private DEPLOY_HOST braucht self-hosted Runner
+        run: |
+          case "${{ secrets.DEPLOY_HOST }}" in
+            10.*|192.168.*|172.1[6-9].*|172.2*.*|172.3[01].*)
+              if [ -z "${{ vars.RUNNER_LABEL }}" ]; then
+                echo "::error::DEPLOY_HOST ist privat (${{ secrets.DEPLOY_HOST }}), RUNNER_LABEL aber leer - SSH wuerde in einen NAT-Timeout laufen."
+                exit 1
+              fi ;;
+          esac
+
       - name: Deploy to Customer Server
         uses: appleboy/ssh-action@master
         with:
