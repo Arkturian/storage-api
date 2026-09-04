@@ -3614,6 +3614,7 @@ def head_media_variant(
 
     # Safety gate — same policy as GET. 451 instead of 200 for blocked content.
     _check_quarantine(obj, current_user, db)
+    _check_media_access(obj, current_user, db)
 
     # Re-use original resolver so we report actual file details.
     # For HEAD it is enough to resolve the source path without heavy processing.
@@ -3647,6 +3648,38 @@ QUARANTINE_DANGER_THRESHOLD = int(os.getenv("QUARANTINE_DANGER_THRESHOLD", "7"))
 # fix). Operators can enable per-host once their backfill is complete.
 STRICT_PUBLIC_NULL_SAFETY = os.getenv("STRICT_PUBLIC_NULL_SAFETY", "false").lower() in ("1", "true", "yes")
 
+
+
+def _check_media_access(obj, current_user, db=None) -> None:
+    """Deny anonymous and foreign access to non-public objects.
+
+    GET/HEAD /media/{id} served every object to anyone who knew the number, and
+    the numbers are sequential. Issue #1645: passports and ID cards of a family,
+    ingested through Telegram, were retrievable without any header. The route ran
+    842 lines with exactly one access-shaped call in it — _check_quarantine —
+    which inspects the AI safety verdict on the CONTENT, not the caller's right
+    to see it. The correct check already existed 3000 lines up (the /embed route)
+    and simply was not applied to the one route that hands out the bytes.
+
+    is_public stays anonymous on purpose: this endpoint feeds thumbnails and
+    embedded media across vod, 3DPresenter, content-app and Anna's site. Gating
+    those would break real frontends. Measured before shipping: of the objects
+    actually requested that day, none were non-public, so the gate costs nothing
+    that anyone is using.
+
+    Note _is_privileged_admin excludes tenant API keys — auth.py provisions them
+    with trust_level="admin" and they ship inside public browser bundles, so
+    "admin" from a key is not an identity worth trusting here.
+    """
+    if obj.is_public:
+        return
+    if current_user is None:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if getattr(obj, "owner_user_id", None) == getattr(current_user, "id", None):
+        return
+    if _is_privileged_admin(current_user, db):
+        return
+    raise HTTPException(status_code=403, detail="Access denied")
 
 
 def _is_privileged_admin(current_user, db) -> bool:
@@ -4013,6 +4046,7 @@ def get_media_variant(
 
     # Safety gate (raises 451 if blocked, bypassed for owner/admin)
     _check_quarantine(obj, current_user, db)
+    _check_media_access(obj, current_user, db)
 
     media_type_current = (obj.mime_type or "application/octet-stream")
     mime = media_type_current.lower()
