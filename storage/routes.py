@@ -1162,15 +1162,34 @@ async def kg_health_check(
 
         stats = kg_pipeline.get_stats(tenant_id=tenant_id)
         openai_configured = bool(os.getenv("OPENAI_API_KEY"))
-        from knowledge_graph.embedding_service import embedding_service as _emb
+
+        # Import ONLY when configured: embedding_service builds an OpenAI client
+        # at import time and raises "Missing credentials" without a key. That
+        # exception used to land in the generic handler below, so an instance
+        # without the (optional) key reported a bare "unhealthy" plus a raw SDK
+        # message — and the openai_configured field meant to describe exactly
+        # this case was never reached. Cloud hit it on agentos1 after the tenant
+        # rollout (2026-09-05) and had to judge from the raw text whether the
+        # store was broken. It is not: upload, delivery and variants work fine
+        # without a key; only embeddings do. Say that instead.
+        embedding_model = vector_dimensions = None
+        if openai_configured:
+            from knowledge_graph.embedding_service import embedding_service as _emb
+            embedding_model = _emb.model
+            vector_dimensions = _emb.dimensions
 
         return {
-            "status": "healthy",
+            "status": "healthy" if openai_configured else "degraded",
             "total_embeddings": stats["total_embeddings"],
             "vector_store": stats["collection"],
             "openai_configured": openai_configured,
-            "embedding_model": _emb.model,
-            "vector_dimensions": _emb.dimensions
+            "embedding_model": embedding_model,
+            "vector_dimensions": vector_dimensions,
+            "detail": None if openai_configured else (
+                "OPENAI_API_KEY is not set — embeddings and semantic search are "
+                "unavailable. Storage itself (upload, delivery, variants) is "
+                "unaffected."
+            ),
         }
     except Exception as e:
         print(f"❌ KG health check error: {e}")
