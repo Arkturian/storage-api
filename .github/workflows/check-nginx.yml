@@ -5,7 +5,7 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Check NGINX configs
         uses: appleboy/ssh-action@v1.0.3
@@ -33,4 +33,3 @@ jobs:
             echo ""
             echo "=== Storage API Error Logs (last 20 lines) ==="
             tail -20 /var/log/storage-api-error.log 2>/dev/null || echo "Log not found"
-
