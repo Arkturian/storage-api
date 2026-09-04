@@ -5,7 +5,7 @@ on:
 
 jobs:
   check-logs:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
 
     steps:
       - name: Check storage-api logs and test api-ai
@@ -36,4 +36,3 @@ jobs:
             echo ""
             echo "=== storage-api service status ==="
             systemctl status storage-api --no-pager -l | head -15
-
