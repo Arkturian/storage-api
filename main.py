@@ -61,6 +61,23 @@ async def startup():
                 "normal owner/admin access."
             )
             print("🔴 SECURITY: master API_KEY is the public hardcoded default — set API_KEY in the env", flush=True)
+        # Same class, different variable: DEFAULT_TENANT_ID falls back to the
+        # OPERATOR's tenant name. On a customer instance that never sets it,
+        # every keyless request silently resolves to "arkturian" — Cloud found
+        # this on David's instance, where kg_health reported the collection
+        # tenant_arkturian_knowledge instead of the customer's own (Steward #35).
+        # Nothing errors; the store is simply empty and the name looks plausible.
+        # Deliberately NOT fail-closed: oneal runs without the variable today and
+        # resolves its tenant through API keys, so refusing to start would take
+        # out a working instance to fix a latent one. Loud instead of silent.
+        if not os.getenv("DEFAULT_TENANT_ID"):
+            import logging as _lg2
+            _lg2.getLogger("uvicorn.error").warning(
+                "TENANCY: DEFAULT_TENANT_ID is unset — keyless requests resolve to "
+                "the operator tenant 'arkturian'. On a customer instance set it to "
+                "that customer's tenant id."
+            )
+            print("🟡 TENANCY: DEFAULT_TENANT_ID unset — keyless requests resolve to 'arkturian'", flush=True)
     except Exception:
         pass
     await connect_db()

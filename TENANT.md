@@ -25,6 +25,7 @@ Ohne diese Werte startet der Dienst zwar, läuft aber falsch. Sie sind alle
 | `CHROMA_DB_PATH` | **Genau dieser Name.** `CHROMA_PERSIST_DIR` wird nirgends gelesen; wer ihn setzt, bekommt lautlos den eingebauten Vorgabepfad. |
 | `STORAGE_UPLOAD_DIR` | absolut angeben, sonst relativ zum Arbeitsverzeichnis |
 | `TENANT_ID` | eigener Mandantenname, **nicht** `arkturian` |
+| `DEFAULT_TENANT_ID` | **Pflicht.** Auf welchen Mandanten ein Aufruf **ohne** Schlüssel fällt. Ungesetzt lautet der Rückfall `arkturian` — der Betreiber. Auf David's Instanz meldete `kg_health` dadurch die Sammlung `tenant_arkturian_knowledge` statt der eigenen: kein Fehler, nur ein leerer Speicher mit plausiblem Namen. Der Dienst warnt seit `2a2035f` beim Start, wenn die Variable fehlt. |
 | `ONEAL_API_KEY` | ausdrücklich **leeren** — der Vorgabewert gehört einem fremden Mandanten |
 | `IACP_REDIS_URL` | **nicht setzen.** Ungesetzt bedeutet keine Bus-Anbindung, und genau das ist für eine isolierte Instanz richtig. |
 
