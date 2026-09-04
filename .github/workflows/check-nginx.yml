@@ -5,8 +5,18 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
+      - name: Guard - private DEPLOY_HOST braucht self-hosted Runner
+        run: |
+          case "${{ secrets.DEPLOY_HOST }}" in
+            10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+              if [ -z "${{ vars.RUNNER_LABEL }}" ]; then
+                echo "::error::DEPLOY_HOST ist privat (${{ secrets.DEPLOY_HOST }}), RUNNER_LABEL aber leer - SSH wuerde in einen NAT-Timeout laufen."
+                exit 1
+              fi ;;
+          esac
+
       - name: Check NGINX configs
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -33,4 +43,3 @@ jobs:
             echo ""
             echo "=== Storage API Error Logs (last 20 lines) ==="
             tail -20 /var/log/storage-api-error.log 2>/dev/null || echo "Log not found"
-

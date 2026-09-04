@@ -20,7 +20,7 @@ env:
 jobs:
   test:
     name: Run Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
 
     steps:
       - name: Checkout code
@@ -58,7 +58,7 @@ jobs:
   deploy-customer:
     name: Deploy to Customer (arkturian.com)
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     environment:
       name: customer
       url: https://api-storage.arkturian.com
@@ -68,6 +68,16 @@ jobs:
         uses: actions/checkout@v3
         with:
           ref: ${{ env.DEPLOY_REF }}
+
+      - name: Guard - private DEPLOY_HOST braucht self-hosted Runner
+        run: |
+          case "${{ secrets.DEPLOY_HOST }}" in
+            10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+              if [ -z "${{ vars.RUNNER_LABEL }}" ]; then
+                echo "::error::DEPLOY_HOST ist privat (${{ secrets.DEPLOY_HOST }}), RUNNER_LABEL aber leer - SSH wuerde in einen NAT-Timeout laufen."
+                exit 1
+              fi ;;
+          esac
 
       - name: Deploy to Customer Server
         uses: appleboy/ssh-action@master
