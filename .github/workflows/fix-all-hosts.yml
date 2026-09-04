@@ -5,7 +5,7 @@ on:
 
 jobs:
   fix-hosts:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
 
     steps:
       - name: Add hosts entries for all APIs
@@ -56,4 +56,3 @@ jobs:
             
             echo ""
             echo "✅ Done! All hosts entries added."
-
