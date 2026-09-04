@@ -182,6 +182,16 @@ async def storage_media_head_headers(request: Request, call_next):
             _md_priv = obj.metadata_json if isinstance(obj.metadata_json, dict) else {}
             if _md_priv.get("private_media"):
                 return Response(status_code=403, headers=_apply_cors_for_head({}, request))
+            # Issue #1645: a non-public object must not leak through HEAD either.
+            # The GET route got its access check, but this middleware answers
+            # FIRST and would still have confirmed existence, size and MIME of
+            # any object to an anonymous caller — enough to enumerate a store
+            # with sequential IDs. Middleware has no current_user (auth runs in
+            # the route), so the only safe answer here is the anonymous one:
+            # public passes, everything else is denied. Owners and admins still
+            # reach the object through GET, which does know who is asking.
+            if not obj.is_public:
+                return Response(status_code=403, headers=_apply_cors_for_head({}, request))
 
             danger = obj.ai_danger_potential or 0
             threshold = int(os.getenv("QUARANTINE_DANGER_THRESHOLD", "7"))
