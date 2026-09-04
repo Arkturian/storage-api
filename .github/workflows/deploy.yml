@@ -25,7 +25,7 @@ env:
 jobs:
   test:
     name: Run Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -72,7 +72,7 @@ jobs:
     # if the VPS ever becomes a storage host again.
     if: ${{ false }}
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     environment:
       name: production
       url: https://api-storage.arkturian.com
@@ -179,7 +179,7 @@ jobs:
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       (github.event_name != 'workflow_dispatch' || inputs.deploy_arkserver)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     environment:
       name: staging
       url: https://api-storage.arkserver.arkturian.com
@@ -308,7 +308,7 @@ jobs:
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       (github.event_name != 'workflow_dispatch' || inputs.deploy_aiserver)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     environment:
       name: oneal
       url: https://gsgbot.arkturian.com
@@ -405,7 +405,7 @@ jobs:
     if: |
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     environment:
       name: pdrei
       url: https://storage-api.pdrei.arkturian.com
@@ -573,7 +573,7 @@ jobs:
       always() &&
       github.ref == 'refs/heads/main' &&
       (needs.deploy-arkturian.result == 'success' || needs.deploy-arkserver.result == 'success')
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Trigger C# SDK regeneration
         uses: peter-evans/repository-dispatch@v2
