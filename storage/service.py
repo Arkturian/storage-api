@@ -1386,10 +1386,15 @@ async def enqueue_ai_safety_and_transcoding(storage_obj, db=None, skip_ai_safety
         or mime_lc in SAFETY_BYPASS_MIMES
         or fname_lc.endswith((".md", ".markdown", ".json", ".yaml", ".yml", ".xml", ".toml", ".csv"))
     )
-    if is_markup and ai_mode != "none":
+    if is_markup:
         # Mark as completed/safe so the quarantine gate lets the asset
         # through. We don't run an actual safety check — the content shape
         # (markup, no embedded media) makes the risk negligible.
+        # Independent of ai_mode on purpose: this costs nothing, and a markup
+        # object left at 'pending' is blocked for anonymous readers forever.
+        # PUT /files reset a public presentation to 'pending' and then called
+        # here with ai_mode="none" — the bypass was skipped, the share link
+        # answered 451 until someone edited the row (3DPresenter, 2026-09-10).
         logger.info(
             f"⏭️  Bypassing safety analysis for markup/config "
             f"(ctx={storage_obj.context!r} mime={storage_obj.mime_type!r}) "
