@@ -87,7 +87,24 @@ class TranscodingHelper:
             output_dir.mkdir(parents=True, exist_ok=True)
 
             # Transcode (this will run async)
+            import time as _time
+            job_started = _time.time()
             result = await transcoder.transcode(source_path, output_dir)
+
+            # A re-transcode with a different ladder (4k/1080p/720p replacing
+            # 1080p/720p/480p on 2026-09-10) left the previous rendition's
+            # playlist and 24 segments as orphans next to the new master.
+            # Remove playlists/segments older than this job — only on success,
+            # so a failed run keeps the old set playable. Done here, in front
+            # of both response modes, because this is the path the worker
+            # actually takes (the transcoding package handles the transfer).
+            if result.success:
+                for stale in list(output_dir.glob("*.m3u8")) + list(output_dir.glob("*.ts")):
+                    try:
+                        if stale.stat().st_mtime < job_started - 1:
+                            stale.unlink()
+                    except OSError as unlink_err:
+                        logging.warning(f"⚠️ Could not remove stale {stale.name}: {unlink_err}")
 
             # Update database with transcoding result
             from database import SessionLocal
