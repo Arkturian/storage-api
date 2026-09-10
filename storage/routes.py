@@ -602,7 +602,7 @@ def _ensure_pdf_preview(
 
 from database import get_db
 from auth import get_current_user, get_current_user_optional, generate_api_key
-from models import StorageObject, StorageObjectResponse, StorageListResponse, User, AsyncTask
+from models import StorageObject, StorageObjectResponse, StorageListResponse, User, AsyncTask, CollectionSummary, CollectionPreview, CollectionListResponse
 from ai_analysis import analyze_content
 from config import settings
 from pydantic import BaseModel
@@ -5391,6 +5391,142 @@ def get_object_metadata(
     return response_obj
 
 
+def _scope_query_to_caller(q, *, anonymous: bool, tenant_id: Optional[str], tenant: Optional[str]):
+    """Tenant + public narrowing shared by /list and /collections.
+
+    One function on purpose: /collections must show exactly the objects
+    /list would show, or its counts lie. Keyed callers are pinned to the
+    key's tenant. Keyless callers see only is_public, never tombstoned, never
+    private_media — and no tenant pin (public is public), narrowable with
+    ?tenant=. COALESCE on the json_extract is essential: for a row that HAS
+    metadata_json but no private_media key the extract is NULL, and
+    NOT (NULL = 1) is NULL — a naive filter dropped every object carrying any
+    metadata (12,657 public objects collapsed to 321).
+    """
+    if not anonymous:
+        q = q.filter(StorageObject.tenant_id == tenant_id)
+    elif tenant:
+        q = q.filter(StorageObject.tenant_id == tenant)
+    if anonymous:
+        q = q.filter(StorageObject.is_public.is_(True))
+        q = q.filter(StorageObject.tombstoned_at.is_(None))
+        q = q.filter(
+            func.coalesce(func.json_extract(StorageObject.metadata_json, "$.private_media"), 0) != 1
+        )
+    return q
+
+
+def _owner_filter_applies(*, anonymous: bool, mine: bool, current_user, db) -> bool:
+    """Whether the caller's view is narrowed to objects they own.
+
+    Anonymous: no ownership concept, the public filter rules. mine=false is
+    honoured only for a REAL admin identity — tenant keys ship in browser
+    bundles and must not list foreign inventory (Issue #799).
+    """
+    if anonymous:
+        return False
+    if not mine and _is_privileged_admin(current_user, db):
+        return False
+    return True
+
+
+_UNCATEGORIZED_NAME = "Uncategorized"
+
+
+def _collection_display_name(cid: str) -> str:
+    if not cid:
+        return _UNCATEGORIZED_NAME
+    tail = cid.rstrip("/").split("/")[-1]
+    return tail or cid
+
+
+@router.get("/collections", response_model=CollectionListResponse)
+def list_collections(
+    request: Request,
+    search: Optional[str] = Query(None, description="Case-insensitive contains filter on collection_id"),
+    prefix: Optional[str] = Query(None, description="Only collections whose id starts with this path (case-insensitive), e.g. 'UdoJuergensMp3/' for the sub-collections of one folder"),
+    sort: str = Query("updated_at", pattern="^(updated_at|name|item_count)$", description="updated_at (default) | name | item_count"),
+    order: str = Query("desc", pattern="^(asc|desc)$", description="Explicit direction — no '-' prefix convention here"),
+    preview: bool = Query(False, description="Attach the newest visible object of each collection (id, mime_type, urls)"),
+    include_uncategorized: bool = Query(True, description="Include the bucket of objects without collection_id (id=null)"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    tenant: Optional[str] = Query(None, description="Keyless calls only: restrict to one tenant"),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    tenant_id: Optional[str] = Depends(get_tenant_id_optional),
+):
+    """Collections as GROUP BY over the caller's /list?collection_id=X view.
+
+    There is no collections table: collection_id is a free string on each
+    object, hierarchy is the '/' convention. NULL and '' fold into one bucket
+    with id=null.
+
+    Visibility is exactly what /list applies when a collection is addressed:
+    keyed callers see their tenant, keyless callers only public objects — and
+    NO owner narrowing, because /list skips the owner filter as soon as
+    collection_id or collection_like is set (a collection is a tenant-wide
+    thing). So item_count is the number /list?collection_id=X returns to the
+    same caller. A `mine` parameter would promise a narrowing that opening
+    the collection does not honour; it is deliberately absent.
+
+    Requested by XCodeFieldshare (post 4961): /admin/collections is admin-
+    only, not tenant-bound and its item_count is always null.
+    """
+    anonymous = current_user is None
+
+    bucket = func.coalesce(func.nullif(StorageObject.collection_id, ""), "")
+    item_count = func.count(StorageObject.id).label("item_count")
+    updated_at = func.max(StorageObject.created_at).label("updated_at")
+    latest_id = func.max(StorageObject.id).label("latest_id")
+
+    q = db.query(bucket.label("cid"), item_count, updated_at, latest_id)
+    q = _scope_query_to_caller(q, anonymous=anonymous, tenant_id=tenant_id, tenant=tenant)
+
+    if not include_uncategorized:
+        q = q.filter(bucket != "")
+    if prefix:
+        q = q.filter(StorageObject.collection_id.ilike(prefix.replace("%", "\\%").replace("_", "\\_") + "%", escape="\\"))
+    if search:
+        q = q.filter(StorageObject.collection_id.ilike("%" + search.replace("%", "\\%").replace("_", "\\_") + "%", escape="\\"))
+
+    q = q.group_by(bucket)
+    total = q.count()  # SQLAlchemy wraps the grouped select → number of groups
+
+    order_col = {"updated_at": updated_at, "name": bucket, "item_count": item_count}[sort]
+    q = q.order_by(order_col.asc() if order == "asc" else order_col.desc(), bucket.asc())
+    rows = q.offset(offset).limit(limit).all()
+
+    previews: Dict[int, CollectionPreview] = {}
+    if preview and rows:
+        base_url = get_base_url_from_request(request)
+        ids = [r.latest_id for r in rows if r.latest_id is not None]
+        for o in db.query(StorageObject).filter(StorageObject.id.in_(ids)).all():
+            urls = build_storage_urls(
+                object_id=o.id, tenant_id=o.tenant_id, checksum=o.checksum,
+                metadata_json=o.metadata_json, base_url=base_url,
+                storage_mode=o.storage_mode, stored_file_url=o.file_url or None,
+                mime_type=o.mime_type,
+            )
+            previews[o.id] = CollectionPreview(
+                id=o.id, mime_type=o.mime_type, file_url=urls["file_url"],
+                thumbnail_url=urls["thumbnail_url"], webview_url=urls["webview_url"],
+            )
+
+    items = [
+        CollectionSummary(
+            id=r.cid or None,
+            name=_collection_display_name(r.cid),
+            item_count=r.item_count,
+            updated_at=r.updated_at,
+            latest_object_id=r.latest_id,
+            preview=previews.get(r.latest_id),
+        )
+        for r in rows
+    ]
+    return CollectionListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
 @router.get("/list", response_model=StorageListResponse)
 def list_objects(
     request: Request,
@@ -5429,27 +5565,9 @@ def list_objects(
     # Join with User table to get owner email
     q = db.query(StorageObject, User.email.label('owner_email')).outerjoin(User, StorageObject.owner_user_id == User.id)
 
-    # Filter by tenant_id first for performance. Skipped for anonymous callers:
-    # without a key the tenant dependency falls back to DEFAULT_TENANT_ID, which
-    # would silently hide every public object stored under a different tenant
-    # (arkturian's FloraFauna vs. arkserver's default → 0 results). Public is
-    # public regardless of tenant; callers can still narrow with ?tenant=.
-    if not anonymous:
-        q = q.filter(StorageObject.tenant_id == tenant_id)
-    elif tenant:
-        q = q.filter(StorageObject.tenant_id == tenant)
-
-    if anonymous:
-        q = q.filter(StorageObject.is_public.is_(True))
-        q = q.filter(StorageObject.tombstoned_at.is_(None))
-        # private_media lives inside metadata_json. COALESCE is essential: for a
-        # row that HAS metadata_json but no private_media key, json_extract
-        # returns NULL, and `NOT (NULL = 1)` is NULL — i.e. not true — so a naive
-        # filter silently dropped every object carrying any metadata at all
-        # (12,657 public objects collapsed to the 321 with metadata_json IS NULL).
-        q = q.filter(
-            func.coalesce(func.json_extract(StorageObject.metadata_json, "$.private_media"), 0) != 1
-        )
+    # Tenant pin + anonymous public narrowing — shared with /collections so
+    # both endpoints describe the same set (see _scope_query_to_caller).
+    q = _scope_query_to_caller(q, anonymous=anonymous, tenant_id=tenant_id, tenant=tenant)
 
     # Exact-id lookup (admin deep-link / Search-ID): the most specific filter,
     # returns just that object regardless of pagination/other filters.
@@ -5470,11 +5588,7 @@ def list_objects(
     elif collection_like:
         like = f"%{collection_like}%"
         q = q.filter(StorageObject.collection_id.ilike(like))
-    elif anonymous:
-        pass  # no ownership concept without a key — the public filter above rules
-    elif not mine and _is_privileged_admin(current_user, db):
-        pass
-    else:
+    elif _owner_filter_applies(anonymous=anonymous, mine=mine, current_user=current_user, db=db):
         q = q.filter(StorageObject.owner_user_id == current_user.id)
 
     if context:

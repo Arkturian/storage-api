@@ -227,6 +227,38 @@ class StorageListResponse(BaseModel):
     offset: int
 
 
+class CollectionPreview(BaseModel):
+    """Newest visible object of a collection — enough for a tile, nothing more."""
+    id: int
+    mime_type: Optional[str] = None
+    file_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    webview_url: Optional[str] = None
+
+
+class CollectionSummary(BaseModel):
+    """One collection_id bucket of GET /storage/collections.
+
+    id is None for the bucket of objects without a collection_id. name is the
+    last '/' segment of the id (hierarchy convention), 'Uncategorized' for the
+    null bucket. item_count / updated_at / latest_object_id are computed over
+    exactly the objects the same caller sees on /storage/list.
+    """
+    id: Optional[str] = None
+    name: str
+    item_count: int
+    updated_at: Optional[datetime] = None
+    latest_object_id: Optional[int] = None
+    preview: Optional[CollectionPreview] = None
+
+
+class CollectionListResponse(BaseModel):
+    items: List[CollectionSummary]
+    total: int
+    limit: int
+    offset: int
+
+
 class UserResponse(BaseModel):
     id: int
     email: str
