@@ -6310,10 +6310,18 @@ async def replace_file(
     # /storage/objects/{id}/analyze explicitly afterwards.
     try:
         from storage.service import enqueue_ai_safety_and_transcoding
-        # ai_mode="none" like every other write path: AI analysis costs real
-        # money and is opt-in per call. Hardcoding "safety" here billed an
-        # analysis on EVERY replace — including a plain document save.
-        await enqueue_ai_safety_and_transcoding(updated_obj, db=db, ai_mode="none")
+        # The status was just reset to 'pending', so SOMETHING must resolve it
+        # or the object stays blocked for anonymous readers forever:
+        #   - markup/config: the free bypass inside enqueue_* marks it completed
+        #     (now independent of ai_mode);
+        #   - public media: a real safety check — the bytes changed while the
+        #     object is exposed, exactly the case the quarantine exists for;
+        #   - private media: nothing now (no cost); PATCH is_public→true
+        #     re-checks because the status is not 'completed'.
+        # Hardcoding "safety" for every replace billed a plain document save
+        # (2026-08-07); hardcoding "none" left public objects stuck (2026-09-10).
+        replace_mode = "safety" if updated_obj.is_public else "none"
+        await enqueue_ai_safety_and_transcoding(updated_obj, db=db, ai_mode=replace_mode)
     except Exception as e:
         print(f"⚠️ PUT /files re-enqueue failed for {updated_obj.id}: {e}")
 
