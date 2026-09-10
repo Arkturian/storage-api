@@ -214,8 +214,13 @@ class TranscodingHelper:
                 logging.error("❌ Transcoding is disabled")
                 return
 
-            # Upload to transcoding-api and receive ZIP
-            async with httpx.AsyncClient(timeout=600.0) as client:
+            # Upload to transcoding-api and receive ZIP. The call is synchronous
+            # on the wire: the response starts only when EVERY tier is encoded.
+            # 600 s was enough for the fixed 1080p ladder (~7.5 min on 4K
+            # masters) but not for a 4K top tier — the client would give up
+            # while ffmpeg keeps running and the result is never fetched.
+            # Aligned with the Celery soft limit (3300 s) instead.
+            async with httpx.AsyncClient(timeout=httpx.Timeout(3300.0, connect=30.0)) as client:
                 with open(source_path, "rb") as f:
                     files = {"file": (source_path.name, f, "video/mp4")}
 
@@ -236,6 +241,16 @@ class TranscodingHelper:
 
                         logging.info(f"📦 Received ZIP: {len(response.content)} bytes")
 
+                        # Drop the previous rendition first — a re-transcode
+                        # with a different ladder (e.g. 4k/1080p/720p replacing
+                        # 1080p/720p/480p) would otherwise leave orphan
+                        # playlists and segments next to the new master.
+                        # Only on success: a failed run keeps the old HLS set.
+                        for stale in list(output_dir.glob("*.m3u8")) + list(output_dir.glob("*.ts")):
+                            try:
+                                stale.unlink()
+                            except OSError as unlink_err:
+                                logging.warning(f"⚠️ Could not remove stale {stale.name}: {unlink_err}")
                         # Extract ZIP
                         with zipfile.ZipFile(zip_path, 'r') as zipf:
                             zipf.extractall(output_dir)
@@ -288,6 +303,22 @@ class TranscodingHelper:
 
         except Exception as e:
             logging.error(f"❌ Transcoding error: {e}")
+            # Without this the object stayed 'processing' forever after a
+            # client-side timeout or network error.
+            try:
+                from database import SessionLocal
+                from models import StorageObject
+                db_session = SessionLocal()
+                try:
+                    storage_obj = db_session.get(StorageObject, storage_object_id)
+                    if storage_obj:
+                        storage_obj.transcoding_status = "failed"
+                        storage_obj.transcoding_error = f"{type(e).__name__}: {e}"[:500]
+                        db_session.commit()
+                finally:
+                    db_session.close()
+            except Exception as db_err:
+                logging.error(f"Failed to record transcoding failure: {db_err}")
             import traceback
             traceback.print_exc()
 
