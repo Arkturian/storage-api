@@ -5531,6 +5531,13 @@ def list_objects(
         }
         order_col = sort_map.get(raw, StorageObject.created_at)
 
+    # Total BEFORE pagination. Until 2026-09-10 this was len(page): every
+    # caller saw total == limit and could not tell page 1 from the last page
+    # (XCodeFieldshare, post 4961). Counted on the filtered query, so it
+    # reflects exactly the caller's visibility; `has_hls` is a post-filter on
+    # the filesystem and is deliberately NOT part of the count.
+    total = q.order_by(None).count()
+
     q = q.order_by(order_col.asc() if order_asc else order_col.desc())
 
     # Pagination
@@ -5639,9 +5646,6 @@ def list_objects(
             item for item in response_items
             if (bool(item.hls_url) == has_hls)
         ]
-    
-    # Get total count for pagination (pre has_hls filter)
-    total = len(response_items)
     
     return StorageListResponse(
         items=response_items,
