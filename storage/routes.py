@@ -5543,6 +5543,7 @@ def list_objects(
     min_id: Optional[int] = Query(None, description="Only return objects with id >= min_id"),
     max_id: Optional[int] = Query(None, description="Only return objects with id <= max_id"),
     id: Optional[int] = Query(None, description="Return only the object with this exact id (within the tenant) — exact-id lookup for admin deep-links"),
+    uncategorized: bool = Query(False, description="Only objects WITHOUT a collection (collection_id NULL or ''). Same view as the id=null bucket of /storage/collections; 422 together with collection_id/collection_like/link_id"),
     sort: Optional[str] = Query(None, description="Sort field: 'created_at' (default), 'id', 'filename', 'file_size'. Prefix with '-' for asc, default desc."),
     offset: int = Query(0, ge=0, description="Pagination offset"),
     limit: int = Query(100, ge=1, le=5000),
@@ -5561,6 +5562,12 @@ def list_objects(
     anonymous = current_user is None
     if anonymous:
         mine = False
+
+    if uncategorized and (collection_id or collection_like or link_id):
+        raise HTTPException(
+            status_code=422,
+            detail="uncategorized=true cannot be combined with collection_id, collection_like or link_id",
+        )
 
     # Join with User table to get owner email
     q = db.query(StorageObject, User.email.label('owner_email')).outerjoin(User, StorageObject.owner_user_id == User.id)
@@ -5588,6 +5595,11 @@ def list_objects(
     elif collection_like:
         like = f"%{collection_like}%"
         q = q.filter(StorageObject.collection_id.ilike(like))
+    elif uncategorized:
+        # The id=null bucket of /storage/collections: NULL and '' fold together.
+        # Sits in this chain on purpose — like any addressed collection it is
+        # tenant-wide, not owner-narrowed, so its count matches item_count.
+        q = q.filter(func.coalesce(func.nullif(StorageObject.collection_id, ""), "") == "")
     elif _owner_filter_applies(anonymous=anonymous, mine=mine, current_user=current_user, db=db):
         q = q.filter(StorageObject.owner_user_id == current_user.id)
 

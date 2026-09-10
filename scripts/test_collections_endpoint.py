@@ -16,6 +16,7 @@ Covered (anonymous, always):
   8. uncategorized  id=null present by default, gone with include_uncategorized=false
   9. preview        preview.id belongs to that collection and is visible
  10. validation     bad sort / order / limit -> 422
+ 12. /list?uncategorized=true == null bucket item_count; 422 with collection_id/like/link_id
 Keyed (with --key): 11. per-collection item_count == /list?collection_id=X with the same
                         key. No sum check there: /list without collection_id narrows to
                         the owner (unless admin + mine=false), /list WITH collection_id is
@@ -82,6 +83,15 @@ def run(c: httpx.Client, label: str, list_params: dict, sum_check: bool) -> None
     for i in sorted(named, key=lambda x: -x["item_count"])[:3] + named[-2:]:
         n = list_total(c, {**list_params, "collection_id": i["id"]})
         check(n == i["item_count"], f"item_count matches /list for {i['id'][:40]}", f"{i['item_count']} vs {n}")
+    null_bucket = next((i for i in items if i["id"] is None), None)
+    if null_bucket:
+        n = list_total(c, {**list_params, "uncategorized": "true"})
+        check(n == null_bucket["item_count"], "uncategorized bucket matches /list?uncategorized=true", f"{null_bucket['item_count']} vs {n}")
+        r = c.get("/storage/list", params={"uncategorized": "true", "limit": 3})
+        check(all(not o.get("collection_id") for o in r.json()["items"]), "/list?uncategorized=true returns only objects without collection")
+    for bad in ({"collection_id": "x"}, {"collection_like": "x"}, {"link_id": "1"}):
+        r = c.get("/storage/list", params={"uncategorized": "true", **bad})
+        check(r.status_code == 422, f"uncategorized + {list(bad)[0]} -> 422", str(r.status_code))
 
 
 def main() -> int:
