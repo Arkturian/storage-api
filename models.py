@@ -74,6 +74,10 @@ class StorageObject(Base):
         Index("ix_storage_tenant_owner_created", "tenant_id", "owner_user_id", "created_at"),
         Index("ix_storage_tenant_context", "tenant_id", "context"),
         Index("ix_storage_tenant_created", "tenant_id", "created_at"),
+        # Neu angelegte SQLite-Datenbanken bekommen AUTOINCREMENT (#1943). Bestehende
+        # Tabellen aendert create_all nicht — dort schuetzt der before_insert-Waechter
+        # unten (_assign_never_reused_id).
+        {"sqlite_autoincrement": True},
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -268,3 +272,52 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+
+# ── Nummern werden nie wiederverwendet (#1943) ─────────────────────────────────
+#
+# `id INTEGER PRIMARY KEY` OHNE AUTOINCREMENT vergibt in SQLite max(id)+1. Wer die
+# HOECHSTEN Zeilen loescht, gibt ihre Nummern frei: am 18.09.2026 auf pdrei
+# wurden vier Ausweisbilder (media/1549-1552) um 07:45 geloescht und die Nummern
+# um 08:03 an Zahlungslisten eines anderen Agenten neu vergeben. Eine media-ID
+# ist aber eine Fundstelle — in Posts, Issues, Manifesten — und muss fuer immer
+# denselben Inhalt meinen (vgl. #772 Upload-Unveraenderlichkeit). Der zentrale
+# Speicher auf arkserver hatte dasselbe Schema.
+#
+# SQLite kann AUTOINCREMENT nicht nachtraeglich per ALTER setzen, ein Umbau der
+# Tabelle braeuchte eine Auszeit aller Worker. Stattdessen fuehrt eine
+# Hochwassermarke je Tabelle Buch; sie wird im SELBEN Schreibvorgang wie der
+# Insert fortgeschrieben. Das UPDATE nimmt die Schreibsperre (SQLite) bzw. die
+# Zeilensperre (PostgreSQL) — zwei gleichzeitige Uploads aus verschiedenen
+# Prozessen bekommen also verschiedene Nummern, und nie eine schon vergebene.
+# Beim ersten Einsatz startet die Marke bei max(id): Nummern, die VOR dem Einsatz
+# frei wurden, sind damit nicht mehr zu retten — alles danach schon.
+
+from sqlalchemy import event as _sa_event, text as _sa_text
+
+_HWM_TABLE = "id_high_water"
+_hwm_ready: set = set()
+
+
+def _hwm_next(connection, table: str) -> int:
+    key = id(connection.engine)
+    if key not in _hwm_ready:
+        connection.execute(_sa_text(
+            f"CREATE TABLE IF NOT EXISTS {_HWM_TABLE} (tbl VARCHAR(64) PRIMARY KEY, hwm BIGINT NOT NULL)"))
+        _hwm_ready.add(key)
+    groesser = "GREATEST" if connection.dialect.name == "postgresql" else "MAX"
+    connection.execute(_sa_text(
+        f"INSERT INTO {_HWM_TABLE} (tbl, hwm) SELECT :t, 0 "
+        f"WHERE NOT EXISTS (SELECT 1 FROM {_HWM_TABLE} WHERE tbl = :t)"), {"t": table})
+    connection.execute(_sa_text(
+        f"UPDATE {_HWM_TABLE} SET hwm = {groesser}(hwm, COALESCE((SELECT MAX(id) FROM {table}), 0)) + 1 "
+        f"WHERE tbl = :t"), {"t": table})
+    return int(connection.execute(_sa_text(
+        f"SELECT hwm FROM {_HWM_TABLE} WHERE tbl = :t"), {"t": table}).scalar())
+
+
+@_sa_event.listens_for(StorageObject, "before_insert")
+def _assign_never_reused_id(mapper, connection, target):
+    if target.id is None:
+        target.id = _hwm_next(connection, StorageObject.__tablename__)
