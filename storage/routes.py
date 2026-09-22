@@ -1737,8 +1737,7 @@ def clean_tenant_objects_endpoint(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if current_user.trust_level != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    _require_bulk_admin(current_user, db)
 
     result = _clean_tenant_objects(
         db,
@@ -1761,8 +1760,7 @@ def delete_tenant_objects(
     current_user: User = Depends(get_current_user),
 ):
     """Deprecated: use /storage/admin/clean-tenant."""
-    if current_user.trust_level != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    _require_bulk_admin(current_user, db)
 
     result = _clean_tenant_objects(
         db,
@@ -3701,6 +3699,34 @@ def _check_media_access(obj, current_user, db=None) -> None:
     raise HTTPException(status_code=403, detail="Access denied")
 
 
+def _is_public_default_master(current_user) -> bool:
+    """True while the master key is still config.py's publicly known default.
+
+    That value shipped in a browser bundle (2026-07-30) and is unset on this
+    host's service environment (measured 2026-09-22, Issue #1960). Anyone can
+    present it, so the system@api identity it maps to must not carry any
+    privilege that would be dangerous in a stranger's hands. The restriction
+    is tied to the risk condition: setting a real API_KEY lifts it by itself.
+    """
+    return settings.API_KEY == "Inetpass1" and getattr(current_user, "email", None) == "system@api"
+
+
+def _require_bulk_admin(current_user, db) -> None:
+    """Gate for operations that destroy data across a whole tenant.
+
+    Until 2026-09-22 these routes checked only trust_level == "admin". auth.py
+    provisions EVERY tenant key's user with that flag, and tenant keys ship in
+    public browser bundles — so any of them could wipe ANY tenant: verified by
+    dry run, a koralmbahn key asking /admin/clean-tenant for tenant "oneal"
+    passed the gate and was offered 1,853 objects to delete. Now: a real admin
+    identity only (never a tenant key, never an impersonated principal — see
+    _is_privileged_admin), and never the public default master. Measured before
+    tightening: 0 calls to these routes in 14 days of access logs.
+    """
+    if not _is_privileged_admin(current_user, db) or _is_public_default_master(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+
 def _is_privileged_admin(current_user, db) -> bool:
     """True only for a REAL admin identity — never for a tenant API key.
 
@@ -3808,7 +3834,7 @@ def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] =
         # master key is the known default, the system@api identity gets NO bypass
         # for confidential objects. Setting a real API_KEY env var restores it
         # automatically — the restriction is tied to the actual risk condition.
-        if settings.API_KEY == "Inetpass1" and getattr(current_user, "email", None) == "system@api":
+        if _is_public_default_master(current_user):
             _is_admin = False
             _is_owner = False
         if not (_is_admin or _is_owner):
@@ -6003,6 +6029,7 @@ async def replace_object_image(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(get_tenant_id),
 ):
     """Replace an object's image bytes IN PLACE (e.g. from the editor: rotate/crop)
     targeting the exact object by id — not the fragile filename+owner reuse path.
@@ -6011,11 +6038,16 @@ async def replace_object_image(
     ai_*); only the file + dimensions/checksum change. So a re-encoded edit — whose
     canvas export has no EXIF — keeps its stored GPS etc. Clears stale derivative
     caches so the new bytes are served everywhere immediately."""
+    # Looked up by id alone and gated only by trust_level == "admin" until
+    # 2026-09-22 — every tenant key carries that flag, so any public-bundle key
+    # could overwrite the bytes of ANY object in ANY tenant. Now the caller must
+    # own the object inside its own tenant, or be a real admin (not a tenant
+    # key, not the public default master). 404 rather than 403 for foreign
+    # objects: no confirmation that the id exists elsewhere.
     obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
-    if not obj:
+    privileged = _is_privileged_admin(current_user, db) and not _is_public_default_master(current_user)
+    if not obj or (not privileged and (obj.tenant_id != tenant_id or obj.owner_user_id != current_user.id)):
         raise HTTPException(status_code=404, detail="Not found")
-    if current_user.trust_level != "admin" and obj.owner_user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Forbidden")
     data = await file.read()
     is_image = (
         data[:3] == b"\xff\xd8\xff"            # JPEG
