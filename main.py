@@ -129,6 +129,7 @@ app.add_middleware(
     expose_headers=[
         "Content-Length",
         "Content-Range",
+        "Content-Disposition",
         "X-HLS-URL",
         "X-Transcoding-Status",
         "X-Mime-Type",
@@ -137,7 +138,7 @@ app.add_middleware(
 )
 
 _MEDIA_ID_RE = re.compile(r"^/storage/media/(\d+)/?$")
-_EXPOSE_HEADERS = "Content-Length, Content-Range, X-HLS-URL, X-Transcoding-Status, X-Mime-Type, X-Transcoded-Size"
+_EXPOSE_HEADERS = "Content-Length, Content-Range, Content-Disposition, X-HLS-URL, X-Transcoding-Status, X-Mime-Type, X-Transcoded-Size"
 
 # Query params that change the served representation. For HEAD requests carrying
 # any of these, the raw source file_size_bytes/mime is NOT the truth — reporting
@@ -243,13 +244,14 @@ async def storage_media_head_headers(request: Request, call_next):
 
             # ?download=1 → Content-Disposition: attachment (mirror GET's download
             # param) so HEAD advertises the same download intent + filename.
-            if (qp.get("download") or "").strip().lower() in ("1", "true", "yes", "on"):
-                from urllib.parse import quote as _quote
-                _dl_raw = os.path.basename(obj.original_filename or f"file_{object_id}")
-                _dl_ascii = re.sub(r"[^A-Za-z0-9._ -]", "_", _dl_raw).strip() or f"file_{object_id}"
-                _dl_cd = f"attachment; filename=\"{_dl_ascii}\"; filename*=UTF-8''{_quote(_dl_raw)}"
-            else:
-                _dl_cd = "inline"
+            # Same helper as the GET route, so HEAD and GET name the file alike.
+            _dl_cd = storage_routes.content_disposition(
+                "attachment"
+                if (qp.get("download") or "").strip().lower() in ("1", "true", "yes", "on")
+                else "inline",
+                obj.original_filename,
+                object_id,
+            )
 
             # Audio transcode (?format=mp3|wav|...): report the target audio mime
             # (and, for a cached derivative, its exact size) so HEAD doesn't lie

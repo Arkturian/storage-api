@@ -3667,6 +3667,22 @@ STRICT_PUBLIC_NULL_SAFETY = os.getenv("STRICT_PUBLIC_NULL_SAFETY", "false").lowe
 
 
 
+def content_disposition(kind: str, original_filename, object_id) -> str:
+    """RFC 6266 Content-Disposition with both filename forms.
+
+    filename= is an ASCII fallback (everything outside [A-Za-z0-9._ -] becomes
+    "_", which also removes quotes, backslashes and CR/LF), filename*= is the
+    exact UTF-8 name percent-encoded per RFC 5987 with nothing left unescaped.
+    Used by the GET route and the HEAD middleware so both answer identically.
+    """
+    import os as _os
+    import re as _re
+    from urllib.parse import quote as _quote
+    raw = _os.path.basename(original_filename or f"file_{object_id}") or f"file_{object_id}"
+    ascii_name = _re.sub(r"[^A-Za-z0-9._ -]", "_", raw).strip() or f"file_{object_id}"
+    return f"{kind}; filename=\"{ascii_name}\"; filename*=UTF-8''{_quote(raw, safe='')}"
+
+
 def _check_media_access(obj, current_user, db=None) -> None:
     """Deny anonymous and foreign access to non-public objects.
 
@@ -4116,23 +4132,18 @@ def get_media_variant(
 
     # Build extra headers for downstream consumers (HLS-aware frontends, etc.).
     # CORSMiddleware exposes these via Access-Control-Expose-Headers (see main.py).
-    if download:
-        # Force a browser "Save As" with the object's real filename instead of
-        # inline render/play. Emit both an ASCII-sanitized filename= (legacy
-        # fallback) and an RFC 5987 filename*= (UTF-8) so unicode names like
-        # "Ólafur Arnalds …" survive. Keyless for public objects — the canonical
-        # share/download link is /storage/media/{id}?download=1.
-        import re as _re
-        from urllib.parse import quote as _quote
-        _raw_name = os.path.basename(obj.original_filename or f"file_{object_id}")
-        _ascii_name = _re.sub(r"[^A-Za-z0-9._ -]", "_", _raw_name).strip() or f"file_{object_id}"
-        _disposition = (
-            f"attachment; filename=\"{_ascii_name}\"; "
-            f"filename*=UTF-8''{_quote(_raw_name)}"
-        )
-    else:
-        _disposition = "inline"
-
+    # Content-Disposition always carries the object's real name (RFC 6266):
+    # an ASCII-sanitized filename= as legacy fallback plus an RFC 5987
+    # filename*= in UTF-8, so "Angebot für Müller.docx" survives. `inline`
+    # by default (render/play in place), `attachment` with ?download=1 to force
+    # "Save As". Until 2026-09-25 the inline answer carried no name at all, so
+    # the CloudV2 portal could only label an attachment "Datei 126248 · Word"
+    # (requested by Alex via CloudV2). The name is not new information for a
+    # caller who may read the bytes: /storage/objects/{id} already returns
+    # original_filename under the same access rules.
+    _disposition = content_disposition(
+        "attachment" if download else "inline", obj.original_filename, object_id
+    )
     _media_extra_headers: Dict[str, str] = {"Content-Disposition": _disposition}
 
     # Caching. Media responses carried an ETag but no Cache-Control, and the
