@@ -4149,11 +4149,25 @@ def get_media_variant(
     #   no ?v=                 -> the id alone can serve new bytes after a
     #                             replace-image, so only a short max-age plus
     #                             revalidation is honest.
+    #
+    # Private objects (is_public=0 or private_media) are the exception: only
+    # the owner, an On-Behalf principal or a real admin gets past
+    # _check_media_access, and the answer depends on WHO asked, not only on the
+    # URL. "public" let any cache keyed by URL — a device HTTP cache in a
+    # native client, a proxy — hand account A's bytes to account B after a
+    # logout (measured 2026-09-23: public, max-age=3600, Vary: Origin only).
+    # Such responses must never be stored anywhere.
+    _md_cache = obj.metadata_json if isinstance(obj.metadata_json, dict) else {}
+    _private_repr = (not obj.is_public) or bool(_md_cache.get("private_media"))
+
+    def _media_cache_control(public_value: str) -> str:
+        return "private, no-store" if _private_repr else public_value
+
     _v_param = (v or "").strip()
     if _v_param and obj.checksum and _v_param == obj.checksum:
-        _media_extra_headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        _media_extra_headers["Cache-Control"] = _media_cache_control("public, max-age=31536000, immutable")
     else:
-        _media_extra_headers["Cache-Control"] = "public, max-age=3600"
+        _media_extra_headers["Cache-Control"] = _media_cache_control("public, max-age=3600")
 
     # Conditional requests. Starlette's FileResponse sets an ETag but never
     # evaluates If-None-Match, so a revalidating client got 200 plus the full
@@ -4305,7 +4319,7 @@ def get_media_variant(
             # moderate max-age + the existing ETag revalidation is the safe cache
             # contract for browsers/CDNs (requested by CHAP2/Alex for the 67
             # pre-warmed Flora/Fauna GLBs, 2026-07-22).
-            _media_extra_headers["Cache-Control"] = "public, max-age=86400"
+            _media_extra_headers["Cache-Control"] = _media_cache_control("public, max-age=86400")
             return FileResponse(glb_cache_path, media_type=media_type_glb, headers=_media_extra_headers)
 
         # Forward to 3D-API via multipart upload (portable across storage instances).
@@ -4356,7 +4370,7 @@ def get_media_variant(
         except Exception:
             pass  # Best-effort cache write — still serve the response
 
-        _media_extra_headers["Cache-Control"] = "public, max-age=86400"
+        _media_extra_headers["Cache-Control"] = _media_cache_control("public, max-age=86400")
         return Response(content=resp.content, media_type=media_type_glb, headers=_media_extra_headers)
 
     if not mime.startswith("image/"):
