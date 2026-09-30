@@ -5391,7 +5391,8 @@ def get_object_metadata(
     return response_obj
 
 
-def _scope_query_to_caller(q, *, anonymous: bool, tenant_id: Optional[str], tenant: Optional[str]):
+def _scope_query_to_caller(q, *, anonymous: bool, tenant_id: Optional[str], tenant: Optional[str],
+                           include_temporary: bool = True):
     """Tenant + public narrowing shared by /list and /collections.
 
     One function on purpose: /collections must show exactly the objects
@@ -5402,6 +5403,11 @@ def _scope_query_to_caller(q, *, anonymous: bool, tenant_id: Optional[str], tena
     metadata_json but no private_media key the extract is NULL, and
     NOT (NULL = 1) is NULL — a naive filter dropped every object carrying any
     metadata (12,657 public objects collapsed to 321).
+
+    include_temporary=False drops every object with a TTL (expires_at set,
+    whether still pending or already due for the 15-min purge cron). It sits
+    here, before any grouping or paging, so /list total and /collections
+    item_count/total/latest_object_id/preview all describe the same set.
     """
     if not anonymous:
         q = q.filter(StorageObject.tenant_id == tenant_id)
@@ -5413,6 +5419,8 @@ def _scope_query_to_caller(q, *, anonymous: bool, tenant_id: Optional[str], tena
         q = q.filter(
             func.coalesce(func.json_extract(StorageObject.metadata_json, "$.private_media"), 0) != 1
         )
+    if not include_temporary:
+        q = q.filter(StorageObject.expires_at.is_(None))
     return q
 
 
@@ -5449,6 +5457,7 @@ def list_collections(
     order: str = Query("desc", pattern="^(asc|desc)$", description="Explicit direction — no '-' prefix convention here"),
     preview: bool = Query(False, description="Attach the newest visible object of each collection (id, mime_type, urls)"),
     include_uncategorized: bool = Query(True, description="Include the bucket of objects without collection_id (id=null)"),
+    include_temporary: bool = Query(True, description="false = only permanent objects (expires_at IS NULL); TTL objects are dropped before counting, grouping, paging and preview. Default true keeps existing callers unchanged"),
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
     tenant: Optional[str] = Query(None, description="Keyless calls only: restrict to one tenant"),
@@ -5481,7 +5490,8 @@ def list_collections(
     latest_id = func.max(StorageObject.id).label("latest_id")
 
     q = db.query(bucket.label("cid"), item_count, updated_at, latest_id)
-    q = _scope_query_to_caller(q, anonymous=anonymous, tenant_id=tenant_id, tenant=tenant)
+    q = _scope_query_to_caller(q, anonymous=anonymous, tenant_id=tenant_id, tenant=tenant,
+                               include_temporary=include_temporary)
 
     if not include_uncategorized:
         q = q.filter(bucket != "")
@@ -5544,6 +5554,7 @@ def list_objects(
     max_id: Optional[int] = Query(None, description="Only return objects with id <= max_id"),
     id: Optional[int] = Query(None, description="Return only the object with this exact id (within the tenant) — exact-id lookup for admin deep-links"),
     uncategorized: bool = Query(False, description="Only objects WITHOUT a collection (collection_id NULL or ''). Same view as the id=null bucket of /storage/collections; 422 together with collection_id/collection_like/link_id"),
+    include_temporary: bool = Query(True, description="false = only permanent objects (expires_at IS NULL); TTL objects are dropped before counting, grouping, paging and preview. Default true keeps existing callers unchanged"),
     sort: Optional[str] = Query(None, description="Sort field: 'created_at' (default), 'id', 'filename', 'file_size'. Prefix with '-' for asc, default desc."),
     offset: int = Query(0, ge=0, description="Pagination offset"),
     limit: int = Query(100, ge=1, le=5000),
@@ -5574,7 +5585,8 @@ def list_objects(
 
     # Tenant pin + anonymous public narrowing — shared with /collections so
     # both endpoints describe the same set (see _scope_query_to_caller).
-    q = _scope_query_to_caller(q, anonymous=anonymous, tenant_id=tenant_id, tenant=tenant)
+    q = _scope_query_to_caller(q, anonymous=anonymous, tenant_id=tenant_id, tenant=tenant,
+                               include_temporary=include_temporary)
 
     # Exact-id lookup (admin deep-link / Search-ID): the most specific filter,
     # returns just that object regardless of pagination/other filters.

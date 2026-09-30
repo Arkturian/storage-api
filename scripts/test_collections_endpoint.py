@@ -17,6 +17,9 @@ Covered (anonymous, always):
   9. preview        preview.id belongs to that collection and is visible
  10. validation     bad sort / order / limit -> 422
  12. /list?uncategorized=true == null bucket item_count; 422 with collection_id/like/link_id
+ 13. include_temporary=false: sum(item_count) == /list total with the same flag, no TTL
+     object in /list, validation 422; with --ttl-fixture PREFIX also the seeded mixed /
+     ttl-only collections (count, latest_object_id and preview fall back to permanent)
 Keyed (with --key): 11. per-collection item_count == /list?collection_id=X with the same
                         key. No sum check there: /list without collection_id narrows to
                         the owner (unless admin + mine=false), /list WITH collection_id is
@@ -98,6 +101,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True)
     ap.add_argument("--key", default=None, help="API key for the keyed run (never printed)")
+    ap.add_argument("--ttl-fixture", default=None, help="collection prefix holding the seeded 'mixed' and 'ttl-only' collections, e.g. FieldShareTTLTest/")
     a = ap.parse_args()
 
     anon = httpx.Client(base_url=a.base, timeout=60)
@@ -139,6 +143,34 @@ def main() -> int:
     for params in ({"sort": "bogus"}, {"order": "sideways"}, {"limit": 0}, {"limit": 5000}):
         r = anon.get("/storage/collections", params=params)
         check(r.status_code == 422, f"validation 422 for {params}", str(r.status_code))
+
+    print("\n== include_temporary (anonymous)")
+    items_p, total_p = page_all(anon, {"include_temporary": "false"})
+    lt_p = list_total(anon, {"mine": "false", "include_temporary": "false"})
+    check(sum(i["item_count"] for i in items_p) == lt_p, "include_temporary=false: sum(item_count) == /list total", f"{sum(i['item_count'] for i in items_p)} vs {lt_p}")
+    check(total_p == len(items_p), "include_temporary=false: total == groups paged", f"{total_p} vs {len(items_p)}")
+    r = anon.get("/storage/list", params={"mine": "false", "include_temporary": "false", "sort": "-id", "limit": 5000}).json()
+    check(all(o.get("expires_at") is None for o in r["items"]), "include_temporary=false: /list carries no expires_at")
+    check(list_total(anon, {"mine": "false"}) >= lt_p, "default (true) is a superset of false")
+    for ep in ("/storage/list", "/storage/collections"):
+        r = anon.get(ep, params={"include_temporary": "maybe"})
+        check(r.status_code == 422, f"{ep} include_temporary=maybe -> 422", str(r.status_code))
+    if a.ttl_fixture:
+        pre = a.ttl_fixture
+        def coll(flag):
+            d = anon.get("/storage/collections", params={"prefix": pre, "preview": "true", "include_temporary": flag}).json()
+            return {i["id"]: i for i in d["items"]}, d["total"]
+        on, t_on = coll("true")
+        off, t_off = coll("false")
+        mixed, ttl_only = pre + "mixed", pre + "ttl-only"
+        check(t_on == 2 and on[mixed]["item_count"] == 2 and on[ttl_only]["item_count"] == 1, "fixture true: mixed=2, ttl-only=1", str({k: v["item_count"] for k, v in on.items()}))
+        check(t_off == 1 and ttl_only not in off and off[mixed]["item_count"] == 1, "fixture false: ttl-only gone, mixed=1", str({k: v["item_count"] for k, v in off.items()}))
+        lo = anon.get("/storage/list", params={"collection_id": mixed, "include_temporary": "false"}).json()["items"]
+        check(len(lo) == 1 and lo[0]["expires_at"] is None, "fixture false: /list mixed = the permanent object")
+        if mixed in off and lo:
+            check(off[mixed]["latest_object_id"] == lo[0]["id"] == (off[mixed]["preview"] or {}).get("id"), "fixture false: latest_object_id + preview fall back to permanent object")
+        la = anon.get("/storage/list", params={"collection_id": mixed}).json()["items"]
+        check(any(o["expires_at"] for o in la), "fixture default: /list mixed shows the TTL object with expires_at")
 
     if a.key:
         keyed = httpx.Client(base_url=a.base, timeout=60, headers={"X-API-KEY": a.key})
