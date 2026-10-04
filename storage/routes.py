@@ -7213,7 +7213,10 @@ def sign_media_links(
         raise HTTPException(status_code=400, detail={"error": "signing is the service's own act; drop X-On-Behalf-Of", "code": "on_behalf_not_allowed"})
     row = _presented_tenant_key(request, db)
     tenants = {t.strip() for t in ((row.sign_tenants if row else None) or "").split(",") if t.strip()}
-    if not row or not row.is_service or payload.tenant not in tenants:
+    # sign_tenants alone authorises this (set only by the operator). It does
+    # NOT require is_service: a pure signing key must not also be able to act
+    # on behalf of arbitrary people via X-On-Behalf-Of.
+    if not row or payload.tenant not in tenants:
         raise HTTPException(status_code=403, detail={"error": "this key may not sign for this tenant", "code": "sign_not_allowed"})
     scope = _validate_scope(payload.scope)
     if not (1 <= payload.ttl <= _signing.MAX_TTL_SECONDS):
@@ -7312,7 +7315,10 @@ def move_media_grants(
         raise HTTPException(status_code=400, detail={"error": "moving grants is the service's own act; drop X-On-Behalf-Of", "code": "on_behalf_not_allowed"})
     row = _presented_tenant_key(request, db)
     tenants = {t.strip() for t in ((row.sign_tenants if row else None) or "").split(",") if t.strip()}
-    if not row or not row.is_service or payload.tenant not in tenants:
+    # sign_tenants alone authorises this (set only by the operator). It does
+    # NOT require is_service: a pure signing key must not also be able to act
+    # on behalf of arbitrary people via X-On-Behalf-Of.
+    if not row or payload.tenant not in tenants:
         raise HTTPException(status_code=403, detail={"error": "this key may not manage grants for this tenant", "code": "sign_not_allowed"})
     src = _validate_scope(payload.from_scope)
     dst = _validate_scope(payload.to_scope)

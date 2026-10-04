@@ -40,6 +40,11 @@ def sign(client, ids, **kw):
 
 print("== who may sign")
 check(sign(PLAIN, [P]).status_code == 403, "plain tenant key -> 403")
+signonly = "sk_test_signonly_" + __import__("secrets").token_hex(8)
+db.execute("insert into tenant_api_keys (api_key, tenant_id, label, is_active, is_service, sign_tenants) values (?,?,?,?,?,?)", (signonly, "arkturian", "test sign-only", 1, 0, "arkturian")); db.commit()
+SO = httpx.Client(base_url=B, headers={"X-API-KEY": signonly}, timeout=60)
+check(sign(SO, [P]).status_code == 200, "sign-only key (is_service=0, sign_tenants) may sign")
+check(SO.get("/storage/list", params={"limit": 1}, headers={"X-On-Behalf-Of": owner_q}).status_code == 403, "sign-only key cannot act on behalf of anyone")
 if svc2: check(httpx.post(f"{B}/storage/sign", headers={"X-API-KEY": svc2[0]}, json={"tenant": "arkturian", "scope": scope, "ids": [P], "ttl": 60}).status_code == 403, "service key without sign_tenants -> 403")
 check(sign(S, [P], tenant="oneal").status_code == 403, "service key, tenant not enabled -> 403")
 check(sign(S, [P], headers={"X-On-Behalf-Of": owner_q}).status_code == 400, "X-On-Behalf-Of on /sign -> 400")
