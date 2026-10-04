@@ -7274,3 +7274,64 @@ def _bind_on_upload(db: Session, obj, scope: Optional[str], current_user) -> Non
     db.add(MediaGrant(object_id=obj.id, scope=scope, granted_by_user_id=current_user.id, granted_via="upload"))
     db.commit()
     print(f"🔗 upload grant object={obj.id} scope={scope} by_user={current_user.id}", flush=True)
+
+
+class GrantMoveRequest(BaseModel):
+    tenant: str
+    from_scope: str
+    to_scope: str
+
+
+def _scope_family(scope: str) -> str:
+    """'cloud-session:x' and 'cloud-session-x:ab' -> 'cloud'. Moves stay inside one family."""
+    return scope.split(":", 1)[0].split("-", 1)[0]
+
+
+@router.post("/grants/move")
+def move_media_grants(
+    payload: GrantMoveRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Re-point every binding of one scope to another (Post 5250: agent rename).
+
+    Same gate as POST /storage/sign: an active service key whose sign_tenants
+    lists `tenant`, no X-On-Behalf-Of. It grants nothing new — that key may
+    already sign any scope of its tenant — and it only touches objects of
+    that tenant. Moves stay inside one scope family ("cloud-…"), so a
+    rename can never re-label a post's images as an agent's.
+    If the object already carries `to_scope`, the old row is dropped (merge).
+    """
+    from models import MediaGrant
+
+    if request.headers.get("X-On-Behalf-Of"):
+        raise HTTPException(status_code=400, detail={"error": "moving grants is the service's own act; drop X-On-Behalf-Of", "code": "on_behalf_not_allowed"})
+    row = _presented_tenant_key(request, db)
+    tenants = {t.strip() for t in ((row.sign_tenants if row else None) or "").split(",") if t.strip()}
+    if not row or not row.is_service or payload.tenant not in tenants:
+        raise HTTPException(status_code=403, detail={"error": "this key may not manage grants for this tenant", "code": "sign_not_allowed"})
+    src = _validate_scope(payload.from_scope)
+    dst = _validate_scope(payload.to_scope)
+    if src == dst:
+        raise HTTPException(status_code=422, detail={"error": "from_scope equals to_scope", "code": "same_scope"})
+    if _scope_family(src) != _scope_family(dst):
+        raise HTTPException(status_code=422, detail={"error": "scopes must belong to the same family", "code": "cross_family"})
+
+    rows = (
+        db.query(MediaGrant)
+        .join(StorageObject, StorageObject.id == MediaGrant.object_id)
+        .filter(MediaGrant.scope == src, StorageObject.tenant_id == payload.tenant)
+        .all()
+    )
+    have_dst = {g.object_id for g in db.query(MediaGrant.object_id).filter(
+        MediaGrant.scope == dst, MediaGrant.object_id.in_([r.object_id for r in rows] or [-1])).all()}
+    moved = merged = 0
+    for g in rows:
+        if g.object_id in have_dst:
+            db.delete(g); merged += 1
+        else:
+            g.scope = dst; moved += 1
+    db.commit()
+    print(f"🔗 grants move key={row.label or row.tenant_id} tenant={payload.tenant} {src} -> {dst} moved={moved} merged={merged}", flush=True)
+    return {"from_scope": src, "to_scope": dst, "moved": moved, "merged": merged}
