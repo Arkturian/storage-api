@@ -2159,6 +2159,7 @@ def create_upload_ticket(
     private: bool = Query(False, description="Mark confidential — media endpoint then serves it to owner/admin only"),
     ai_mode: str = Query("none", description="none | safety | vision | full — AI analysis costs money, default off"),
     ttl_hours: Optional[int] = Query(None, description="Auto-delete the uploaded object after N hours"),
+    grant_scope: Optional[str] = Query(None, description="Bind the uploaded object to this scope (media_grants)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     tenant_id: str = Depends(get_tenant_id),
@@ -2171,6 +2172,7 @@ def create_upload_ticket(
     """
     import secrets as _secrets
 
+    grant_scope = _check_upload_scope(grant_scope)
     _purge_expired_tickets()
     token = _secrets.token_urlsafe(32)
     _UPLOAD_TICKETS[token] = {
@@ -2183,6 +2185,7 @@ def create_upload_ticket(
         "private": bool(private),
         "ai_mode": ai_mode,
         "ttl_hours": ttl_hours,
+        "grant_scope": grant_scope,
         "expires_at": time.time() + _TICKET_TTL_SECONDS,
     }
     base = str(request.base_url).rstrip("/")
@@ -2248,6 +2251,9 @@ async def consume_upload_ticket(
         except Exception as exc:  # never fail the upload over analysis
             print(f"⚠️ ticket upload: analysis enqueue failed for {saved_obj.id}: {exc}")
 
+    if ticket.get("grant_scope"):
+        from types import SimpleNamespace as _NS
+        _bind_on_upload(db, saved_obj, ticket["grant_scope"], _NS(id=ticket["owner_user_id"]))
     _resp = StorageObjectResponse.from_orm(saved_obj)
     _hydrate_storage_urls(_resp, saved_obj, request)
     return _resp
@@ -2525,6 +2531,7 @@ async def upload_file(
     ai_context_role: Optional[str] = Form(None),  # product|lifestyle|doc|other
     reuse_existing: bool = Form(True),  # Auto-detect duplicate uploads by filename+tenant+owner
     ttl_hours: Optional[int] = Form(None),  # Auto-delete after N hours (None = permanent)
+    grant_scope: Optional[str] = Form(None),  # Post 5250: bind the new object to this scope (media_grants) in the same request
     private: bool = Form(False),  # Issue #420: set metadata_json.private_media → /storage/media serves this object only to owner/admin (403 for everyone else). Set AT UPLOAD to avoid the window where a confidential file is enumerable before a follow-up PATCH lands.
     transcribe_audio: bool = Form(False),  # Video: demux audio + transcribe via api-ai → audio_transcript (needs an analysis ai_mode)
     x_compute_focal: Optional[str] = Header(None),  # Opt-in: "true"/"1" → compute face focal point at upload (images only, AI-cost-free, default off)
@@ -2533,6 +2540,7 @@ async def upload_file(
     api_key_header: Optional[str] = Security(_APIKeyHeader(name="X-API-KEY", auto_error=False)),
     tenant_id: Optional[str] = Depends(get_tenant_id),
 ):
+    grant_scope = _check_upload_scope(grant_scope)
     import logging
     glogger = logging.getLogger("gunicorn.error")
 
@@ -2760,6 +2768,7 @@ async def upload_file(
                 
             # Return immediately after HLS processing (successful or failed) - avoid normal upload pipeline
             _resp = StorageObjectResponse.from_orm(saved_obj)
+            _bind_on_upload(db, saved_obj, grant_scope, current_user)
             _hydrate_storage_urls(_resp, saved_obj, request)
             return _resp
         else:
@@ -2941,6 +2950,7 @@ async def upload_file(
             glogger.error(f"⚠️ X-Compute-Focal failed for {saved_obj.id} (upload unaffected): {_focal_exc}")
 
     _resp = StorageObjectResponse.from_orm(saved_obj)
+    _bind_on_upload(db, saved_obj, grant_scope, current_user)
     _hydrate_storage_urls(_resp, saved_obj, request)
     return _resp
 
@@ -2954,6 +2964,7 @@ class RemoteFetchRequest(BaseModel):
     link_id: Optional[str] = None
     filename: Optional[str] = None
     analyze: bool = False
+    grant_scope: Optional[str] = None  # Post 5250: bind the fetched object to this scope
 
 
 @router.post("/fetch", response_model=StorageObjectResponse)
@@ -2965,6 +2976,7 @@ async def fetch_and_store_remote(
     api_key_header: str = Security(_APIKeyHeader(name="X-API-KEY", auto_error=True)),
     tenant_id: str = Depends(get_tenant_id),
 ):
+    _fetch_scope = _check_upload_scope(payload.grant_scope)
     # Resolve target owner
     target_owner_id = current_user.id
     if payload.owner_email:
@@ -3157,6 +3169,7 @@ async def fetch_and_store_remote(
 
         _resp = StorageObjectResponse.from_orm(saved_obj)
         _hydrate_storage_urls(_resp, saved_obj, request)
+        _bind_on_upload(db, saved_obj, _fetch_scope, current_user)
         return _resp
 
     except HTTPException:
@@ -7233,3 +7246,31 @@ def sign_media_links(
     expires = datetime.fromtimestamp(int(now) + payload.ttl, tz=timezone.utc).isoformat().replace("+00:00", "Z")
     print(f"✍️ sign key={row.label or row.tenant_id} tenant={payload.tenant} scope={scope} ids={len(ids)} signed={signed_n} ttl={payload.ttl}", flush=True)
     return {"expires_at": expires, "items": items}
+
+
+def _check_upload_scope(scope: Optional[str]) -> Optional[str]:
+    """Validate grant_scope BEFORE anything is stored (422 leaves no object)."""
+    if scope is None or not str(scope).strip():
+        return None
+    return _validate_scope(scope)
+
+
+def _bind_on_upload(db: Session, obj, scope: Optional[str], current_user) -> None:
+    """Bind a just-stored object to `scope` (Post 5250, variant c).
+
+    Safe without owner/admin checks: the caller supplied these bytes in this
+    very request, so the binding cannot unlock anything that was not already
+    theirs. Only a filename-dedupe replay returns an existing row, and that
+    row belongs to the same owner by construction — checked anyway.
+    """
+    if not scope or obj is None:
+        return
+    from models import MediaGrant
+    if getattr(obj, "owner_user_id", None) != getattr(current_user, "id", None):
+        print(f"🔗 upload grant skipped object={obj.id}: owner mismatch", flush=True)
+        return
+    if db.query(MediaGrant).filter(MediaGrant.object_id == obj.id, MediaGrant.scope == scope).first():
+        return
+    db.add(MediaGrant(object_id=obj.id, scope=scope, granted_by_user_id=current_user.id, granted_via="upload"))
+    db.commit()
+    print(f"🔗 upload grant object={obj.id} scope={scope} by_user={current_user.id}", flush=True)
