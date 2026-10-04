@@ -1018,7 +1018,7 @@ async def find_similar_objects(
 
     # Check access (owner or public)
     if obj.owner_user_id != current_user.id and not obj.is_public:
-        if current_user.trust_level != "admin":
+        if not _is_privileged_admin(current_user, db):
             raise HTTPException(status_code=403, detail="Access denied")
 
     try:
@@ -1027,7 +1027,7 @@ async def find_similar_objects(
         # Build tenant-aware where filter for vector search
         where = None
         try:
-            if current_user.trust_level == "admin":
+            if _is_privileged_admin(current_user, db):
                 where = None
             else:
                 # Prefer tenant from API key mapping; fallback to email domain
@@ -1063,7 +1063,7 @@ async def find_similar_objects(
         )
 
         # Enforce access control: owner, public, or same-tenant (API key tenant or email domain); admin bypass
-        if current_user.trust_level != "admin":
+        if not _is_privileged_admin(current_user, db):
             tenant_domain = None
             try:
                 if getattr(current_user, "email", None) and "@" in current_user.email:
@@ -1233,7 +1233,7 @@ async def kg_text_search(
 
         # Build metadata filter for vector store
         where: Optional[dict] = None
-        if current_user.trust_level == "admin":
+        if _is_privileged_admin(current_user, db):
             if mine:
                 where = {"owner_user_id": current_user.id}
             else:
@@ -1284,10 +1284,10 @@ async def kg_text_search(
         for so, owner_email in rows:
             # Access control: allow owner, public, or admin
             try:
-                if not (getattr(so, "is_public", False) or so.owner_user_id == current_user.id or current_user.trust_level == "admin"):
+                if not (getattr(so, "is_public", False) or so.owner_user_id == current_user.id or _is_privileged_admin(current_user, db)):
                     continue
             except Exception:
-                pass
+                continue  # fail closed (#2282): an access check that throws must not admit the row
             allowed_ids.add(so.id)
             # Only serialize the (heavy, ~30k-char) full object when explicitly requested.
             if include_source_file:
@@ -1370,7 +1370,7 @@ async def kg_vibe_search(
 
         # Build metadata filter
         where: Optional[dict] = None
-        if current_user.trust_level == "admin":
+        if _is_privileged_admin(current_user, db):
             if mine:
                 where = {"owner_user_id": current_user.id}
         else:
@@ -1417,10 +1417,10 @@ async def kg_vibe_search(
         for so, owner_email in rows:
             # Access control
             try:
-                if not (getattr(so, "is_public", False) or so.owner_user_id == current_user.id or current_user.trust_level == "admin"):
+                if not (getattr(so, "is_public", False) or so.owner_user_id == current_user.id or _is_privileged_admin(current_user, db)):
                     continue
             except Exception:
-                pass
+                continue  # fail closed (#2282): an access check that throws must not admit the row
 
             objects_map[so.id] = (so, owner_email)
 
@@ -1553,7 +1553,7 @@ async def regenerate_embedding(
         raise HTTPException(status_code=404, detail="Storage object not found")
 
     # Access control - only owner or admin
-    if storage_obj.owner_user_id != current_user.id and current_user.trust_level != "admin":
+    if storage_obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Access denied")
 
     try:
@@ -1645,7 +1645,7 @@ async def proxy_external_file(
 
     # Access control
     if not obj.is_public:
-        if obj.owner_user_id != current_user.id and current_user.trust_level != "admin":
+        if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
             raise HTTPException(status_code=403, detail="Access denied")
 
     # Check if it's an external object
@@ -1699,13 +1699,14 @@ async def proxy_external_file(
 @router.get("/proxy/stats")
 def get_proxy_cache_stats(
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
     Get external proxy cache statistics.
 
     Admin-only endpoint to monitor cache performance.
     """
-    if current_user.trust_level != "admin":
+    if not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Admin access required")
 
     return external_cache.get_stats()
@@ -1817,7 +1818,7 @@ def admin_cleanup_by_age(
     current_user: User = Depends(get_current_user),
 ):
     """Deletes all storage objects older than a specified number of days."""
-    if current_user.trust_level != "admin":
+    if not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden: Admin access required.")
     try:
         result = admin_routes.cleanup_objects_older_than(db, payload.days)
@@ -1835,7 +1836,7 @@ def admin_cleanup_by_user(
     current_user: User = Depends(get_current_user),
 ):
     """Purges all storage objects owned by a specific user by their email."""
-    if current_user.trust_level != "admin":
+    if not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden: Admin access required.")
     try:
         result = admin_routes.purge_objects_by_user_email(db, payload.email)
@@ -1853,7 +1854,7 @@ def admin_cleanup_by_collection(
     current_user: User = Depends(get_current_user),
 ):
     """Deletes all storage objects within a specific collection."""
-    if current_user.trust_level != "admin":
+    if not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden: Admin access required.")
     try:
         result = admin_routes.purge_objects_by_collection(db, payload.collection_id)
@@ -1867,7 +1868,7 @@ def get_users_with_collections(
     current_user: User = Depends(get_current_user)
 ):
     """Get all users who have collections in storage"""
-    if current_user.trust_level != "admin":
+    if not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Admin access required")
     
     # Query users who have storage objects (with or without collection_id)
@@ -1904,7 +1905,7 @@ def admin_find_storage_by_mac_job(
     tenant_id: str = Depends(get_tenant_id),
 ):
     """Find storage object by mac_job_id in metadata_json"""
-    if current_user.trust_level != "admin":
+    if not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden: Admin access required.")
 
     try:
@@ -1929,7 +1930,7 @@ def get_collections_for_user(
     current_user: User = Depends(get_current_user)
 ):
     """Get collections for a specific user or public collections"""
-    if current_user.trust_level != "admin":
+    if not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Admin access required")
     
     if public_only:
@@ -1984,7 +1985,7 @@ def rename_collection(
     """Bulk rename a collection_id across all storage objects.
     If owner_email is provided, only objects belonging to that user are updated.
     """
-    if current_user.trust_level != "admin":
+    if not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Admin access required")
 
     try:
@@ -3182,7 +3183,7 @@ async def analyze_existing_object(
     ).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Not found")
-    if obj.owner_user_id != current_user.id and current_user.trust_level != "admin":
+    if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     try:
@@ -3339,10 +3340,10 @@ def get_asset_variant_references(
     for obj in results:
         # Enforce access: allow owner, public, or admin
         try:
-            if not (getattr(obj, "is_public", False) or obj.owner_user_id == current_user.id or current_user.trust_level == "admin"):
+            if not (getattr(obj, "is_public", False) or obj.owner_user_id == current_user.id or _is_privileged_admin(current_user, db)):
                 continue
         except Exception:
-            pass
+            continue  # fail closed (#2282): an access check that throws must not admit the row
 
         # Optional role filter from metadata_json
         obj_role = None
@@ -3485,10 +3486,10 @@ def get_asset_variant_references_batch(
     for obj in results:
         # Enforce access: allow owner, public, or admin
         try:
-            if not (getattr(obj, "is_public", False) or obj.owner_user_id == current_user.id or current_user.trust_level == "admin"):
+            if not (getattr(obj, "is_public", False) or obj.owner_user_id == current_user.id or _is_privileged_admin(current_user, db)):
                 continue
         except Exception:
-            pass
+            continue  # fail closed (#2282): an access check that throws must not admit the row
 
         obj_link_id = getattr(obj, "link_id", None)
         if not obj_link_id:
@@ -3760,13 +3761,22 @@ def _is_privileged_admin(current_user, db) -> bool:
     # able to widen its reach by picking a privileged principal.
     if getattr(current_user, "_storage_on_behalf_of", False):
         return False
+    cached = getattr(current_user, "_storage_privileged_admin", None)
+    if cached is not None:
+        return cached
     key = getattr(current_user, "api_key", None)
     if not key or db is None:
         return True
     try:
-        return not tenant_id_for_api_key(key, db)
+        result = not tenant_id_for_api_key(key, db)
     except Exception:
         return False
+    # Per-request memo: list/search routes ask once per row (Issue #2282).
+    try:
+        current_user._storage_privileged_admin = result
+    except Exception:
+        pass
+    return result
 
 
 def media_repr_etag(obj, **repr_params) -> Optional[str]:
@@ -3860,7 +3870,7 @@ def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] =
             )
     # Owner / admin bypass
     if current_user is not None:
-        if getattr(current_user, "trust_level", None) == "admin":
+        if _is_privileged_admin(current_user, db):
             return
         if getattr(obj, "owner_user_id", None) == current_user.id:
             return
@@ -5384,7 +5394,7 @@ def get_object_metadata(
     if not obj.is_public:
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
-        if obj.owner_user_id != current_user.id and current_user.trust_level != "admin":
+        if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
             raise HTTPException(status_code=403, detail="Forbidden")
     # Confidential objects never leak metadata to anonymous callers either.
     _md = obj.metadata_json if isinstance(obj.metadata_json, dict) else {}
@@ -5738,7 +5748,7 @@ def download_file(
     if not obj.is_public:
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
-        if obj.owner_user_id != current_user.id and current_user.trust_level != "admin":
+        if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
             raise HTTPException(status_code=403, detail="Forbidden")
     path = generic_storage.absolute_path_for_key(obj.object_key, obj.tenant_id)
     if not path.exists():
@@ -6106,7 +6116,7 @@ async def update_object_metadata(
         StorageObject.id == object_id,
         StorageObject.tenant_id == tenant_id
     ).first()
-    if not obj or (obj.owner_user_id != current_user.id and current_user.trust_level != "admin"):
+    if not obj or (obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db)):
         raise HTTPException(status_code=404, detail="Not found or forbidden")
 
     update_data = payload.dict(exclude_unset=True)
@@ -6186,7 +6196,7 @@ async def create_embedding_for_object(
     ).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Not found")
-    if obj.owner_user_id != current_user.id and current_user.trust_level != "admin":
+    if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     try:
@@ -6217,7 +6227,7 @@ async def get_processing_status(
     ).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Not found")
-    if obj.owner_user_id != current_user.id and current_user.trust_level != "admin":
+    if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     # Read status from file system
@@ -6295,7 +6305,7 @@ def transfer_owner_by_link(
     Admin-only: Transfer ownership of all storage objects that share the given link_id
     to the user identified by owner_email. Creates the user if necessary.
     """
-    if current_user.trust_level != "admin":
+    if not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden: Admin access required.")
 
     if not payload.link_id:
@@ -6344,7 +6354,7 @@ async def replace_file(
         StorageObject.id == object_id,
         StorageObject.tenant_id == tenant_id
     ).first()
-    if not obj or (obj.owner_user_id != current_user.id and current_user.trust_level != "admin"):
+    if not obj or (obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db)):
         raise HTTPException(status_code=404, detail="Not found or forbidden")
 
     data = await file.read()
@@ -6448,7 +6458,7 @@ async def admin_trigger_processing(
     tenant_id: str = Depends(get_tenant_id),
 ):
     """Manually trigger processing for a storage object (admin-only)"""
-    if current_user.trust_level != "admin":
+    if not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden: Admin access required.")
 
     storage_obj = db.query(StorageObject).filter(
@@ -6505,7 +6515,7 @@ async def analyze_async(
         raise HTTPException(status_code=404, detail="Storage object not found")
 
     # Check permissions
-    if storage_obj.owner_user_id != current_user.id and current_user.trust_level != "admin":
+    if storage_obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     # Prepare context overrides (metadata, descriptions, etc.)
@@ -6666,7 +6676,7 @@ async def get_object_annotations(
     if not obj:
         raise HTTPException(status_code=404, detail="Object not found")
 
-    if obj.owner_user_id != current_user.id and current_user.trust_level != "admin":
+    if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     metadata = obj.ai_context_metadata or {}
