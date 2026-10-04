@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, Float, Text, DateTime, ForeignKey, JSON, Index
+from sqlalchemy import Column, Integer, String, Boolean, Float, Text, DateTime, ForeignKey, JSON, Index, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -34,10 +34,32 @@ class TenantAPIKey(Base):
     # Service keys may act on behalf of a user via X-On-Behalf-Of. Off by
     # default: an ordinary tenant key must never be able to impersonate.
     is_service = Column(Boolean, default=False, nullable=True)
+    # Comma-separated tenants this (service) key may mint signed read links
+    # for via POST /storage/sign (Post 5235). NULL = no signing right.
+    sign_tenants = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
 
     tenant = relationship("Tenant", back_populates="api_keys")
+
+
+class MediaGrant(Base):
+    """An object bound to a scope (e.g. "content-post:5226") by its owner.
+
+    POST /storage/sign only signs non-public objects that carry a grant for
+    the requested scope. Created only by the owner's real identity (service
+    key + X-On-Behalf-Of) or a real admin — never by a tenant key — so
+    putting a foreign id into a post does not make it signable (Post 5235).
+    """
+    __tablename__ = "media_grants"
+    __table_args__ = (UniqueConstraint("object_id", "scope", name="uq_media_grant_object_scope"),)
+
+    id = Column(Integer, primary_key=True)
+    object_id = Column(Integer, index=True, nullable=False)
+    scope = Column(String(200), index=True, nullable=False)
+    granted_by_user_id = Column(Integer, nullable=False)
+    granted_via = Column(String(255), nullable=True)  # service key label or "admin"
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 # SQLAlchemy Models

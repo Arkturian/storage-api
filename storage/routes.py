@@ -3794,7 +3794,8 @@ def media_repr_etag(obj, **repr_params) -> Optional[str]:
     return '"' + hashlib.md5(f"{obj.checksum}|{key}".encode()).hexdigest() + '"'
 
 
-def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] = None) -> None:
+def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] = None,
+                      signed: bool = False) -> None:
     """
     Block public delivery of an asset whose AI safety verdict is unsafe, failed,
     or still pending. Raises HTTPException(451 Unavailable For Legal Reasons)
@@ -3863,7 +3864,11 @@ def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] =
         if _is_public_default_master(current_user):
             _is_admin = False
             _is_owner = False
-        if not (_is_admin or _is_owner):
+        # A valid signed link (POST /storage/sign) stands in for the owner:
+        # it was only issued because the owner bound this object to the
+        # scope (media_grants). It lifts THIS check only — the safety
+        # verdict below still applies (Post 5235).
+        if not (_is_admin or _is_owner or signed):
             raise HTTPException(
                 status_code=403,
                 detail={"error": "This object is private", "code": "private_media"},
@@ -4079,6 +4084,9 @@ def get_media_variant(
     output: Optional[str] = Query(None, description="GLB: glb | zip (re-bundled vs. split)"),
     preset: Optional[str] = Query(None, description="GLB: web | mobile | preview | sculpture (param shortcut; an unknown name is rejected with 400 and the valid list)"),
     v: Optional[str] = Query(None, description="Cache-busting checksum. When it matches the object's checksum the URL is content-addressed and the response may be cached immutably"),
+    exp: Optional[int] = Query(None, description="Signed link (POST /storage/sign): expiry, unix seconds"),
+    kid: Optional[str] = Query(None, description="Signed link: key id"),
+    sig: Optional[str] = Query(None, description="Signed link: HMAC; opens this one object until exp, nothing else"),
     if_none_match: Optional[str] = Header(None, alias="If-None-Match"),
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
@@ -4115,9 +4123,20 @@ def get_media_variant(
     if not obj:
         raise HTTPException(status_code=404, detail="Not found")
 
+    # Signed link (Post 5235): any of the three present means the caller
+    # relies on it, so a wrong or expired one is a hard 403 rather than a
+    # silent fall-back to the anonymous answer.
+    _signed = False
+    if exp is not None or kid or sig:
+        from storage import signing as _signing
+        if not _signing.verify(object_id, exp, kid, sig):
+            raise HTTPException(status_code=403, detail={"error": "invalid or expired signature", "code": "invalid_signature"})
+        _signed = True
+
     # Safety gate (raises 451 if blocked, bypassed for owner/admin)
-    _check_quarantine(obj, current_user, db)
-    _check_media_access(obj, current_user, db)
+    _check_quarantine(obj, current_user, db, signed=_signed)
+    if not _signed:
+        _check_media_access(obj, current_user, db)
 
     media_type_current = (obj.mime_type or "application/octet-stream")
     mime = media_type_current.lower()
@@ -7034,3 +7053,183 @@ async def transcoding_callback(
         print(f"❌ Callback error: {str(e)}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Signed read links + media grants (Post 5235, PDF export of private images)
+# ---------------------------------------------------------------------------
+
+class SignRequest(BaseModel):
+    tenant: str
+    scope: str
+    ids: List[int]
+    ttl: int = 600
+
+
+class GrantRequest(BaseModel):
+    scope: str
+
+
+def _presented_tenant_key(request: Request, db: Session):
+    from models import TenantAPIKey
+    key = (request.headers.get("X-API-KEY") or "").strip()
+    if not key:
+        return None
+    return (
+        db.query(TenantAPIKey)
+        .filter(TenantAPIKey.api_key == key, TenantAPIKey.is_active.is_(True))
+        .one_or_none()
+    )
+
+
+def _require_grant_authority(obj, current_user, request: Request, db: Session) -> str:
+    """Owner's real identity or a real admin; returns the audit label.
+
+    "Real identity" means a service key vouching for a verified human via
+    X-On-Behalf-Of. A tenant key that happens to own objects does not
+    qualify: those keys ship in browser bundles (#799, #2282).
+    """
+    if _is_privileged_admin(current_user, db):
+        # The hardcoded default master is publicly known and is denied
+        # private_media in _check_quarantine. Binding would hand it a detour
+        # around that gate (bind, then let an export sign it), so it may bind
+        # only what it can already read.
+        md = obj.metadata_json if isinstance(obj.metadata_json, dict) else {}
+        if not (_is_public_default_master(current_user) and md.get("private_media")):
+            return "admin"
+    if getattr(current_user, "_storage_on_behalf_of", False) and obj.owner_user_id == current_user.id:
+        row = _presented_tenant_key(request, db)
+        return f"service:{(row.label or row.tenant_id) if row else 'unknown'}"
+    # Same answer for "not yours" and "not there": no existence oracle.
+    raise HTTPException(status_code=404, detail="Not found")
+
+
+def _grant_object(object_id: int, db: Session):
+    obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
+    if not obj or getattr(obj, "tombstoned_at", None) is not None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return obj
+
+
+def _validate_scope(scope: str) -> str:
+    from storage import signing as _signing
+    scope = (scope or "").strip()
+    if not _signing.SCOPE_RE.match(scope):
+        raise HTTPException(status_code=422, detail={"error": "scope must look like '<kind>:<id>'", "code": "invalid_scope"})
+    return scope
+
+
+@router.post("/objects/{object_id}/grants")
+def create_media_grant(
+    object_id: int,
+    payload: GrantRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Bind an object to a scope so POST /storage/sign may sign it there."""
+    from models import MediaGrant
+    scope = _validate_scope(payload.scope)
+    obj = _grant_object(object_id, db)
+    via = _require_grant_authority(obj, current_user, request, db)
+    existing = db.query(MediaGrant).filter(MediaGrant.object_id == obj.id, MediaGrant.scope == scope).first()
+    if existing:
+        return {"object_id": obj.id, "scope": scope, "created": False}
+    db.add(MediaGrant(object_id=obj.id, scope=scope, granted_by_user_id=current_user.id, granted_via=via))
+    db.commit()
+    print(f"🔗 grant object={obj.id} scope={scope} by_user={current_user.id} via={via}", flush=True)
+    return {"object_id": obj.id, "scope": scope, "created": True}
+
+
+@router.get("/objects/{object_id}/grants")
+def list_media_grants(
+    object_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from models import MediaGrant
+    obj = _grant_object(object_id, db)
+    _require_grant_authority(obj, current_user, request, db)
+    rows = db.query(MediaGrant).filter(MediaGrant.object_id == obj.id).order_by(MediaGrant.id).all()
+    return {"object_id": obj.id, "grants": [
+        {"scope": g.scope, "granted_by_user_id": g.granted_by_user_id, "granted_via": g.granted_via,
+         "created_at": g.created_at.isoformat() if g.created_at else None} for g in rows]}
+
+
+@router.delete("/objects/{object_id}/grants")
+def delete_media_grant(
+    object_id: int,
+    request: Request,
+    scope: str = Query(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from models import MediaGrant
+    scope = _validate_scope(scope)
+    obj = _grant_object(object_id, db)
+    via = _require_grant_authority(obj, current_user, request, db)
+    n = db.query(MediaGrant).filter(MediaGrant.object_id == obj.id, MediaGrant.scope == scope).delete()
+    db.commit()
+    print(f"🔗 ungrant object={obj.id} scope={scope} by_user={current_user.id} via={via} removed={n}", flush=True)
+    return {"object_id": obj.id, "scope": scope, "deleted": bool(n)}
+
+
+@router.post("/sign")
+def sign_media_links(
+    payload: SignRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Mint short-lived read URLs for objects bound to a scope (Post 5235).
+
+    Only an active service key whose sign_tenants lists `tenant` may call
+    this. Public objects come back unsigned; non-public ones only with a
+    grant for `scope`. Errors are per id, so one bad id never fails the
+    export it belongs to.
+    """
+    from datetime import timezone
+    from models import MediaGrant
+    from storage import signing as _signing
+
+    if request.headers.get("X-On-Behalf-Of"):
+        raise HTTPException(status_code=400, detail={"error": "signing is the service's own act; drop X-On-Behalf-Of", "code": "on_behalf_not_allowed"})
+    row = _presented_tenant_key(request, db)
+    tenants = {t.strip() for t in ((row.sign_tenants if row else None) or "").split(",") if t.strip()}
+    if not row or not row.is_service or payload.tenant not in tenants:
+        raise HTTPException(status_code=403, detail={"error": "this key may not sign for this tenant", "code": "sign_not_allowed"})
+    scope = _validate_scope(payload.scope)
+    if not (1 <= payload.ttl <= _signing.MAX_TTL_SECONDS):
+        raise HTTPException(status_code=422, detail={"error": f"ttl must be 1..{_signing.MAX_TTL_SECONDS}", "code": "invalid_ttl"})
+    if not (1 <= len(payload.ids) <= _signing.MAX_IDS_PER_REQUEST):
+        raise HTTPException(status_code=422, detail={"error": f"1..{_signing.MAX_IDS_PER_REQUEST} ids", "code": "invalid_ids"})
+    if not _signing.is_configured():
+        raise HTTPException(status_code=503, detail={"error": "signing not configured", "code": "sign_unconfigured"})
+
+    ids = list(dict.fromkeys(int(i) for i in payload.ids))
+    objs = {o.id: o for o in db.query(StorageObject).filter(StorageObject.id.in_(ids)).all()}
+    granted = {g.object_id for g in db.query(MediaGrant.object_id).filter(
+        MediaGrant.scope == scope, MediaGrant.object_id.in_(ids)).all()}
+    base_url = get_base_url_from_request(request).rstrip("/")
+    now = time.time()
+    items = []
+    signed_n = 0
+    for oid in ids:
+        o = objs.get(oid)
+        if o is None or getattr(o, "tombstoned_at", None) is not None:
+            items.append({"id": oid, "error": "not_found"}); continue
+        if o.tenant_id != payload.tenant:
+            items.append({"id": oid, "error": "wrong_tenant"}); continue
+        md = o.metadata_json if isinstance(o.metadata_json, dict) else {}
+        url = f"{base_url}/storage/media/{oid}"
+        if o.is_public and not md.get("private_media"):
+            items.append({"id": oid, "url": url, "signed": False, "public": True}); continue
+        if oid not in granted:
+            items.append({"id": oid, "error": "not_granted"}); continue
+        s = _signing.sign(oid, payload.ttl, now=now)
+        items.append({"id": oid, "url": f"{url}?exp={s['exp']}&kid={s['kid']}&sig={s['sig']}", "signed": True})
+        signed_n += 1
+    expires = datetime.fromtimestamp(int(now) + payload.ttl, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    print(f"✍️ sign key={row.label or row.tenant_id} tenant={payload.tenant} scope={scope} ids={len(ids)} signed={signed_n} ttl={payload.ttl}", flush=True)
+    return {"expires_at": expires, "items": items}
