@@ -2395,6 +2395,7 @@ async def upload_chunk(
     private: bool = Query(False),
     ai_mode: str = Query("none"),
     ttl_hours: Optional[int] = Query(None),
+    grant_scope: Optional[str] = Query(None, description="Bind the finished object to this scope (media_grants); taken from the final chunk"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     tenant_id: str = Depends(get_tenant_id),
@@ -2405,6 +2406,7 @@ async def upload_chunk(
     what matters is that every index 0..total_chunks-1 has been seen exactly once.
     Returns {received, missing} while incomplete, and the storage object once done.
     """
+    grant_scope = _check_upload_scope(grant_scope)
     import base64 as _b64
 
     _purge_expired_chunk_sessions()
@@ -2500,6 +2502,7 @@ async def upload_chunk(
         except Exception as exc:
             print(f"⚠️ chunk upload: analysis enqueue failed for {saved_obj.id}: {exc}")
 
+    _bind_on_upload(db, saved_obj, grant_scope, current_user)
     _resp = StorageObjectResponse.from_orm(saved_obj)
     _hydrate_storage_urls(_resp, saved_obj, request)
     return _resp
