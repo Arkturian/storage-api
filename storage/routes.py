@@ -619,6 +619,50 @@ from admin import routes as admin_routes
 from tenancy.config import tenant_id_for_api_key, get_tenant_id, get_tenant_id_optional
 
 
+def _release_db_before_streaming(func):
+    """Close the request's DB session as soon as the handler has built its
+    response, i.e. BEFORE the bytes are streamed (Issue #2315).
+
+    FastAPI runs the exit code of `Depends(get_db)` only after the response
+    has been sent completely, and nginx proxies this vhost unbuffered. A file
+    transfer to a slow, paused or stalled client therefore held one pooled
+    DB connection for its whole duration; 60 of them (pool 20 + overflow 40)
+    took the whole API down on 2026-10-06. Reproduced with pool 1: a slow
+    download made every other request fail with a pool timeout.
+
+    The handlers wrapped here do all DB work before returning and hand back a
+    FileResponse/Response that only reads the filesystem, so closing early is
+    safe. Session.close() is idempotent; get_db closes again later.
+    """
+    import functools
+    import inspect
+
+    def _close(kwargs):
+        db = kwargs.get("db")
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    if inspect.iscoroutinefunction(func):
+        @functools.wraps(func)
+        async def _async_wrapper(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            finally:
+                _close(kwargs)
+        return _async_wrapper
+
+    @functools.wraps(func)
+    def _sync_wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _close(kwargs)
+    return _sync_wrapper
+
+
 def build_hls_url(tenant_id: str, basename: str) -> str:
     """
     Build HLS URL using VOD_BASE_URL from settings.
@@ -1608,6 +1652,7 @@ async def regenerate_embedding(
 
 
 @router.get("/proxy/{object_id}")
+@_release_db_before_streaming
 async def proxy_external_file(
     object_id: int,
     no_cache: bool = Query(False, description="Bypass cache and fetch fresh from source"),
@@ -4071,6 +4116,7 @@ def _glb_cache_path_for(obj, resolved: Dict[str, Any], pipeline_version: str) ->
 
 
 @router.get("/media/{object_id}")
+@_release_db_before_streaming
 def get_media_variant(
     object_id: int,
     variant: Optional[str] = Query(None, description="thumbnail | medium | full"),
@@ -5752,6 +5798,7 @@ def list_objects(
 
 
 @router.get("/files/{object_id}")
+@_release_db_before_streaming
 def download_file(
     object_id: int,
     db: Session = Depends(get_db),
