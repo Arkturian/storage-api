@@ -201,8 +201,26 @@ async def storage_media_head_headers(request: Request, call_next):
             # will see the actual file.
             # Per-object opt-in privacy (Issue #420) — middleware has no
             # current_user, so HEAD on a private_media object is always 403.
+            # Signed link (POST /storage/sign): GET honoured the signature from
+            # the start, HEAD did not — and the portal probes with HEAD before
+            # it shows an image, so signed private media never appeared
+            # (3DNerd, 2026-10-09). Same rule as GET: any of the three params
+            # present means the caller relies on it, so a wrong or expired one
+            # is a hard 403; a valid one lifts the two owner checks below and
+            # nothing else (the safety verdict still answers 451).
+            _qp_sig = request.query_params
+            _head_signed = False
+            if _qp_sig.get("exp") or _qp_sig.get("kid") or _qp_sig.get("sig"):
+                from storage import signing as _signing
+                try:
+                    _exp = int(_qp_sig.get("exp") or "")
+                except ValueError:
+                    _exp = None
+                if not _signing.verify(object_id, _exp, _qp_sig.get("kid"), _qp_sig.get("sig")):
+                    return Response(status_code=403, headers=_apply_cors_for_head({}, request))
+                _head_signed = True
             _md_priv = obj.metadata_json if isinstance(obj.metadata_json, dict) else {}
-            if _md_priv.get("private_media"):
+            if _md_priv.get("private_media") and not _head_signed:
                 return Response(status_code=403, headers=_apply_cors_for_head({}, request))
             # Issue #1645: a non-public object must not leak through HEAD either.
             # The GET route got its access check, but this middleware answers
@@ -212,7 +230,7 @@ async def storage_media_head_headers(request: Request, call_next):
             # the route), so the only safe answer here is the anonymous one:
             # public passes, everything else is denied. Owners and admins still
             # reach the object through GET, which does know who is asking.
-            if not obj.is_public:
+            if not obj.is_public and not _head_signed:
                 return Response(status_code=403, headers=_apply_cors_for_head({}, request))
 
             danger = obj.ai_danger_potential or 0
@@ -245,6 +263,9 @@ async def storage_media_head_headers(request: Request, call_next):
                 if (_v and obj.checksum and _v == obj.checksum)
                 else "public, max-age=3600"
             )
+            # Mirror GET: a non-public object is never cacheable by URL.
+            if (not obj.is_public) or _md_priv.get("private_media"):
+                _head_cache = "private, no-store"
 
             # ?download=1 → Content-Disposition: attachment (mirror GET's download
             # param) so HEAD advertises the same download intent + filename.
