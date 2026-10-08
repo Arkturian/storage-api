@@ -388,3 +388,31 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8002)
+
+
+# --- Speaking media URLs: /storage/media/{id}/{filename.ext} ---------------
+# A bare /storage/media/129748 tells a recipient nothing (Alex, 2026-10-09:
+# print data mailed to a print shop). The same object now also answers under
+# /storage/media/129748/DIHA_Transparent.pdf. The trailing name is decoration
+# only: it is stripped here, before routing, so access checks, variants,
+# signatures, Range and HEAD behave exactly as for the bare id. It must carry
+# a file extension, which keeps /trim-bounds and /focal untouched.
+_MEDIA_NAMED_RE = re.compile(r"^(/storage/media/\d+)/[^/]{1,200}\.[A-Za-z0-9]{1,8}$")
+
+
+class _MediaFilenameAlias:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            m = _MEDIA_NAMED_RE.match(scope.get("path", ""))
+            if m:
+                scope = dict(scope)
+                scope["path"] = m.group(1)
+                scope["raw_path"] = m.group(1).encode()
+        await self.app(scope, receive, send)
+
+
+# Added last = outermost, so the HEAD middleware and the router see the bare id.
+app.add_middleware(_MediaFilenameAlias)
