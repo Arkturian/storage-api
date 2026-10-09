@@ -21,12 +21,13 @@ _TRANSLIT = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö":
 
 def _share_name(original_filename: Optional[str]) -> str:
     """Readable, URL-safe file name for a share link ("" if nothing usable)."""
-    name = (original_filename or "").replace("\\", "/").rsplit("/", 1)[-1].translate(_TRANSLIT)
+    base = (original_filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = base.translate(_TRANSLIT)
     name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", name)
     name = re.sub(r"-{2,}", "-", name)
     name = re.sub(r"-?\.-?", ".", name).strip("-.")
-    if "." not in name and "." in (original_filename or ""):
+    if "." not in name and "." in base:
         return ""  # nothing readable left of the stem (e.g. non-Latin name)
     if len(name) > 120:
         stem, dot, ext = name.rpartition(".")
