@@ -614,7 +614,7 @@ from fastapi.security.api_key import APIKeyHeader as _APIKeyHeader
 from storage.domain import save_file_and_record, update_file_and_record
 from storage.service import generic_storage, bulk_delete_objects, GenericStorageService
 from storage.external_proxy import fetch_external_file, external_cache
-from storage.url_builder import build_storage_urls, get_base_url_from_request
+from storage.url_builder import build_share_url, build_storage_urls, get_base_url_from_request
 from admin import routes as admin_routes
 from tenancy.config import tenant_id_for_api_key, get_tenant_id, get_tenant_id_optional
 
@@ -2095,6 +2095,7 @@ def _hydrate_storage_urls(response_obj, storage_obj, request) -> None:
         response_obj.file_url = urls["file_url"]
         response_obj.thumbnail_url = urls["thumbnail_url"]
         response_obj.webview_url = urls["webview_url"]
+        response_obj.share_url = build_share_url(storage_obj.id, storage_obj.original_filename, bool(storage_obj.is_public))
     except Exception as _e:
         logging.getLogger("gunicorn.error").warning(
             f"_hydrate_storage_urls failed for obj {getattr(storage_obj, 'id', None)}: {_e}"
@@ -5499,6 +5500,7 @@ def get_object_metadata(
     response_obj.file_url = urls["file_url"]
     response_obj.thumbnail_url = urls["thumbnail_url"]
     response_obj.webview_url = urls["webview_url"]
+    response_obj.share_url = build_share_url(obj.id, obj.original_filename, bool(obj.is_public))
 
     # Check for HLS files if this is a video or pre-transcoded zip
     if (obj.mime_type and obj.mime_type.startswith("video/")) or \
@@ -5713,6 +5715,7 @@ def list_objects(
         response_obj.file_url = urls["file_url"]
         response_obj.thumbnail_url = urls["thumbnail_url"]
         response_obj.webview_url = urls["webview_url"]
+        response_obj.share_url = build_share_url(storage_obj.id, storage_obj.original_filename, bool(storage_obj.is_public))
 
         # Check for HLS files if this is a video or pre-transcoded zip
         if (storage_obj.mime_type and storage_obj.mime_type.startswith("video/")) or \

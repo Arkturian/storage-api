@@ -8,8 +8,45 @@ not stored in the database. This allows for:
 - No database migrations when URLs change
 """
 
+import os
+import re
+import unicodedata
 from typing import Optional
+from urllib.parse import quote
+
 from fastapi import Request
+
+_TRANSLIT = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
+
+
+def _share_name(original_filename: Optional[str]) -> str:
+    """Readable, URL-safe file name for a share link ("" if nothing usable)."""
+    name = (original_filename or "").replace("\\", "/").rsplit("/", 1)[-1].translate(_TRANSLIT)
+    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name)
+    name = re.sub(r"-{2,}", "-", name)
+    name = re.sub(r"-?\.-?", ".", name).strip("-.")
+    if "." not in name and "." in (original_filename or ""):
+        return ""  # nothing readable left of the stem (e.g. non-Latin name)
+    if len(name) > 120:
+        stem, dot, ext = name.rpartition(".")
+        name = f"{stem[:120 - len(ext) - 1]}.{ext}" if dot and len(ext) <= 8 else name[:120]
+    return name
+
+
+def build_share_url(object_id: int, original_filename: Optional[str], is_public: bool) -> Optional[str]:
+    """Link meant to be handed to people outside: <share host>/<id>/<name>.
+
+    Only for public objects — the share host changes the address, not the
+    rights, so a private object would just answer 403 there. Off unless
+    STORAGE_SHARE_BASE_URL is set: the host exists per instance, and a
+    hard-coded default would hand out links into another instance's DB.
+    """
+    base = os.getenv("STORAGE_SHARE_BASE_URL", "").strip().rstrip("/")
+    if not base or not is_public:
+        return None
+    name = _share_name(original_filename)
+    return f"{base}/{int(object_id)}/{quote(name)}" if name else f"{base}/{int(object_id)}"
 
 
 def build_storage_urls(
