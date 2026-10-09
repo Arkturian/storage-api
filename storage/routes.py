@@ -6911,7 +6911,9 @@ def get_public_object(
     if not obj:
         raise HTTPException(status_code=404, detail="Public object not found")
     
-    return obj
+    response_obj = StorageObjectResponse.from_orm(obj)
+    response_obj.share_url = build_share_url(obj.id, obj.original_filename, True)
+    return response_obj
 
 
 
