@@ -2299,8 +2299,11 @@ async def consume_upload_ticket(
 
     if ticket.get("grant_scope"):
         from types import SimpleNamespace as _NS
-        _bind_on_upload(db, saved_obj, ticket["grant_scope"], _NS(id=ticket["owner_user_id"]))
+        _bound = _bind_on_upload(db, saved_obj, ticket["grant_scope"], _NS(id=ticket["owner_user_id"]))
+    else:
+        _bound = None
     _resp = StorageObjectResponse.from_orm(saved_obj)
+    _resp.grant_scope = _bound
     _hydrate_storage_urls(_resp, saved_obj, request)
     return _resp
 
@@ -2548,8 +2551,9 @@ async def upload_chunk(
         except Exception as exc:
             print(f"⚠️ chunk upload: analysis enqueue failed for {saved_obj.id}: {exc}")
 
-    _bind_on_upload(db, saved_obj, grant_scope, current_user)
+    _bound = _bind_on_upload(db, saved_obj, grant_scope, current_user)
     _resp = StorageObjectResponse.from_orm(saved_obj)
+    _resp.grant_scope = _bound
     _hydrate_storage_urls(_resp, saved_obj, request)
     return _resp
 
@@ -2590,6 +2594,8 @@ async def upload_file(
     tenant_id: Optional[str] = Depends(get_tenant_id),
 ):
     grant_scope = _check_upload_scope(grant_scope)
+    if not (reference_id and hls_result):
+        _reject_scope_for_foreign_owner(grant_scope, owner_email, current_user)
     import logging
     glogger = logging.getLogger("gunicorn.error")
 
@@ -2817,7 +2823,7 @@ async def upload_file(
                 
             # Return immediately after HLS processing (successful or failed) - avoid normal upload pipeline
             _resp = StorageObjectResponse.from_orm(saved_obj)
-            _bind_on_upload(db, saved_obj, grant_scope, current_user)
+            _resp.grant_scope = _bind_on_upload(db, saved_obj, grant_scope, current_user)
             _hydrate_storage_urls(_resp, saved_obj, request)
             return _resp
         else:
@@ -2999,7 +3005,7 @@ async def upload_file(
             glogger.error(f"⚠️ X-Compute-Focal failed for {saved_obj.id} (upload unaffected): {_focal_exc}")
 
     _resp = StorageObjectResponse.from_orm(saved_obj)
-    _bind_on_upload(db, saved_obj, grant_scope, current_user)
+    _resp.grant_scope = _bind_on_upload(db, saved_obj, grant_scope, current_user)
     _hydrate_storage_urls(_resp, saved_obj, request)
     return _resp
 
@@ -3029,6 +3035,7 @@ async def fetch_and_store_remote(
     # Resolve target owner
     target_owner_id = current_user.id
     if payload.owner_email:
+        _reject_scope_for_foreign_owner(_fetch_scope, payload.owner_email, current_user)
         if current_user.trust_level != "admin":
             raise HTTPException(status_code=403, detail="Only admin may set owner_email")
         owner = db.query(User).filter(User.email == payload.owner_email).first()
@@ -3218,7 +3225,7 @@ async def fetch_and_store_remote(
 
         _resp = StorageObjectResponse.from_orm(saved_obj)
         _hydrate_storage_urls(_resp, saved_obj, request)
-        _bind_on_upload(db, saved_obj, _fetch_scope, current_user)
+        _resp.grant_scope = _bind_on_upload(db, saved_obj, _fetch_scope, current_user)
         return _resp
 
     except HTTPException:
@@ -7306,6 +7313,18 @@ def sign_media_links(
     return {"expires_at": expires, "items": items}
 
 
+def _reject_scope_for_foreign_owner(scope: Optional[str], owner_email: Optional[str], current_user) -> None:
+    """grant_scope binds only what the caller owns; owner_email hands the
+    object to someone else. Together they would store the file and silently
+    skip the binding (api-ai, 2026-10-11) — refuse before anything is stored."""
+    if not scope or not owner_email:
+        return
+    if owner_email.strip().lower() != (getattr(current_user, "email", None) or "").strip().lower():
+        raise HTTPException(status_code=422, detail={
+            "error": "grant_scope cannot be combined with owner_email for another owner",
+            "code": "grant_scope_owner_mismatch"})
+
+
 def _check_upload_scope(scope: Optional[str]) -> Optional[str]:
     """Validate grant_scope BEFORE anything is stored (422 leaves no object)."""
     if scope is None or not str(scope).strip():
@@ -7313,25 +7332,29 @@ def _check_upload_scope(scope: Optional[str]) -> Optional[str]:
     return _validate_scope(scope)
 
 
-def _bind_on_upload(db: Session, obj, scope: Optional[str], current_user) -> None:
+def _bind_on_upload(db: Session, obj, scope: Optional[str], current_user) -> Optional[str]:
     """Bind a just-stored object to `scope` (Post 5250, variant c).
 
     Safe without owner/admin checks: the caller supplied these bytes in this
     very request, so the binding cannot unlock anything that was not already
     theirs. Only a filename-dedupe replay returns an existing row, and that
     row belongs to the same owner by construction — checked anyway.
+
+    Returns the scope that is bound afterwards, or None. Callers put it into
+    the response (`grant_scope`) so a client can tell "bound" from "sent".
     """
     if not scope or obj is None:
-        return
+        return None
     from models import MediaGrant
     if getattr(obj, "owner_user_id", None) != getattr(current_user, "id", None):
         print(f"🔗 upload grant skipped object={obj.id}: owner mismatch", flush=True)
-        return
+        return None
     if db.query(MediaGrant).filter(MediaGrant.object_id == obj.id, MediaGrant.scope == scope).first():
-        return
+        return scope
     db.add(MediaGrant(object_id=obj.id, scope=scope, granted_by_user_id=current_user.id, granted_via="upload"))
     db.commit()
     print(f"🔗 upload grant object={obj.id} scope={scope} by_user={current_user.id}", flush=True)
+    return scope
 
 
 class GrantMoveRequest(BaseModel):
