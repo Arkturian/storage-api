@@ -7350,11 +7350,23 @@ def _reject_scope_for_foreign_owner(scope: Optional[str], owner_email: Optional[
             "code": "grant_scope_owner_mismatch"})
 
 
+_MAX_UPLOAD_SCOPES = 20
+
+
 def _check_upload_scope(scope: Optional[str]) -> Optional[str]:
-    """Validate grant_scope BEFORE anything is stored (422 leaves no object)."""
+    """Validate grant_scope BEFORE anything is stored (422 leaves no object).
+
+    One scope or a comma-separated list (one attachment for several agents,
+    Post 5411). Returned normalised: de-duplicated, order kept, joined by ",".
+    """
     if scope is None or not str(scope).strip():
         return None
-    return _validate_scope(scope)
+    scopes = list(dict.fromkeys(_validate_scope(part) for part in str(scope).split(",") if part.strip()))
+    if not scopes:
+        return None
+    if len(scopes) > _MAX_UPLOAD_SCOPES:
+        raise HTTPException(status_code=422, detail={"error": f"at most {_MAX_UPLOAD_SCOPES} scopes", "code": "too_many_scopes"})
+    return ",".join(scopes)
 
 
 def _bind_on_upload(db: Session, obj, scope: Optional[str], current_user) -> Optional[str]:
@@ -7365,8 +7377,13 @@ def _bind_on_upload(db: Session, obj, scope: Optional[str], current_user) -> Opt
     theirs. Only a filename-dedupe replay returns an existing row, and that
     row belongs to the same owner by construction — checked anyway.
 
-    Returns the scope that is bound afterwards, or None. Callers put it into
-    the response (`grant_scope`) so a client can tell "bound" from "sent".
+    `scope` is what _check_upload_scope returned: one scope or several joined
+    by ",". All of them are bound in one commit, so an object is never bound
+    to only part of the list.
+
+    Returns the scope(s) bound afterwards in the same form, or None. Callers
+    put it into the response (`grant_scope`) so a client can tell "bound"
+    from "sent".
     """
     if not scope or obj is None:
         return None
@@ -7374,12 +7391,16 @@ def _bind_on_upload(db: Session, obj, scope: Optional[str], current_user) -> Opt
     if getattr(obj, "owner_user_id", None) != getattr(current_user, "id", None):
         print(f"🔗 upload grant skipped object={obj.id}: owner mismatch", flush=True)
         return None
-    if db.query(MediaGrant).filter(MediaGrant.object_id == obj.id, MediaGrant.scope == scope).first():
-        return scope
-    db.add(MediaGrant(object_id=obj.id, scope=scope, granted_by_user_id=current_user.id, granted_via="upload"))
-    db.commit()
-    print(f"🔗 upload grant object={obj.id} scope={scope} by_user={current_user.id}", flush=True)
-    return scope
+    scopes = [s for s in scope.split(",") if s]
+    have = {g.scope for g in db.query(MediaGrant.scope).filter(
+        MediaGrant.object_id == obj.id, MediaGrant.scope.in_(scopes)).all()}
+    new = [s for s in scopes if s not in have]
+    if new:
+        for s in new:
+            db.add(MediaGrant(object_id=obj.id, scope=s, granted_by_user_id=current_user.id, granted_via="upload"))
+        db.commit()
+        print(f"🔗 upload grant object={obj.id} scope={','.join(new)} by_user={current_user.id}", flush=True)
+    return ",".join(scopes)
 
 
 class GrantMoveRequest(BaseModel):

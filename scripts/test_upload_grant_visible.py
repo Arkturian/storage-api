@@ -45,5 +45,13 @@ chk("invalid scope still 422 invalid_scope", r.status_code == 422 and r.json()["
 r = requests.get(f"{B}/storage/objects/{up(PLAIN, 'f.bin', grant_scope='test-visible:f').json()['id']}", headers=PLAIN)
 chk("plain GET does not claim a binding", r.status_code == 200 and r.json().get("grant_scope") is None)
 
+r = up(PLAIN, "g.bin", grant_scope="test-visible:g1, test-visible:g2,test-visible:g1")
+chk("list of scopes is bound and returned normalised", r.status_code == 200 and r.json().get("grant_scope") == "test-visible:g1,test-visible:g2", r.text[:80] if r.status_code != 200 else str(r.json().get("grant_scope")))
+before = count()
+r = up(PLAIN, "h.bin", grant_scope="test-visible:h1,not a scope")
+chk("one bad scope in a list -> 422, nothing stored", r.status_code == 422 and count() == before, str(r.status_code))
+r = up(PLAIN, "i.bin", grant_scope=",".join(f"test-visible:i{n}" for n in range(21)))
+chk("more than 20 scopes -> 422 too_many_scopes", r.status_code == 422 and r.json()["detail"].get("code") == "too_many_scopes", str(r.status_code))
+
 print("ALL PASS" if not failed else f"{failed} FAILED")
 sys.exit(1 if failed else 0)
