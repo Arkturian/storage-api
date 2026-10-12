@@ -5439,6 +5439,24 @@ async def proxy_external_image(
         raise HTTPException(status_code=500, detail=f"Image processing failed: {str(e)}")
 
 
+def _anon_hidden_collections() -> List[str]:
+    """Collections never shown in the keyless listing (Issue #2418).
+
+    Public-by-id is not the same as discoverable: files people hand to an
+    agent in the portal are stored public so the chat can show them, but
+    nobody expects them in a list anyone on the internet can page through.
+    """
+    raw = os.getenv("STORAGE_ANON_HIDDEN_COLLECTIONS", "cloud-uploads")
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
+def _strip_owner_for_anonymous(response_obj):
+    """Who owns a public file is not public (Issue #2418)."""
+    response_obj.owner_email = None
+    response_obj.owner_user_id = None
+    return response_obj
+
+
 @router.get("/objects/{object_id}", response_model=StorageObjectResponse)
 def get_object_metadata(
     object_id: int,
@@ -5539,6 +5557,8 @@ def get_object_metadata(
         except Exception:
             pass
 
+    if current_user is None:
+        _strip_owner_for_anonymous(response_obj)
     return response_obj
 
 
@@ -5601,6 +5621,9 @@ def list_objects(
         q = q.filter(
             func.coalesce(func.json_extract(StorageObject.metadata_json, "$.private_media"), 0) != 1
         )
+        _hidden = _anon_hidden_collections()
+        if _hidden:
+            q = q.filter(or_(StorageObject.collection_id.is_(None), ~StorageObject.collection_id.in_(_hidden)))
 
     # Exact-id lookup (admin deep-link / Search-ID): the most specific filter,
     # returns just that object regardless of pagination/other filters.
@@ -5707,6 +5730,8 @@ def list_objects(
             print(f"DEBUG 33648: After from_orm, transcoding_status = {response_obj.transcoding_status}")
         # Add owner_email to the response
         response_obj.owner_email = owner_email
+        if anonymous:
+            _strip_owner_for_anonymous(response_obj)
 
         # Build URLs dynamically based on object ID and current request
         urls = build_storage_urls(
@@ -6914,13 +6939,13 @@ def get_public_object(
         StorageObject.id == object_id,
         StorageObject.is_public == True  # Only public objects
     ).first()
-    
-    if not obj:
+    _md = obj.metadata_json if obj is not None and isinstance(obj.metadata_json, dict) else {}
+    if not obj or _md.get("private_media") or getattr(obj, "tombstoned_at", None) is not None:
         raise HTTPException(status_code=404, detail="Public object not found")
     
     response_obj = StorageObjectResponse.from_orm(obj)
     response_obj.share_url = build_share_url(obj.id, obj.original_filename, True)
-    return response_obj
+    return _strip_owner_for_anonymous(response_obj)
 
 
 
