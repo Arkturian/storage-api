@@ -451,14 +451,18 @@ def blast_radius(
     if downstream:
         import httpx
         key = os.getenv("AI_INTERNAL_API_KEY", "Inetpass1")
+        # ARTrack gets its own outbound key (Issue #2385): after the ARTrack
+        # master rotation the shared value no longer authenticates there.
+        # Same variable as _notify_artrack_storage_deleted in storage/routes.py.
+        artrack_key = os.getenv("ARTRACK_API_KEY") or key
         targets = {
-            "artrack": f"{os.getenv('ARTRACK_API_URL', 'https://api-artrack.arkturian.com')}/admin/storage/{asset_id}/refs",
-            "knowledge": f"{os.getenv('KNOWLEDGE_API_URL', 'https://knowledge-api.arkturian.com')}/admin/refs/storage/{asset_id}",
+            "artrack": (f"{os.getenv('ARTRACK_API_URL', 'https://api-artrack.arkturian.com')}/admin/storage/{asset_id}/refs", artrack_key),
+            "knowledge": (f"{os.getenv('KNOWLEDGE_API_URL', 'https://knowledge-api.arkturian.com')}/admin/refs/storage/{asset_id}", key),
         }
-        for name, url in targets.items():
+        for name, (url, target_key) in targets.items():
             try:
                 with httpx.Client(timeout=8.0) as c:
-                    r = c.get(url, headers={"X-API-KEY": key})
+                    r = c.get(url, headers={"X-API-KEY": target_key})
                     radius["downstream"][name] = {
                         "status": r.status_code,
                         "refs": (r.json() if r.status_code == 200 else None),
