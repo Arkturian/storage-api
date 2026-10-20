@@ -605,7 +605,7 @@ from auth import get_current_user, get_current_user_optional, generate_api_key
 from models import StorageObject, StorageObjectResponse, StorageListResponse, User, AsyncTask
 from ai_analysis import analyze_content
 from config import settings
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import httpx
 from urllib.parse import urlparse, urlunparse
 from fastapi import Security
@@ -5176,6 +5176,67 @@ def _focal_access_check(object_id: int, db: Session, current_user: Optional[User
     return obj
 
 
+# Manual focal point (OnealServ, Alex 2026-10-20): YuNet only finds faces, so a
+# rider in a helmet or a banner of goggles has no automatic point. The owner can
+# set one by hand. It lives next to the face result in
+# ai_context_metadata["focal_point_manual"], wins over it on every read, and a
+# face recompute (POST) leaves it alone.
+class ManualFocalRequest(BaseModel):
+    x_pct: float = Field(..., ge=0, le=100, description="0-100, from the left edge of the image")
+    y_pct: float = Field(..., ge=0, le=100, description="0-100, from the top edge of the image")
+    note: Optional[str] = Field(None, max_length=200, description="What the point marks, e.g. 'Brille'")
+
+
+def _with_manual_focal(context_meta: Dict[str, Any], face: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The focal answer callers see: the manual point if set, else the face result.
+
+    Face fields (faces, model, computed_at …) are kept when they were computed,
+    so a consumer still sees what YuNet found under a manual point.
+    """
+    manual = context_meta.get("focal_point_manual")
+    if isinstance(manual, dict) and "x_pct" in manual and "y_pct" in manual:
+        out = dict(face or {})
+        out["focal_point"] = {"x_pct": manual["x_pct"], "y_pct": manual["y_pct"], "source": "manual"}
+        out["source"] = "manual"
+        out["note"] = manual.get("note")
+        out["set_at"] = manual.get("set_at")
+        return out
+    if face is None:
+        return None
+    out = dict(face)
+    if isinstance(out.get("focal_point"), dict):
+        out["focal_point"] = {**out["focal_point"], "source": "face"}
+        out["source"] = "face"
+    else:
+        out["source"] = None
+    return out
+
+
+def _focal_owner_check(object_id: int, db: Session, current_user: User, tenant_id: str) -> Any:
+    """Load an image object for a focal WRITE: own tenant, owner or real admin (as PATCH)."""
+    obj = db.query(StorageObject).filter(
+        StorageObject.id == object_id,
+        StorageObject.tenant_id == tenant_id,
+    ).first()
+    if not obj or (obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db)):
+        raise HTTPException(status_code=404, detail="Not found or forbidden")
+    if not (obj.mime_type or "").lower().startswith("image/"):
+        raise HTTPException(status_code=400, detail="Focal point is only available for images")
+    return obj
+
+
+def _store_context_meta(db: Session, object_id: int, context_meta: Dict[str, Any]) -> None:
+    try:
+        db.query(StorageObject).filter(StorageObject.id == object_id).update(
+            {"ai_context_metadata": context_meta},
+            synchronize_session=False,
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to persist focal point: {exc}")
+
+
 @router.get("/media/{object_id}/focal")
 def get_media_focal_point(
     object_id: int,
@@ -5199,6 +5260,9 @@ def get_media_focal_point(
     ``x_pct``/``y_pct`` in 0-100. ``null`` when no face is found — consumers then
     fall back to ``object-position: top``. Computed lazily on first call (unless
     ``generate=false``) and cached; use POST to force a recompute.
+
+    A point set by hand (PUT) wins: ``focal_point.source`` and ``source`` say
+    ``"manual"`` or ``"face"``; with a manual point no face detection runs.
     """
     obj = _focal_access_check(object_id, db, current_user)
 
@@ -5206,13 +5270,15 @@ def get_media_focal_point(
     if not isinstance(context_meta, dict):
         context_meta = {}
     cached = context_meta.get("focal_point")
-    if isinstance(cached, dict) and cached.get("computed_at"):
-        return cached
+    if not (isinstance(cached, dict) and cached.get("computed_at")):
+        cached = None
+    if cached is not None or isinstance(context_meta.get("focal_point_manual"), dict):
+        return _with_manual_focal(context_meta, cached)
 
     if not generate:
         raise HTTPException(status_code=404, detail="Focal point not computed yet")
 
-    return _compute_and_store_focal(obj, db, object_id)
+    return _with_manual_focal(context_meta, _compute_and_store_focal(obj, db, object_id))
 
 
 @router.post("/media/{object_id}/focal")
@@ -5222,9 +5288,55 @@ def recompute_media_focal_point(
     current_user: Optional[User] = Depends(get_current_user_optional),
     tenant_id: Optional[str] = Depends(get_tenant_id_optional),
 ) -> Dict[str, Any]:
-    """Force-recompute the focal point (invalidate cache) and return the fresh result."""
+    """Force-recompute the face focal point and return the result.
+
+    A point set by hand stays and still wins; only the face part is redone.
+    """
     obj = _focal_access_check(object_id, db, current_user)
-    return _compute_and_store_focal(obj, db, object_id)
+    context_meta = obj.ai_context_metadata if isinstance(obj.ai_context_metadata, dict) else {}
+    return _with_manual_focal(context_meta, _compute_and_store_focal(obj, db, object_id))
+
+
+@router.put("/media/{object_id}/focal")
+def set_manual_focal_point(
+    object_id: int,
+    payload: ManualFocalRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(get_tenant_id),
+) -> Dict[str, Any]:
+    """Set the focal point by hand (owner or admin). No face is needed."""
+    obj = _focal_owner_check(object_id, db, current_user, tenant_id)
+    context_meta = dict(obj.ai_context_metadata) if isinstance(obj.ai_context_metadata, dict) else {}
+    context_meta["focal_point_manual"] = {
+        "x_pct": round(float(payload.x_pct), 2),
+        "y_pct": round(float(payload.y_pct), 2),
+        "note": (payload.note or "").strip() or None,
+        "set_at": datetime.utcnow().isoformat() + "Z",
+    }
+    _store_context_meta(db, object_id, context_meta)
+    face = context_meta.get("focal_point")
+    return _with_manual_focal(context_meta, face if isinstance(face, dict) and face.get("computed_at") else None)
+
+
+@router.delete("/media/{object_id}/focal/manual")
+def delete_manual_focal_point(
+    object_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(get_tenant_id),
+) -> Dict[str, Any]:
+    """Drop the hand-set point; reads fall back to face detection."""
+    obj = _focal_owner_check(object_id, db, current_user, tenant_id)
+    context_meta = dict(obj.ai_context_metadata) if isinstance(obj.ai_context_metadata, dict) else {}
+    removed = context_meta.pop("focal_point_manual", None) is not None
+    if removed:
+        _store_context_meta(db, object_id, context_meta)
+    face = context_meta.get("focal_point")
+    return {
+        "manual_removed": removed,
+        "focal": _with_manual_focal(context_meta, face if isinstance(face, dict) and face.get("computed_at") else None),
+    }
 
 
 @router.get("/batch/focal")
@@ -5243,7 +5355,9 @@ def get_batch_focal_points(
     computed + cached on the fly. Per-object failures are reported under
     ``errors`` instead of failing the whole batch.
 
-    Example: ``/storage/media/batch/focal?id=1763&id=3571&generate=true``
+    Points set by hand (PUT) are returned in both modes and win over faces.
+
+    Example: ``/storage/batch/focal?id=1763&id=3571&generate=true``
     """
     result: Dict[str, Any] = {}
     errors: Dict[str, str] = {}
@@ -5257,13 +5371,15 @@ def get_batch_focal_points(
         if not isinstance(context_meta, dict):
             context_meta = {}
         cached = context_meta.get("focal_point")
-        if isinstance(cached, dict) and cached.get("computed_at"):
-            result[str(oid)] = cached
+        if not (isinstance(cached, dict) and cached.get("computed_at")):
+            cached = None
+        if cached is not None or isinstance(context_meta.get("focal_point_manual"), dict):
+            result[str(oid)] = _with_manual_focal(context_meta, cached)
             continue
         if not generate:
             continue
         try:
-            result[str(oid)] = _compute_and_store_focal(obj, db, oid)
+            result[str(oid)] = _with_manual_focal(context_meta, _compute_and_store_focal(obj, db, oid))
         except HTTPException as exc:
             errors[str(oid)] = str(exc.detail)
     payload: Dict[str, Any] = {"focal_points": result}
