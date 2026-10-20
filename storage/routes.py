@@ -4187,21 +4187,22 @@ def get_media_variant(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid bg_color: {exc}") from exc
 
-    # Public endpoint - allow access to any storage object by globally unique ID
-    obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
-
-    if not obj:
-        raise HTTPException(status_code=404, detail="Not found")
-
     # Signed link (Post 5235): any of the three present means the caller
     # relies on it, so a wrong or expired one is a hard 403 rather than a
-    # silent fall-back to the anonymous answer.
+    # silent fall-back to the anonymous answer. Checked before the lookup,
+    # so a wrong signature answers 403 whether the number exists or not.
     _signed = False
     if exp is not None or kid or sig:
         from storage import signing as _signing
         if not _signing.verify(object_id, exp, kid, sig):
             raise HTTPException(status_code=403, detail={"error": "invalid or expired signature", "code": "invalid_signature"})
         _signed = True
+
+    # Public endpoint - allow access to any storage object by globally unique ID
+    obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
+
+    if not obj:
+        raise HTTPException(status_code=404, detail="Not found")
 
     # Safety gate (raises 451 if blocked, bypassed for owner/admin)
     _check_quarantine(obj, current_user, db, signed=_signed)
