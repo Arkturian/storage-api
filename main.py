@@ -185,6 +185,26 @@ async def storage_media_head_headers(request: Request, call_next):
         m = _MEDIA_ID_RE.match(request.url.path)
         if m:
             object_id = int(m.group(1))
+            # Signed link (POST /storage/sign): GET honoured the signature from
+            # the start, HEAD did not — and the portal probes with HEAD before
+            # it shows an image, so signed private media never appeared
+            # (3DNerd, 2026-10-09). Same rule as GET: any of the three params
+            # present means the caller relies on it, so a wrong or expired one
+            # is a hard 403; a valid one lifts the two owner checks below and
+            # nothing else (the safety verdict still answers 451). Checked before
+            # the lookup, so a wrong signature answers 403 whether the number
+            # exists or not.
+            _qp_sig = request.query_params
+            _head_signed = False
+            if _qp_sig.get("exp") or _qp_sig.get("kid") or _qp_sig.get("sig"):
+                from storage import signing as _signing
+                try:
+                    _exp = int(_qp_sig.get("exp") or "")
+                except ValueError:
+                    _exp = None
+                if not _signing.verify(object_id, _exp, _qp_sig.get("kid"), _qp_sig.get("sig")):
+                    return Response(status_code=403, headers=_apply_cors_for_head({}, request))
+                _head_signed = True
             db = SessionLocal()
             try:
                 obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
@@ -201,24 +221,6 @@ async def storage_media_head_headers(request: Request, call_next):
             # will see the actual file.
             # Per-object opt-in privacy (Issue #420) — middleware has no
             # current_user, so HEAD on a private_media object is always 403.
-            # Signed link (POST /storage/sign): GET honoured the signature from
-            # the start, HEAD did not — and the portal probes with HEAD before
-            # it shows an image, so signed private media never appeared
-            # (3DNerd, 2026-10-09). Same rule as GET: any of the three params
-            # present means the caller relies on it, so a wrong or expired one
-            # is a hard 403; a valid one lifts the two owner checks below and
-            # nothing else (the safety verdict still answers 451).
-            _qp_sig = request.query_params
-            _head_signed = False
-            if _qp_sig.get("exp") or _qp_sig.get("kid") or _qp_sig.get("sig"):
-                from storage import signing as _signing
-                try:
-                    _exp = int(_qp_sig.get("exp") or "")
-                except ValueError:
-                    _exp = None
-                if not _signing.verify(object_id, _exp, _qp_sig.get("kid"), _qp_sig.get("sig")):
-                    return Response(status_code=403, headers=_apply_cors_for_head({}, request))
-                _head_signed = True
             _md_priv = obj.metadata_json if isinstance(obj.metadata_json, dict) else {}
             if _md_priv.get("private_media") and not _head_signed:
                 return Response(status_code=403, headers=_apply_cors_for_head({}, request))
