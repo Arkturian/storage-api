@@ -43,7 +43,7 @@ chk("owner_email without scope still works", r.status_code == 200 and r.json().g
 r = up(PLAIN, "e.bin", grant_scope="not a scope")
 chk("invalid scope still 422 invalid_scope", r.status_code == 422 and r.json()["detail"].get("code") == "invalid_scope")
 r = requests.get(f"{B}/storage/objects/{up(PLAIN, 'f.bin', grant_scope='test-visible:f').json()['id']}", headers=PLAIN)
-chk("plain GET does not claim a binding", r.status_code == 200 and r.json().get("grant_scope") is None)
+chk("owner GET shows the bound scope (#2568)", r.status_code == 200 and r.json().get("grant_scope") == "test-visible:f")
 
 r = up(PLAIN, "g.bin", grant_scope="test-visible:g1, test-visible:g2,test-visible:g1")
 chk("list of scopes is bound and returned normalised", r.status_code == 200 and r.json().get("grant_scope") == "test-visible:g1,test-visible:g2", r.text[:80] if r.status_code != 200 else str(r.json().get("grant_scope")))
