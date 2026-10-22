@@ -5527,6 +5527,12 @@ def get_object_metadata(
     response_obj.thumbnail_url = urls["thumbnail_url"]
     response_obj.webview_url = urls["webview_url"]
     response_obj.share_url = build_share_url(obj.id, obj.original_filename, bool(obj.is_public))
+    # #2568: the owner and real admins see the scopes the object is bound to.
+    # Before, GET always said null, and agents read that as "not bound".
+    if current_user is not None and (obj.owner_user_id == current_user.id or _is_privileged_admin(current_user, db)):
+        from models import MediaGrant
+        _scopes = [g.scope for g in db.query(MediaGrant).filter(MediaGrant.object_id == obj.id).order_by(MediaGrant.id)]
+        response_obj.grant_scope = ",".join(_scopes) or None
 
     # Check for HLS files if this is a video or pre-transcoded zip
     if (obj.mime_type and obj.mime_type.startswith("video/")) or \

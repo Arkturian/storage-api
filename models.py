@@ -197,7 +197,7 @@ class StorageObjectResponse(BaseModel):
     thumbnail_url: Optional[str] = None
     webview_url: Optional[str] = None
     share_url: Optional[str] = None  # public objects only: readable link on the share host
-    grant_scope: Optional[str] = None  # upload/fetch responses only: the scope actually bound in this request
+    grant_scope: Optional[str] = None  # upload/fetch: scope bound in this request; GET /objects/{id}: all bound scopes, owner/admin only (#2568)
     mime_type: str
     file_size_bytes: int
     checksum: Optional[str] = None
