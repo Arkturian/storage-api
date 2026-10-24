@@ -5,7 +5,7 @@ on:
 
 jobs:
   check-logs:
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: [self-hosted, linux, arkserver]
 
     steps:
       - name: Guard - private DEPLOY_HOST braucht self-hosted Runner
