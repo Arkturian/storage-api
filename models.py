@@ -315,6 +315,11 @@ def _assign_never_reused_id(mapper, connection, target):
         target.id = _hwm_next(connection, StorageObject.__tablename__)
 
 
+# Aeltere Datenbanken ohne media_grants: dort gibt es nichts zu entfernen, und
+# das Loeschen darf daran nicht scheitern (test_id_no_reuse, Altschema).
+_grants_tabelle: dict = {}
+
+
 @_sa_event.listens_for(StorageObject, "after_delete")
 def _grants_mit_loeschen(mapper, connection, target):
     """Bindungen gehen mit dem Objekt (ELE 24.10.2026).
@@ -323,4 +328,9 @@ def _grants_mit_loeschen(mapper, connection, target):
     die Zeilen als Waisen stehen. Hier, nicht in jedem Loeschweg: so greift es
     auch fuer kaskadierte Kinder und kuenftige Pfade.
     """
-    connection.execute(MediaGrant.__table__.delete().where(MediaGrant.object_id == target.id))
+    key = id(connection.engine)
+    if key not in _grants_tabelle:
+        from sqlalchemy import inspect as _sa_inspect
+        _grants_tabelle[key] = _sa_inspect(connection).has_table(MediaGrant.__tablename__)
+    if _grants_tabelle[key]:
+        connection.execute(MediaGrant.__table__.delete().where(MediaGrant.object_id == target.id))
