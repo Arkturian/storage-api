@@ -16,7 +16,7 @@ import subprocess
 import threading
 from pathlib import Path
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timezone
 
 from PIL import Image
 from storage.pillow_plugins import ensure_heif_support
@@ -3863,6 +3863,16 @@ def media_repr_etag(obj, **repr_params) -> Optional[str]:
     return '"' + hashlib.md5(f"{obj.checksum}|{key}".encode()).hexdigest() + '"'
 
 
+def _ist_abgelaufen(obj) -> bool:
+    """expires_at liegt in der Vergangenheit (naiv = UTC, wie cleanup_expired)."""
+    exp = getattr(obj, "expires_at", None)
+    if exp is None:
+        return False
+    if getattr(exp, "tzinfo", None) is not None:
+        exp = exp.astimezone(timezone.utc).replace(tzinfo=None)
+    return exp < datetime.utcnow()
+
+
 def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] = None,
                       signed: bool = False) -> None:
     """
@@ -3903,6 +3913,11 @@ def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] =
     # query the DB directly and don't go through this gate.
     if getattr(obj, "tombstoned_at", None) is not None:
         raise HTTPException(status_code=404, detail={"error": "asset not found", "code": "tombstoned"})
+    # Abgelaufen (expires_at) gilt ab sofort als weg, nicht erst nach dem
+    # naechsten cleanup_expired-Lauf. Ohne den Lauf blieben "24-h-Kopien"
+    # dauerhaft oeffentlich (P3 24.10.2026: Kontoauszuege seit 30.08. abrufbar).
+    if _ist_abgelaufen(obj):
+        raise HTTPException(status_code=404, detail={"error": "asset not found", "code": "expired"})
     # Per-object opt-in privacy (Issue #420): metadata_json.private_media=true
     # closes the public-by-ID hole for genuinely confidential uploads without
     # changing the default contract the public frontends rely on. Only the
