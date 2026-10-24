@@ -107,7 +107,14 @@ class GenericStorageService:
             self.media_dir.mkdir(exist_ok=True)
             self.thumbnails_dir.mkdir(exist_ok=True)
             self.webview_dir.mkdir(exist_ok=True)
-        except Exception:
+        except Exception as e:
+            # Ausdruecklich gesetzter Ablageort weicht nie aus (P3 24.10.2026):
+            # ein nicht beschreibbares Datenvolumen (TCC, nicht eingehaengt)
+            # haette Nutzdaten still in den Code-Baum geschrieben.
+            if base_dir is None and os.getenv("STORAGE_UPLOAD_DIR"):
+                raise RuntimeError(
+                    f"STORAGE_UPLOAD_DIR={self.upload_root} ist nicht beschreibbar ({e!r}); "
+                    "kein Rueckfall auf ./uploads/storage") from e
             # Fallback to local relative path if configured root is not creatable (e.g., read-only /mnt)
             fallback = Path("./uploads/storage")
             try:
