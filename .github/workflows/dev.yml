@@ -10,20 +10,17 @@ on:
 
 jobs:
   build:
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: [self-hosted, linux, arkserver]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
+      # System python3.11 of the Debian 12 runner; actions/setup-python finds
+      # no 3.11 there (#2583).
       # NOTE: we intentionally do NOT `pip install -r requirements.txt` here —
       # it pulls a private git dep (mac-transcoding-api) the GitHub runner can't
       # clone, which made this CI fail on every push while testing nothing.
       # compileall doesn't import modules, so it catches syntax/indent errors
       # across the codebase without needing the dependencies installed.
       - name: Syntax / compile check
-        run: python -m compileall -q main.py storage tasks ai_analysis knowledge_graph tenancy admin
+        run: python3.11 -m compileall -q main.py storage tasks ai_analysis knowledge_graph tenancy admin

@@ -1,589 +1,168 @@
 name: Deploy Storage API
 
+# Push to main deploys arkserver only. Customer instances (oneal, pdrei, ELE,
+# P3, ...) are NOT deployed from here: each one needs its own Go and goes out
+# via tenant-update / by hand (#2583). arkturian runs no storage-api any more.
+#
+# arkserver is not a git checkout (see DEPLOYED_REVISION.txt there): the job
+# copies the files of this commit over the live tree, the same way manual
+# deploys have been done since 2026-08 (Alex' decision, 24.10.2026, #2583).
+
 on:
   push:
     branches:
       - main
   workflow_dispatch:
-    inputs:
-      deploy_arkturian:
-        description: 'Deploy to arkturian.com'
-        type: boolean
-        default: true
-      deploy_arkserver:
-        description: 'Deploy to arkserver.arkturian.com'
-        type: boolean
-        default: true
-      deploy_aiserver:
-        description: 'Deploy to aiserver.oneal.eu'
-        type: boolean
-        default: true
+
+concurrency:
+  group: deploy-storage-api
+  cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: "3.11"
+  LIVE_PYTHON: /var/www/api-storage.arkturian.com/venv/bin/python
 
 jobs:
   test:
     name: Run Tests
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: [self-hosted, linux, arkserver]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
-          python -m pip install --upgrade pip
-          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
-          pip install -r requirements.txt
-          pip install pytest pytest-cov pytest-asyncio
-
+      # No actions/setup-python: it finds no 3.11 on the Debian 12 runner.
+      # Tests run with the live venv's interpreter (same packages as
+      # production, read-only use); pytest goes into a temp dir, never into
+      # that venv. Data, uploads and tenant config are all in RUNNER_TEMP.
       - name: Run tests
         run: |
-          if [ -d tests ]; then
-            pytest tests/ -v --cov=. --cov-report=xml --cov-report=term
-          else
-            echo "No tests directory present. Skipping pytest step."
-          fi
+          set -euo pipefail
+          T="$RUNNER_TEMP/storage-tests"
+          rm -rf "$T" && mkdir -p "$T/pt" "$T/data" "$T/up"
+          "$LIVE_PYTHON" -m pip install -q --target "$T/pt" pytest
+          echo '{"ci_test_key": "arkturian"}' > "$T/tenants.json"
+          PYTHONPATH="$T/pt" \
+          DATABASE_URL="sqlite:///$T/t.db" \
+          TENANT_CONFIG_PATH="$T/tenants.json" \
+          STORAGE_DATA_DIR="$T/data" \
+          STORAGE_UPLOAD_DIR="$T/up" \
+            "$LIVE_PYTHON" -m pytest -q -p no:cacheprovider tests
 
-  # ============================================================================
-  # PRODUCTION: arkturian.com (api-storage.arkturian.com)
-  # ============================================================================
-  deploy-arkturian:
-    name: Deploy to arkturian.com
-    # DISABLED 2026-07-21: storage consolidated onto arkserver (Phase 1-3).
-    # The VPS runs only an nginx reverse-proxy for api-storage.arkturian.com /
-    # vod.arkturian.com; its storage services are masked. Deploying/restarting
-    # here would resurrect the frozen pre-merge instance. Set false -> true only
-    # if the VPS ever becomes a storage host again.
-    if: ${{ false }}
+      - name: Build release archive
+        run: git archive --format=tar.gz -o "$RUNNER_TEMP/storage-api-${GITHUB_SHA}.tar.gz" "$GITHUB_SHA"
+
+      - name: Keep archive for deploy
+        uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: ${{ runner.temp }}/storage-api-${{ github.sha }}.tar.gz
+          retention-days: 7
+
+  deploy-arkserver:
+    name: Deploy to arkserver
     needs: test
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    if: vars.ENABLE_ARKSERVER_DEPLOY == 'true' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, arkserver]
     environment:
       name: production
       url: https://api-storage.arkturian.com
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Guard - private DEPLOY_HOST braucht self-hosted Runner
-        run: |
-          case "${{ secrets.DEPLOY_HOST }}" in
-            10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
-              if [ -z "${{ vars.RUNNER_LABEL }}" ]; then
-                echo "::error::DEPLOY_HOST ist privat (${{ secrets.DEPLOY_HOST }}), RUNNER_LABEL aber leer - SSH wuerde in einen NAT-Timeout laufen."
-                exit 1
-              fi ;;
-          esac
-
-      - name: Deploy to arkturian.com
-        uses: appleboy/ssh-action@v1.0.3
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+      - name: Fetch release archive
+        uses: actions/download-artifact@v4
         with:
-          host: ${{ secrets.PROD_DEPLOY_HOST }}
-          port: ${{ secrets.PROD_DEPLOY_PORT }}
-          username: ${{ secrets.PROD_DEPLOY_USER }}
-          key: ${{ secrets.PROD_DEPLOY_SSH_KEY }}
-          envs: GH_TOKEN
-          command_timeout: 10m
-          script: |
-            set -euo pipefail
-            export DEBIAN_FRONTEND=noninteractive
+          name: release
+          path: release
 
-            TARGET_DIR="/var/www/api-storage.arkturian.com"
-            DATA_DIR="/var/lib/storage-api"
-
-            mkdir -p "$TARGET_DIR" "$DATA_DIR/chroma_db"
-            git config --global --add safe.directory "$TARGET_DIR"
-            cd "$TARGET_DIR"
-
-            if [ ! -d .git ]; then
-              git init && git remote add origin https://github.com/apopovic77/storage-api.git
-            fi
-            git fetch origin && git checkout main && git reset --hard origin/main
-
-            # Python venv (use --without-pip to avoid ensurepip issues on some systems)
-            rm -rf venv
-            if [ -f ~/.pyenv/versions/3.11.9/bin/python3.11 ]; then
-              ~/.pyenv/versions/3.11.9/bin/python3.11 -m venv venv --without-pip
-            else
-              python3 -m venv venv --without-pip
-            fi
-            source venv/bin/activate
-            curl -sS https://bootstrap.pypa.io/get-pip.py | python3
-            pip install --upgrade pip
-
-            # mac-transcoding-api dependency
-            mkdir -p /var/code
-            if [ ! -d /var/code/mac-transcoding-api/.git ]; then
-              git clone -b dev https://github.com/apopovic77/mac-transcoding-api.git /var/code/mac-transcoding-api
-            else
-              cd /var/code/mac-transcoding-api && git fetch origin && git reset --hard origin/dev && cd -
-            fi
-            sed -i 's|git+https://github.com/apopovic77/mac-transcoding-api.git@[a-z]*|/var/code/mac-transcoding-api|g' requirements.txt
-
-            pip install --no-cache-dir -r requirements.txt
-
-            # Sync STORAGE_UPLOAD_DIR from systemd unit to .env (cleanup cron needs it)
-            UPLOAD_DIR=$(systemctl show storage-api.service -p Environment 2>/dev/null | grep -oP 'STORAGE_UPLOAD_DIR=\K[^ "]+' || true)
-            if [ -n "$UPLOAD_DIR" ]; then
-              grep -q "^STORAGE_UPLOAD_DIR=" "$TARGET_DIR/.env" 2>/dev/null \
-                || echo "STORAGE_UPLOAD_DIR=$UPLOAD_DIR" >> "$TARGET_DIR/.env"
-            fi
-
-            # GLB bridge → 3D-API (single instance hosted on arkserver, reachable for prod via public domain)
-            grep -q "^THREED_API_URL=" "$TARGET_DIR/.env" 2>/dev/null && sed -i 's|^THREED_API_URL=.*|THREED_API_URL=https://3d-api.arkserver.arkturian.com|' "$TARGET_DIR/.env" \
-              || echo "THREED_API_URL=https://3d-api.arkserver.arkturian.com" >> "$TARGET_DIR/.env"
-
-            # Ensure TTL cleanup cron runs every 15 minutes
-            CRON_CMD="*/15 * * * * cd $TARGET_DIR && ./venv/bin/python scripts/cleanup_expired.py >> /var/log/storage-api-cleanup.log 2>&1"
-            CRON_USER="www-data"
-            EXISTING_CRON=$(crontab -u "$CRON_USER" -l 2>/dev/null | grep -v cleanup_expired || true)
-            { [ -n "$EXISTING_CRON" ] && echo "$EXISTING_CRON"; echo "$CRON_CMD"; } | crontab -u "$CRON_USER" -
-
-            # Syntax gate: never restart on code that cannot even be imported.
-            # A malformed patch took the whole service down on 2026-08-05 —
-            # the process died before binding the port, so /health was gone too
-            # and systemd looped every 10s. compileall costs milliseconds and
-            # shows ALL offending lines at once instead of revealing them one
-            # restart at a time (3dApi's suggestion after that outage).
-            if ! ./venv/bin/python -m compileall -q -x '(^|/)(venv|\.venv|__pycache__|\.git)(/|$)' .; then
-              echo "❌ syntax check failed — NOT restarting the service"
-              exit 1
-            fi
-
-            systemctl restart storage-api.service
-            systemctl restart celery-worker.service || true
-            # Cold start (ChromaDB load) can exceed a fixed sleep — retry up to 90s
-            for i in $(seq 1 18); do
-              if curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null 2>&1; then
-                echo "health OK after ~$((i*5))s"; exit 0
-              fi
-              sleep 5
-            done
-            echo "health check failed after 90s"; exit 1
-
-  # ============================================================================
-  # STAGING: arkserver.arkturian.com (api-storage.arkserver.arkturian.com)
-  # ============================================================================
-  deploy-arkserver:
-    name: Deploy to arkserver.arkturian.com
-    needs: test
-    if: |
-      vars.ENABLE_ARKSERVER_DEPLOY == 'true' &&
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      (github.event_name != 'workflow_dispatch' || inputs.deploy_arkserver)
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
-    environment:
-      name: staging
-      url: https://api-storage.arkserver.arkturian.com
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy to arkserver.arkturian.com
-        uses: appleboy/ssh-action@v1.0.3
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+      - name: Upload archive to host
+        uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           port: ${{ secrets.DEPLOY_PORT }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: GH_TOKEN
+          source: release/storage-api-${{ github.sha }}.tar.gz
+          target: /var/tmp/storage-api-deploy
+          strip_components: 1
+
+      - name: Copy files, check, restart, verify
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: SHA
           command_timeout: 10m
           script: |
             set -euo pipefail
-            export DEBIAN_FRONTEND=noninteractive
+            LIVE=/var/www/api-storage.arkturian.com
+            SHORT=${SHA:0:7}
+            STAGE=/var/tmp/storage-api-deploy/$SHORT
+            BACKUP=/var/backups/storage-api/$(date +%Y%m%d-%H%M%S)-$SHORT
+            SERVICES="storage-api celery-worker storage-ai-worker storage-safety-worker storage-embeddings-worker"
 
-            TARGET_DIR="/var/www/api-storage.arkturian.com"
-            DATA_DIR="/var/lib/storage-api"
+            rm -rf "$STAGE" && mkdir -p "$STAGE"
+            tar -xzf "/var/tmp/storage-api-deploy/storage-api-$SHA.tar.gz" -C "$STAGE"
 
-            mkdir -p "$TARGET_DIR" "$DATA_DIR/chroma_db"
-            git config --global --add safe.directory "$TARGET_DIR"
-            cd "$TARGET_DIR"
-
-            if [ ! -d .git ]; then
-              git init && git remote add origin https://github.com/apopovic77/storage-api.git
-            fi
-            git fetch origin && git checkout main && git reset --hard origin/main
-
-            # Python venv — REUSE existing venv; full rebuild only when missing/broken.
-            # (The old rm -rf + get-pip + full pip install on every deploy took up
-            # to 2h on a loaded box for a one-line code change.)
-            if [ ! -x venv/bin/python ]; then
-              rm -rf venv
-              if [ -f ~/.pyenv/versions/3.11.9/bin/python3.11 ]; then
-                ~/.pyenv/versions/3.11.9/bin/python3.11 -m venv venv --without-pip
-              else
-                python3 -m venv venv --without-pip
-              fi
-              source venv/bin/activate
-              curl -sS https://bootstrap.pypa.io/get-pip.py | python3
-            else
-              source venv/bin/activate
-            fi
-
-            # mac-transcoding-api dependency
-            mkdir -p /var/code
-            if [ ! -d /var/code/mac-transcoding-api/.git ]; then
-              git clone -b dev https://github.com/apopovic77/mac-transcoding-api.git /var/code/mac-transcoding-api
-            else
-              cd /var/code/mac-transcoding-api && git fetch origin && git reset --hard origin/dev && cd -
-            fi
-            sed -i 's|git+https://github.com/apopovic77/mac-transcoding-api.git@[a-z]*|/var/code/mac-transcoding-api|g' requirements.txt
-
-            # Install deps only when requirements.txt (post-sed) or the
-            # mac-transcoding-api checkout actually changed — code-only deploys
-            # skip pip entirely.
-            MAC_SHA=$(git -C /var/code/mac-transcoding-api rev-parse HEAD 2>/dev/null || echo none)
-            REQ_HASH="$(sha256sum requirements.txt | cut -d' ' -f1)-$MAC_SHA"
-            STAMP_FILE=venv/.deps-stamp
-            if [ "$(cat "$STAMP_FILE" 2>/dev/null || true)" != "$REQ_HASH" ]; then
-              pip install --upgrade pip
-              pip install -r requirements.txt
-              echo "$REQ_HASH" > "$STAMP_FILE"
-            else
-              echo "Dependencies unchanged ($REQ_HASH) — skipping pip install"
-            fi
-
-            # Fix chroma_db permissions - both www-data (storage-api) and root (celery) need access
-            mkdir -p "$TARGET_DIR/chroma_db"
-            chown -R www-data:www-data "$TARGET_DIR/chroma_db"
-            chmod -R 775 "$TARGET_DIR/chroma_db"
-
-            # Sync STORAGE_UPLOAD_DIR from systemd unit to .env (cleanup cron needs it)
-            UPLOAD_DIR=$(systemctl show storage-api.service -p Environment 2>/dev/null | grep -oP 'STORAGE_UPLOAD_DIR=\K[^ "]+' || true)
-            if [ -n "$UPLOAD_DIR" ]; then
-              grep -q "^STORAGE_UPLOAD_DIR=" "$TARGET_DIR/.env" 2>/dev/null \
-                || echo "STORAGE_UPLOAD_DIR=$UPLOAD_DIR" >> "$TARGET_DIR/.env"
-            fi
-
-            # GLB bridge → 3D-API (lives on this same host, talk locally to skip SSL/nginx hop)
-            grep -q "^THREED_API_URL=" "$TARGET_DIR/.env" 2>/dev/null && sed -i 's|^THREED_API_URL=.*|THREED_API_URL=http://127.0.0.1:8065|' "$TARGET_DIR/.env" \
-              || echo "THREED_API_URL=http://127.0.0.1:8065" >> "$TARGET_DIR/.env"
-
-            # Ensure TTL cleanup cron runs every 15 minutes
-            CRON_CMD="*/15 * * * * cd $TARGET_DIR && ./venv/bin/python scripts/cleanup_expired.py >> /var/log/storage-api-cleanup.log 2>&1"
-            CRON_USER="www-data"
-            EXISTING_CRON=$(crontab -u "$CRON_USER" -l 2>/dev/null | grep -v cleanup_expired || true)
-            { [ -n "$EXISTING_CRON" ] && echo "$EXISTING_CRON"; echo "$CRON_CMD"; } | crontab -u "$CRON_USER" -
-
-            # Syntax gate: never restart on code that cannot even be imported.
-            # A malformed patch took the whole service down on 2026-08-05 —
-            # the process died before binding the port, so /health was gone too
-            # and systemd looped every 10s. compileall costs milliseconds and
-            # shows ALL offending lines at once instead of revealing them one
-            # restart at a time (3dApi's suggestion after that outage).
-            if ! ./venv/bin/python -m compileall -q -x '(^|/)(venv|\.venv|__pycache__|\.git)(/|$)' .; then
-              echo "❌ syntax check failed — NOT restarting the service"
+            # requirements.txt on the host points mac-transcoding-api at the
+            # local checkout (the PAT for the git URL is broken).
+            sed -i 's|git+https://github.com/apopovic77/mac-transcoding-api.git@[a-z]*|/var/code/mac-transcoding-api|g' "$STAGE/requirements.txt"
+            if ! cmp -s "$STAGE/requirements.txt" "$LIVE/requirements.txt"; then
+              echo "❌ requirements.txt changed — dependency updates are done by hand (venv rebuild breaks running workers). Not deploying."
+              diff "$LIVE/requirements.txt" "$STAGE/requirements.txt" || true
               exit 1
             fi
 
-            systemctl restart storage-api.service
-            systemctl restart celery-worker.service || true
-            # Cold start (ChromaDB load) can exceed a fixed sleep — retry up to 90s
-            for i in $(seq 1 18); do
-              if curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null 2>&1; then
-                echo "health OK after ~$((i*5))s"; exit 0
+            # Syntax gate on the new tree before anything is touched.
+            if ! "$LIVE/venv/bin/python" -m compileall -q -x '(^|/)(venv|\.venv|__pycache__|\.git|tests)(/|$)' "$STAGE" >/dev/null; then
+              echo "❌ syntax check failed — nothing changed"
+              exit 1
+            fi
+
+            # Backup of every live file this deploy overwrites.
+            mkdir -p "$BACKUP"
+            (cd "$STAGE" && find . -type f ! -path './tests/*' ! -path '*/__pycache__/*' -print0) | while IFS= read -r -d '' f; do
+              if [ -f "$LIVE/$f" ] && ! cmp -s "$STAGE/$f" "$LIVE/$f"; then
+                mkdir -p "$BACKUP/$(dirname "$f")" && cp -p "$LIVE/$f" "$BACKUP/$f"
               fi
+            done
+            cp -p "$LIVE/DEPLOYED_REVISION.txt" "$BACKUP/" 2>/dev/null || true
+            echo "backup: $BACKUP"
+
+            # Copy without deleting: live-only files (.env, venv, data) stay.
+            # Services only read the code; root-owned 644 files are fine.
+            rsync -rlt --checksum --exclude 'tests/' --exclude '.git/' --exclude '__pycache__/' "$STAGE/" "$LIVE/"
+
+            rollback() {
+              echo "⚠️  rolling back from $BACKUP"
+              rsync -rlt "$BACKUP/" "$LIVE/"
+              systemctl restart $SERVICES || true
+            }
+
+            systemctl restart $SERVICES
+            ok=""
+            for i in $(seq 1 18); do
+              if curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null 2>&1; then ok=1; echo "health OK after ~$((i*5))s"; break; fi
               sleep 5
             done
-            echo "health check failed after 90s"; exit 1
+            if [ -z "$ok" ]; then rollback; echo "❌ health check failed after 90s, rolled back"; exit 1; fi
+            for s in $SERVICES; do
+              systemctl is-active --quiet "$s" || { rollback; echo "❌ $s not active, rolled back"; exit 1; }
+            done
 
-  # ============================================================================
-  # O'NEAL: aiserver.oneal.eu (via arkturian.com jump host)
-  # ============================================================================
-  deploy-aiserver:
-    name: Deploy to aiserver.oneal.eu
-    needs: test
-    if: |
-      vars.ENABLE_AISERVER_DEPLOY == 'true' &&
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      (github.event_name != 'workflow_dispatch' || inputs.deploy_aiserver)
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
-    environment:
-      name: oneal
-      url: https://gsgbot.arkturian.com
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+            sed -i "s|^Code in this directory == storage-api origin/[a-z]* @ \([0-9a-f]*\) (|Code in this directory == storage-api origin/main @ $SHORT ($(date +%F), CI deploy; backup $BACKUP; before: \1 |" "$LIVE/DEPLOYED_REVISION.txt"
+            rm -rf "$STAGE" "/var/tmp/storage-api-deploy/storage-api-$SHA.tar.gz"
+            echo "✅ storage-api $SHORT live on arkserver"
 
-      - name: Deploy via arkturian.com jump host
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.PROD_DEPLOY_HOST }}
-          port: ${{ secrets.PROD_DEPLOY_PORT }}
-          username: ${{ secrets.PROD_DEPLOY_USER }}
-          key: ${{ secrets.PROD_DEPLOY_SSH_KEY }}
-          command_timeout: 10m
-          script: |
-            set -euo pipefail
-            echo "=== Deploying storage-api to aiserver.oneal.eu via jump host ==="
-
-            # SSH to aiserver and deploy
-            ssh -o StrictHostKeyChecking=no -i /root/.ssh/oneal_aiserver gsgbot@aiserver.oneal.eu << 'DEPLOY_SCRIPT'
-            set -euo pipefail
-
-            TARGET_DIR="/var/www/storage-api"
-            DATA_DIR="/var/lib/storage-api"
-
-            echo "=== Updating repository ==="
-            cd "$TARGET_DIR"
-            git fetch origin
-            # Clean untracked files but keep venv and .env
-            git clean -fd --exclude=venv --exclude=.env
-            git checkout -f main
-            git reset --hard origin/main
-
-            echo "=== Installing dependencies ==="
-            source venv/bin/activate
-            pip install --upgrade pip
-
-            # Update mac-transcoding-api if exists
-            if [ -d /var/code/mac-transcoding-api ]; then
-              cd /var/code/mac-transcoding-api && git fetch origin && git reset --hard origin/dev && cd -
-            fi
-
-            # Convert git URL to local path for mac-transcoding-api
-            sed -i 's|git+https://github.com/apopovic77/mac-transcoding-api.git@dev|/var/code/mac-transcoding-api|g' requirements.txt
-
-            # Install dependencies (Python 3.13 compatible)
-            pip install --no-cache-dir -r requirements.txt
-
-            # Sync STORAGE_UPLOAD_DIR from systemd unit to .env (cleanup cron needs it)
-            UPLOAD_DIR=$(sudo systemctl show storage-api.service -p Environment 2>/dev/null | grep -oP 'STORAGE_UPLOAD_DIR=\K[^ "]+' || true)
-            if [ -n "$UPLOAD_DIR" ]; then
-              grep -q "^STORAGE_UPLOAD_DIR=" "$TARGET_DIR/.env" 2>/dev/null \
-                || echo "STORAGE_UPLOAD_DIR=$UPLOAD_DIR" >> "$TARGET_DIR/.env"
-            fi
-
-            # GLB bridge → 3D-API (single instance on arkserver, reachable via public domain)
-            grep -q "^THREED_API_URL=" "$TARGET_DIR/.env" 2>/dev/null && sed -i 's|^THREED_API_URL=.*|THREED_API_URL=https://3d-api.arkserver.arkturian.com|' "$TARGET_DIR/.env" \
-              || echo "THREED_API_URL=https://3d-api.arkserver.arkturian.com" >> "$TARGET_DIR/.env"
-
-            # Ensure TTL cleanup cron runs every 15 minutes
-            CRON_CMD="*/15 * * * * cd $TARGET_DIR && ./venv/bin/python scripts/cleanup_expired.py >> /var/log/storage-api-cleanup.log 2>&1"
-            EXISTING_CRON=$(crontab -l 2>/dev/null | grep -v cleanup_expired || true)
-            { [ -n "$EXISTING_CRON" ] && echo "$EXISTING_CRON"; echo "$CRON_CMD"; } | crontab -
-
-            echo "=== Restarting services ==="
-            # Syntax gate: never restart on code that cannot even be imported.
-            # A malformed patch took the whole service down on 2026-08-05 —
-            # the process died before binding the port, so /health was gone too
-            # and systemd looped every 10s. compileall costs milliseconds and
-            # shows ALL offending lines at once instead of revealing them one
-            # restart at a time (3dApi's suggestion after that outage).
-            if ! ./venv/bin/python -m compileall -q -x '(^|/)(venv|\.venv|__pycache__|\.git)(/|$)' .; then
-              echo "❌ syntax check failed — NOT restarting the service"
-              exit 1
-            fi
-
-            sudo systemctl restart storage-api.service
-            sudo systemctl restart celery-worker.service || true
-            sleep 3
-
-            echo "=== Health check ==="
-            curl -fsS --max-time 10 http://127.0.0.1:8001/health
-            echo ""
-            echo "=== Deployment complete ==="
-            DEPLOY_SCRIPT
-
-  # ============================================================================
-  # PDREI: pdrei.arkturian.com (jascha) — minimal deploy, no celery/transcoding
-  # ============================================================================
-  deploy-pdrei:
-    name: Deploy to pdrei.arkturian.com
-    needs: test
-    if: |
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
-    environment:
-      name: pdrei
-      url: https://storage-api.pdrei.arkturian.com
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy to pdrei
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.PDREI_DEPLOY_HOST }}
-          username: ${{ secrets.PDREI_DEPLOY_USER }}
-          key: ${{ secrets.PDREI_DEPLOY_SSH_KEY }}
-          port: 22
-          command_timeout: 15m
-          script: |
-            set -e
-
-            DEPLOY_PATH="/var/www/storage-api"
-            DATA_DIR="/var/lib/storage-api"
-            REPO_URL="https://github.com/apopovic77/storage-api.git"
-            SERVICE_NAME="storage-api"
-            DOMAIN="storage-api.pdrei.arkturian.com"
-            UPSTREAM_PORT=8090  # 8080 is taken by mcp-server on pdrei
-
-            sudo mkdir -p "$DATA_DIR/chroma_db"
-            sudo chown -R jascha:jascha "$DATA_DIR"
-
-            # Init git repo if needed
-            if [ ! -d "$DEPLOY_PATH/.git" ]; then
-              cd "$DEPLOY_PATH"
-              git init
-              git remote add origin "$REPO_URL" || git remote set-url origin "$REPO_URL"
-            fi
-
-            cd "$DEPLOY_PATH"
-            echo "Fetching latest code..."
-            git fetch origin main
-            git reset --hard origin/main
-
-            # Strip mac-transcoding-api git dependency (not used on pdrei)
-            sed -i 's|git+https://github.com/apopovic77/mac-transcoding-api.git@[a-z]*||g' requirements.txt
-
-            # Setup venv
-            if [ ! -d "venv" ]; then
-              python3 -m venv venv
-            fi
-            source venv/bin/activate
-            pip install --upgrade pip --quiet
-            pip install --no-cache-dir -r requirements.txt 2>&1 | tail -5
-
-            # Always (re)write systemd unit
-            echo "Writing systemd unit..."
-            sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null <<UNIT
-            [Unit]
-            Description=Storage API (pdrei instance)
-            After=network.target
-
-            [Service]
-            Type=simple
-            User=jascha
-            WorkingDirectory=${DEPLOY_PATH}
-            Environment="STORAGE_DATA_DIR=${DATA_DIR}"
-            Environment="DATABASE_URL=sqlite:///${DATA_DIR}/storage.db"
-            Environment="CORS_ORIGINS=https://admin.pdrei.arkturian.com,https://content.pdrei.arkturian.com,https://content-api.pdrei.arkturian.com,https://pdrei.arkturian.com,http://localhost:3000,http://localhost:8080"
-            ExecStart=${DEPLOY_PATH}/venv/bin/gunicorn -w 2 -k uvicorn.workers.UvicornWorker --timeout 600 --graceful-timeout 20 --keep-alive 5 --bind 127.0.0.1:${UPSTREAM_PORT} main:app
-            Restart=on-failure
-            RestartSec=5
-
-            [Install]
-            WantedBy=multi-user.target
-            UNIT
-            sudo systemctl daemon-reload
-            sudo systemctl enable ${SERVICE_NAME}
-
-            # Always (re)write nginx vhost with SSL (multi-domain cert)
-            echo "Writing nginx vhost with SSL..."
-            CERT_PATH="/etc/letsencrypt/live/mcp.pdrei.arkturian.com"
-            if ! sudo test -d "$CERT_PATH"; then
-              echo "ERROR: SSL cert not found at $CERT_PATH"
-              exit 1
-            fi
-
-            sudo tee /etc/nginx/sites-available/${DOMAIN} > /dev/null <<NGINX
-            server {
-                listen 80;
-                server_name ${DOMAIN};
-                return 301 https://\$host\$request_uri;
-            }
-
-            server {
-                listen 443 ssl http2;
-                server_name ${DOMAIN};
-
-                ssl_certificate ${CERT_PATH}/fullchain.pem;
-                ssl_certificate_key ${CERT_PATH}/privkey.pem;
-                include /etc/letsencrypt/options-ssl-nginx.conf;
-                ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
-
-                # Storage API handles file uploads — large body sizes
-                client_max_body_size 500M;
-                client_body_timeout 600s;
-                proxy_request_buffering off;
-
-                location / {
-                    proxy_pass http://127.0.0.1:${UPSTREAM_PORT};
-                    proxy_http_version 1.1;
-                    proxy_set_header Host \$host;
-                    proxy_set_header X-Real-IP \$remote_addr;
-                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                    proxy_set_header X-Forwarded-Proto \$scheme;
-                    proxy_read_timeout 600s;
-                    proxy_buffering off;
-                }
-            }
-            NGINX
-            sudo ln -sf /etc/nginx/sites-available/${DOMAIN} /etc/nginx/sites-enabled/${DOMAIN}
-            sudo nginx -t && sudo systemctl reload nginx
-
-            # Sync STORAGE_UPLOAD_DIR from systemd unit to .env (cleanup cron needs it)
-            UPLOAD_DIR=$(sudo systemctl show ${SERVICE_NAME}.service -p Environment 2>/dev/null | grep -oP 'STORAGE_UPLOAD_DIR=\K[^ "]+' || true)
-            if [ -n "$UPLOAD_DIR" ]; then
-              grep -q "^STORAGE_UPLOAD_DIR=" "$DEPLOY_PATH/.env" 2>/dev/null \
-                || echo "STORAGE_UPLOAD_DIR=$UPLOAD_DIR" >> "$DEPLOY_PATH/.env"
-            fi
-
-            # GLB bridge → 3D-API (single instance on arkserver, reachable via public domain)
-            grep -q "^THREED_API_URL=" "$DEPLOY_PATH/.env" 2>/dev/null && sudo sed -i 's|^THREED_API_URL=.*|THREED_API_URL=https://3d-api.arkserver.arkturian.com|' "$DEPLOY_PATH/.env" \
-              || echo "THREED_API_URL=https://3d-api.arkserver.arkturian.com" | sudo tee -a "$DEPLOY_PATH/.env" > /dev/null
-
-            # Ensure TTL cleanup cron runs every 15 minutes
-            CRON_CMD="*/15 * * * * cd $DEPLOY_PATH && ./venv/bin/python scripts/cleanup_expired.py >> /var/log/storage-api-cleanup.log 2>&1"
-            EXISTING_CRON=$(crontab -l 2>/dev/null | grep -v cleanup_expired || true)
-            { [ -n "$EXISTING_CRON" ] && echo "$EXISTING_CRON"; echo "$CRON_CMD"; } | crontab -
-
-            # Restart and verify
-            sudo systemctl restart ${SERVICE_NAME}
-            sleep 5
-
-            if curl -sf http://localhost:${UPSTREAM_PORT}/health > /dev/null; then
-              echo "✅ Storage API healthy on pdrei (local)"
-              curl -s http://localhost:${UPSTREAM_PORT}/health
-              echo
-            else
-              echo "⚠️ Local health check failed"
-              sudo systemctl status ${SERVICE_NAME} --no-pager
-              sudo journalctl -u ${SERVICE_NAME} -n 50 --no-pager
-              exit 1
-            fi
-
-            # Verify HTTPS endpoint
-            if curl -sf https://${DOMAIN}/health > /dev/null; then
-              echo "✅ HTTPS endpoint reachable"
-            else
-              echo "⚠️ HTTPS endpoint check failed"
-            fi
-
-  # ============================================================================
-  # SDK Regeneration (after all deployments)
-  # ============================================================================
   trigger-sdk-regeneration:
     name: Trigger SDK Regeneration
-    needs: [deploy-arkturian, deploy-arkserver, deploy-aiserver]
-    if: |
-      always() &&
-      github.ref == 'refs/heads/main' &&
-      (needs.deploy-arkturian.result == 'success' || needs.deploy-arkserver.result == 'success')
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    needs: deploy-arkserver
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, arkserver]
+    # PAT_TOKEN is known to be broken; a failed SDK trigger must not mark the
+    # deploy red.
+    continue-on-error: true
     steps:
       - name: Trigger C# SDK regeneration
         uses: peter-evans/repository-dispatch@v2

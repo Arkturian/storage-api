@@ -20,7 +20,7 @@ env:
 jobs:
   test:
     name: Run Tests
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: [self-hosted, linux, arkserver]
 
     steps:
       - name: Checkout code
@@ -58,7 +58,7 @@ jobs:
   deploy-customer:
     name: Deploy to Customer (arkturian.com)
     needs: test
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: [self-hosted, linux, arkserver]
     environment:
       name: customer
       url: https://api-storage.arkturian.com
