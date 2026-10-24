@@ -313,3 +313,14 @@ def _hwm_next(connection, table: str) -> int:
 def _assign_never_reused_id(mapper, connection, target):
     if target.id is None:
         target.id = _hwm_next(connection, StorageObject.__tablename__)
+
+
+@_sa_event.listens_for(StorageObject, "after_delete")
+def _grants_mit_loeschen(mapper, connection, target):
+    """Bindungen gehen mit dem Objekt (ELE 24.10.2026).
+
+    media_grants hat keinen Fremdschluessel; DELETE und cleanup_expired liessen
+    die Zeilen als Waisen stehen. Hier, nicht in jedem Loeschweg: so greift es
+    auch fuer kaskadierte Kinder und kuenftige Pfade.
+    """
+    connection.execute(MediaGrant.__table__.delete().where(MediaGrant.object_id == target.id))
