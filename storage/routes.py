@@ -7481,3 +7481,68 @@ def move_media_grants(
     db.commit()
     print(f"🔗 grants move key={row.label or row.tenant_id} tenant={payload.tenant} {src} -> {dst} moved={moved} merged={merged}", flush=True)
     return {"from_scope": src, "to_scope": dst, "moved": moved, "merged": merged}
+
+
+_SHARE_MAX_TARGETS = 19  # 20 scopes per object at upload; one is the sharer's own
+
+
+class GrantShareRequest(BaseModel):
+    tenant: str
+    object_id: int
+    from_scope: str
+    to_scopes: List[str]
+
+
+def _share_grants(db: Session, obj, src: str, dsts: List[str], user_id) -> List[str]:
+    """Bind `dsts` to `obj` next to `src`; returns the scopes newly bound.
+
+    Raises 403 not_granted unless `src` is already bound: only someone who
+    may read the object can pass it on. Existing bindings stay untouched.
+    """
+    from models import MediaGrant
+
+    have = {g.scope for g in db.query(MediaGrant.scope).filter(MediaGrant.object_id == obj.id).all()}
+    if src not in have:
+        raise HTTPException(status_code=403, detail={"error": "from_scope is not bound to this object", "code": "not_granted"})
+    new = [d for d in dsts if d not in have]
+    for d in new:
+        db.add(MediaGrant(object_id=obj.id, scope=d, granted_by_user_id=user_id, granted_via="share"))
+    if new:
+        db.commit()
+    return new
+
+
+@router.post("/grants/share")
+def share_media_grants(
+    payload: GrantShareRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Let a scope that may read an object pass it on to other scopes (Post 5721).
+
+    Same gate as /grants/move: an active key whose sign_tenants lists
+    `tenant`, no X-On-Behalf-Of. The caller (cloud-api) has verified that
+    the agent behind `from_scope` asked for this and that every target is
+    an active agent of the same tenant. It only adds bindings, and only
+    when `from_scope` is already bound, so it grants less than /move can.
+    """
+    if request.headers.get("X-On-Behalf-Of"):
+        raise HTTPException(status_code=400, detail={"error": "sharing grants is the service's own act; drop X-On-Behalf-Of", "code": "on_behalf_not_allowed"})
+    row = _presented_tenant_key(request, db)
+    tenants = {t.strip() for t in ((row.sign_tenants if row else None) or "").split(",") if t.strip()}
+    if not row or payload.tenant not in tenants:
+        raise HTTPException(status_code=403, detail={"error": "this key may not manage grants for this tenant", "code": "sign_not_allowed"})
+    src = _validate_scope(payload.from_scope)
+    dsts = list(dict.fromkeys(_validate_scope(d) for d in payload.to_scopes))
+    if not (1 <= len(dsts) <= _SHARE_MAX_TARGETS):
+        raise HTTPException(status_code=422, detail={"error": f"1..{_SHARE_MAX_TARGETS} to_scopes", "code": "invalid_targets"})
+    if any(_scope_family(d) != _scope_family(src) for d in dsts):
+        raise HTTPException(status_code=422, detail={"error": "scopes must belong to the same family", "code": "cross_family"})
+    obj = db.query(StorageObject).filter(StorageObject.id == payload.object_id).first()
+    if obj is None or getattr(obj, "tombstoned_at", None) is not None or obj.tenant_id != payload.tenant:
+        raise HTTPException(status_code=404, detail={"error": "object not found", "code": "not_found"})
+    new = _share_grants(db, obj, src, [d for d in dsts if d != src], current_user.id)
+    print(f"🔗 grants share key={row.label or row.tenant_id} object={obj.id} {src} -> {','.join(new) or '-'}", flush=True)
+    return {"object_id": obj.id, "from_scope": src, "shared": new,
+            "already": [d for d in dsts if d not in new]}
