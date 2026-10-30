@@ -50,6 +50,8 @@ import asyncio
 INTERNAL_API_KEY = os.getenv("AI_INTERNAL_API_KEY", "Inetpass1")
 # Make AI API base configurable to avoid hardcoding wrong ports on prod
 API_BASE_URL = os.getenv("AI_API_BASE_URL", "http://127.0.0.1:8000")
+# api-ai logs per call who caused the load (AiApi, 30.10.2026).
+AI_AGENT_NAME = os.getenv("AI_AGENT_NAME", "Storage")
 # Public storage base used to hand image URLs to the (CLI-based) AI backends,
 # which fetch the image themselves (contract agreed with api-ai/AiApi).
 STORAGE_BASE_URL = os.getenv("STORAGE_BASE_URL", "").rstrip("/")
@@ -123,7 +125,7 @@ async def _call_claude_with_images(
         payload["effort"] = effort
 
     # Add model as query parameter
-    headers = {"X-API-KEY": INTERNAL_API_KEY, "Content-Type": "application/json"}
+    headers = {"X-API-KEY": INTERNAL_API_KEY, "X-Agent-Name": AI_AGENT_NAME, "Content-Type": "application/json"}
     url = f"{API_BASE_URL}/ai/claude?model={model}"
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -165,7 +167,7 @@ async def _call_gemini_with_images(
         "prompt": prompt,            # str — endpoint accepts either str or PromptText
         "image_paths": image_paths,  # local paths; endpoint validates existence
     }
-    headers = {"X-API-KEY": INTERNAL_API_KEY, "Content-Type": "application/json"}
+    headers = {"X-API-KEY": INTERNAL_API_KEY, "X-Agent-Name": AI_AGENT_NAME, "Content-Type": "application/json"}
     url = f"{API_BASE_URL}/ai/gemini"
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -209,7 +211,7 @@ async def _call_chatgpt_with_images(
         # uebersteuerbar (z.B. "medium", falls Qualitaet leidet).
         "effort": os.getenv("CODEX_VISION_EFFORT", "low"),
     }
-    headers = {"X-API-KEY": INTERNAL_API_KEY, "Content-Type": "application/json"}
+    headers = {"X-API-KEY": INTERNAL_API_KEY, "X-Agent-Name": AI_AGENT_NAME, "Content-Type": "application/json"}
     url = f"{API_BASE_URL}/ai/chatgpt"
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -296,7 +298,7 @@ def _demux_and_transcribe_audio(video_path: str, timeout: float = 60.0):
         with httpx.Client(timeout=timeout) as client:
             resp = client.post(
                 f"{API_BASE_URL}/ai/transcribe",
-                headers={"X-API-KEY": INTERNAL_API_KEY},
+                headers={"X-API-KEY": INTERNAL_API_KEY, "X-Agent-Name": AI_AGENT_NAME},
                 files={"file": ("audio.m4a", audio_bytes, "audio/mp4")},
             )
             resp.raise_for_status()
@@ -417,7 +419,7 @@ async def _analyze_csv_chunk(
     prompt += f"\n\n--- CSV CHUNK ---\n{chunk_text}"
 
     payload = {"prompt": {"text": prompt, "images": []}}
-    headers = {"X-API-KEY": INTERNAL_API_KEY, "Content-Type": "application/json"}
+    headers = {"X-API-KEY": INTERNAL_API_KEY, "X-Agent-Name": AI_AGENT_NAME, "Content-Type": "application/json"}
 
     async with httpx.AsyncClient() as client:
         try:
@@ -986,7 +988,7 @@ async def _analyze_unified_mode(
 
     # Call Gemini API
     payload = {"prompt": {"text": prompt_text, "images": images_list}}
-    headers = {"X-API-KEY": INTERNAL_API_KEY, "Content-Type": "application/json"}
+    headers = {"X-API-KEY": INTERNAL_API_KEY, "X-Agent-Name": AI_AGENT_NAME, "Content-Type": "application/json"}
 
     async with httpx.AsyncClient() as client:
         try:
@@ -1184,7 +1186,7 @@ async def _run_safety_check(
         prompt += f"\n\n--- CONTENT ---\n{text_content}"
 
     payload = {"prompt": {"text": prompt, "images": images_list}}
-    headers = {"X-API-KEY": INTERNAL_API_KEY, "Content-Type": "application/json"}
+    headers = {"X-API-KEY": INTERNAL_API_KEY, "X-Agent-Name": AI_AGENT_NAME, "Content-Type": "application/json"}
 
     async with httpx.AsyncClient() as client:
         try:
@@ -1403,7 +1405,7 @@ async def _run_embedding_generation(
         prompt += f"\n\n--- CONTENT ---\n{text_content}"
 
     payload = {"prompt": {"text": prompt, "images": images_list}}
-    headers = {"X-API-KEY": INTERNAL_API_KEY, "Content-Type": "application/json"}
+    headers = {"X-API-KEY": INTERNAL_API_KEY, "X-Agent-Name": AI_AGENT_NAME, "Content-Type": "application/json"}
 
     async with httpx.AsyncClient() as client:
         try:

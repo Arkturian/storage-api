@@ -1315,7 +1315,7 @@ async def _process_tts_request_from_storage(storage_obj, tts_request):
                     _prompt_resp = await _prompt_client.post(
                         f"{_ai_api_base}/ai/chatgpt",
                         json={"prompt": image_prompt_request},
-                        headers={"X-API-KEY": _ai_api_key, "Content-Type": "application/json"},
+                        headers={"X-API-KEY": _ai_api_key, "X-Agent-Name": os.getenv("AI_AGENT_NAME", "Storage"), "Content-Type": "application/json"},
                     )
                     _prompt_resp.raise_for_status()
                     _prompt_body = _prompt_resp.json()
