@@ -108,3 +108,90 @@ def test_ziele_werden_geprueft(env, dst):
     c, S, (mine, _) = env
     assert _share(c, mine, dst=dst).status_code == 422
     assert _scopes(S, mine) == [A]
+
+
+# --- Mandantenübergreifend: Absender, nur lesend, Widerruf (Post 5721) ---
+
+C = "cloud-user:7"
+D = "cloud-session:Dritter"
+
+
+def _unshare(c, oid, src=A, scopes=(B,), key=SIGN, tenant="arkturian"):
+    return c.post("/storage/grants/unshare", headers={"X-API-KEY": key},
+                  json={"tenant": tenant, "object_id": oid, "from_scope": src, "scopes": list(scopes)})
+
+
+def _lookup(c, scope, ids, key=SIGN, tenant="arkturian"):
+    return c.post("/storage/grants/lookup", headers={"X-API-KEY": key},
+                  json={"tenant": tenant, "scope": scope, "object_ids": list(ids)})
+
+
+def _via(S, oid):
+    s = S()
+    try:
+        return {g.scope: g.granted_via for g in s.query(MediaGrant).filter_by(object_id=oid)}
+    finally:
+        s.close()
+
+
+def test_share_merkt_absender(env):
+    c, S, (mine, _) = env
+    assert _share(c, mine).status_code == 200
+    assert _via(S, mine)[B] == "share:" + A
+
+
+def test_nur_lesend_darf_nicht_weitergeben(env):
+    c, S, (mine, _) = env
+    r = c.post("/storage/grants/share", headers={"X-API-KEY": SIGN},
+               json={"tenant": "arkturian", "object_id": mine, "from_scope": A, "to_scopes": [B, C], "reshare": False})
+    assert r.status_code == 200 and _via(S, mine)[C] == "share-ro:" + A
+    r = _share(c, mine, src=C, dst=(D,))
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "reshare_not_allowed"
+    assert D not in _via(S, mine)
+
+
+def test_widerruf_nur_eigene_und_kaskade(env):
+    c, S, (mine, _) = env
+    _share(c, mine, dst=(B,))
+    _share(c, mine, src=B, dst=(D,))          # B gibt weiter
+    r = _unshare(c, mine, scopes=(B, A))      # A ist Upload, nicht von A geteilt
+    assert r.status_code == 200
+    j = r.json()
+    assert j["revoked"] == [B] and j["cascade"] == [D] and j["not_shared_by_you"] == [A]
+    assert set(_via(S, mine)) == {A}
+
+
+def test_widerruf_fremder_absender_wirkt_nicht(env):
+    c, S, (mine, _) = env
+    _share(c, mine, dst=(B,))
+    r = _unshare(c, mine, src=D, scopes=(B,))
+    assert r.json()["revoked"] == [] and B in _via(S, mine)
+
+
+def test_widerruf_tor_und_mandant(env):
+    c, S, (mine, other) = env
+    assert _unshare(c, mine, key=PLAIN).status_code == 403
+    assert _unshare(c, other).status_code == 404
+
+
+def test_lookup_zeigt_absender_und_empfaenger(env):
+    c, S, (mine, other) = env
+    c.post("/storage/grants/share", headers={"X-API-KEY": SIGN},
+           json={"tenant": "arkturian", "object_id": mine, "from_scope": A, "to_scopes": [C], "reshare": False})
+    j = _lookup(c, C, [mine, other, 999]).json()
+    assert [i["object_id"] for i in j["items"]] == [mine]
+    assert j["items"][0]["shared_by"] == A and j["items"][0]["reshare"] is False
+    j = _lookup(c, A, [mine]).json()
+    assert j["items"][0]["shared_by"] is None and j["items"][0]["shared_with"] == [C]
+    assert _lookup(c, A, [mine], key=PLAIN).status_code == 403
+
+
+def test_move_nimmt_absender_mit(env):
+    c, S, (mine, _) = env
+    _share(c, mine, dst=(B,))
+    neu = "cloud-session:HermineNeu"
+    r = c.post("/storage/grants/move", headers={"X-API-KEY": SIGN},
+               json={"tenant": "arkturian", "from_scope": A, "to_scope": neu})
+    assert r.status_code == 200
+    assert _via(S, mine) == {neu: "upload", B: "share:" + neu}
+    assert _unshare(c, mine, src=neu).json()["revoked"] == [B]
