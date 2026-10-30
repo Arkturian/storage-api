@@ -7478,6 +7478,16 @@ def move_media_grants(
             db.delete(g); merged += 1
         else:
             g.scope = dst; moved += 1
+    # Shares made by `src` name it as sender; follow the rename so the
+    # sender can still see and revoke them under its new scope.
+    for g in (
+        db.query(MediaGrant)
+        .join(StorageObject, StorageObject.id == MediaGrant.object_id)
+        .filter(MediaGrant.granted_via.in_([_SHARE_VIA + src, _SHARE_RO_VIA + src]),
+                StorageObject.tenant_id == payload.tenant)
+        .all()
+    ):
+        g.granted_via = g.granted_via[: g.granted_via.index(":") + 1] + dst
     db.commit()
     print(f"🔗 grants move key={row.label or row.tenant_id} tenant={payload.tenant} {src} -> {dst} moved={moved} merged={merged}", flush=True)
     return {"from_scope": src, "to_scope": dst, "moved": moved, "merged": merged}
@@ -7486,14 +7496,28 @@ def move_media_grants(
 _SHARE_MAX_TARGETS = 19  # 20 scopes per object at upload; one is the sharer's own
 
 
+_SHARE_VIA = "share:"        # granted_via of a share; the sender's scope follows
+_SHARE_RO_VIA = "share-ro:"  # same, but the recipient may not pass it on
+
+
+def _shared_by(via: Optional[str]) -> Optional[str]:
+    for p in (_SHARE_VIA, _SHARE_RO_VIA):
+        if via and via.startswith(p):
+            return via[len(p):] or None
+    return None
+
+
 class GrantShareRequest(BaseModel):
     tenant: str
     object_id: int
     from_scope: str
     to_scopes: List[str]
+    # False: the recipients may read but not pass the object on (cloud-api
+    # sets this for recipients outside the sender's tenant, Post 5721).
+    reshare: bool = True
 
 
-def _share_grants(db: Session, obj, src: str, dsts: List[str], user_id) -> List[str]:
+def _share_grants(db: Session, obj, src: str, dsts: List[str], user_id, reshare: bool = True) -> List[str]:
     """Bind `dsts` to `obj` next to `src`; returns the scopes newly bound.
 
     Raises 403 not_granted unless `src` is already bound: only someone who
@@ -7501,12 +7525,15 @@ def _share_grants(db: Session, obj, src: str, dsts: List[str], user_id) -> List[
     """
     from models import MediaGrant
 
-    have = {g.scope for g in db.query(MediaGrant.scope).filter(MediaGrant.object_id == obj.id).all()}
+    have = {g.scope: g.granted_via for g in db.query(MediaGrant.scope, MediaGrant.granted_via).filter(MediaGrant.object_id == obj.id).all()}
     if src not in have:
         raise HTTPException(status_code=403, detail={"error": "from_scope is not bound to this object", "code": "not_granted"})
+    if (have[src] or "").startswith(_SHARE_RO_VIA):
+        raise HTTPException(status_code=403, detail={"error": "this object was shared with from_scope read-only; it may not be passed on", "code": "reshare_not_allowed"})
+    via = (_SHARE_VIA if reshare else _SHARE_RO_VIA) + src
     new = [d for d in dsts if d not in have]
     for d in new:
-        db.add(MediaGrant(object_id=obj.id, scope=d, granted_by_user_id=user_id, granted_via="share"))
+        db.add(MediaGrant(object_id=obj.id, scope=d, granted_by_user_id=user_id, granted_via=via))
     if new:
         db.commit()
     return new
@@ -7542,7 +7569,120 @@ def share_media_grants(
     obj = db.query(StorageObject).filter(StorageObject.id == payload.object_id).first()
     if obj is None or getattr(obj, "tombstoned_at", None) is not None or obj.tenant_id != payload.tenant:
         raise HTTPException(status_code=404, detail={"error": "object not found", "code": "not_found"})
-    new = _share_grants(db, obj, src, [d for d in dsts if d != src], current_user.id)
-    print(f"🔗 grants share key={row.label or row.tenant_id} object={obj.id} {src} -> {','.join(new) or '-'}", flush=True)
+    new = _share_grants(db, obj, src, [d for d in dsts if d != src], current_user.id, payload.reshare)
+    print(f"🔗 grants share key={row.label or row.tenant_id} object={obj.id} {src} -> {','.join(new) or '-'} reshare={payload.reshare}", flush=True)
     return {"object_id": obj.id, "from_scope": src, "shared": new,
             "already": [d for d in dsts if d not in new]}
+
+
+def _grant_gate(request: Request, db: Session, tenant: str):
+    """Gate of /grants/move and /grants/share: key with `tenant` in sign_tenants, no X-On-Behalf-Of."""
+    if request.headers.get("X-On-Behalf-Of"):
+        raise HTTPException(status_code=400, detail={"error": "managing grants is the service's own act; drop X-On-Behalf-Of", "code": "on_behalf_not_allowed"})
+    row = _presented_tenant_key(request, db)
+    tenants = {t.strip() for t in ((row.sign_tenants if row else None) or "").split(",") if t.strip()}
+    if not row or tenant not in tenants:
+        raise HTTPException(status_code=403, detail={"error": "this key may not manage grants for this tenant", "code": "sign_not_allowed"})
+    return row
+
+
+class GrantUnshareRequest(BaseModel):
+    tenant: str
+    object_id: int
+    from_scope: str
+    scopes: List[str]
+
+
+@router.post("/grants/unshare")
+def unshare_media_grants(
+    payload: GrantUnshareRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Revoke shares that `from_scope` made (Post 5721).
+
+    Only bindings whose sender is `from_scope` are removed; a binding from
+    an upload or from another sender stays. What a revoked recipient passed
+    on is revoked with it, so a revoke reaches every copy of the share.
+    """
+    from models import MediaGrant
+
+    row = _grant_gate(request, db, payload.tenant)
+    src = _validate_scope(payload.from_scope)
+    targets = list(dict.fromkeys(_validate_scope(d) for d in payload.scopes))
+    if not (1 <= len(targets) <= _SHARE_MAX_TARGETS):
+        raise HTTPException(status_code=422, detail={"error": f"1..{_SHARE_MAX_TARGETS} scopes", "code": "invalid_targets"})
+    obj = db.query(StorageObject).filter(StorageObject.id == payload.object_id).first()
+    if obj is None or getattr(obj, "tombstoned_at", None) is not None or obj.tenant_id != payload.tenant:
+        raise HTTPException(status_code=404, detail={"error": "object not found", "code": "not_found"})
+
+    grants = db.query(MediaGrant).filter(MediaGrant.object_id == obj.id).all()
+    mine = [g for g in grants if g.scope in targets and _shared_by(g.granted_via) == src]
+    revoked = [g.scope for g in mine]
+    gone = set(revoked)
+    cascade: List[str] = []
+    todo = list(revoked)
+    while todo:
+        s = todo.pop()
+        for g in grants:
+            if g.scope not in gone and _shared_by(g.granted_via) == s:
+                gone.add(g.scope); cascade.append(g.scope); todo.append(g.scope)
+    for g in grants:
+        if g.scope in gone:
+            db.delete(g)
+    if gone:
+        db.commit()
+    print(f"🔗 grants unshare key={row.label or row.tenant_id} object={obj.id} {src} -x {','.join(revoked) or '-'} cascade={','.join(cascade) or '-'}", flush=True)
+    return {"object_id": obj.id, "from_scope": src, "revoked": revoked, "cascade": cascade,
+            "not_shared_by_you": [t for t in targets if t not in revoked]}
+
+
+class GrantLookupRequest(BaseModel):
+    tenant: str
+    scope: str
+    object_ids: List[int]
+
+
+@router.post("/grants/lookup")
+def lookup_media_grants(
+    payload: GrantLookupRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """How `scope` came to each object: who shared it and whether it may be passed on.
+
+    Same gate as /grants/share. Lists only objects of `tenant` that carry
+    `scope`; for others nothing comes back (no existence oracle beyond what
+    the key may already sign). Also lists who `scope` shared each object
+    with, so a sender sees what it can revoke.
+    """
+    from models import MediaGrant
+
+    _grant_gate(request, db, payload.tenant)
+    scope = _validate_scope(payload.scope)
+    ids = list(dict.fromkeys(int(i) for i in payload.object_ids))
+    if not (1 <= len(ids) <= 200):
+        raise HTTPException(status_code=422, detail={"error": "1..200 object_ids", "code": "invalid_ids"})
+    rows = (
+        db.query(MediaGrant)
+        .join(StorageObject, StorageObject.id == MediaGrant.object_id)
+        .filter(MediaGrant.object_id.in_(ids), StorageObject.tenant_id == payload.tenant,
+                StorageObject.tombstoned_at.is_(None))
+        .all()
+    )
+    own = {g.object_id: g for g in rows if g.scope == scope}
+    items = []
+    for oid in ids:
+        g = own.get(oid)
+        if g is None:
+            continue
+        items.append({
+            "object_id": oid,
+            "shared_by": _shared_by(g.granted_via),
+            "reshare": not (g.granted_via or "").startswith(_SHARE_RO_VIA),
+            "bound_at": g.created_at.isoformat() if g.created_at else None,
+            "shared_with": sorted(x.scope for x in rows if x.object_id == oid and _shared_by(x.granted_via) == scope),
+        })
+    return {"scope": scope, "items": items}
