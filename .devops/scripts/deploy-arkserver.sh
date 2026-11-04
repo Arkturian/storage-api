@@ -79,16 +79,24 @@ rollback() {
   # Runs with errexit off: every step is attempted, every failure counted.
   local bad=0 f
   echo "↩️  rolling back from $B" >&2
+  # The backup is private (700/600, not readable by the invoking user), so
+  # every look into it is privileged — an unprivileged test would read
+  # "absent" and delete a live file that is in fact backed up.
+  if ! sudo test -d "$B/live"; then
+    echo "   backup $B/live not found — nothing restored" >&2
+    return 1
+  fi
   for f in "${files[@]}"; do
-    if [[ -e "$B/live/$f" ]]; then
+    if sudo test -e "$B/live/$f"; then
       sudo cp -p "$B/live/$f" "$LIVE/$f" || bad=1
-      cmp -s "$B/live/$f" "$LIVE/$f" || { echo "   not restored: $f" >&2; bad=1; }
+      sudo cmp -s "$B/live/$f" "$LIVE/$f" || { echo "   not restored: $f" >&2; bad=1; }
     else
       sudo rm -f "$LIVE/$f" || bad=1
     fi
   done
   sudo cp -p "$B/markers/DEPLOYED_REVISION.txt" "$LIVE/DEPLOYED_REVISION.txt" || bad=1
-  if [[ -e "$B/markers/.deployed-rev" ]]; then
+  sudo cmp -s "$B/markers/DEPLOYED_REVISION.txt" "$LIVE/DEPLOYED_REVISION.txt" || bad=1
+  if sudo test -e "$B/markers/.deployed-rev"; then
     sudo cp -p "$B/markers/.deployed-rev" "$LIVE/.deployed-rev" || bad=1
   else
     sudo rm -f "$LIVE/.deployed-rev" || bad=1
