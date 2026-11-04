@@ -97,6 +97,10 @@ async def startup():
                 _conn.execute(_sql_text("ALTER TABLE tenant_api_keys ADD COLUMN sign_tenants VARCHAR(500)"))
                 _conn.commit()
                 print("✅ migration: added tenant_api_keys.sign_tenants")
+            if _tk_cols and "sign_scopes" not in _tk_cols:
+                _conn.execute(_sql_text("ALTER TABLE tenant_api_keys ADD COLUMN sign_scopes VARCHAR(1000)"))
+                _conn.commit()
+                print("✅ migration: added tenant_api_keys.sign_scopes")
             if "tombstoned_at" not in _cols:
                 _conn.execute(_sql_text("ALTER TABLE storage_objects ADD COLUMN tombstoned_at DATETIME"))
                 _conn.commit()

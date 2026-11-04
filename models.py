@@ -37,6 +37,11 @@ class TenantAPIKey(Base):
     # Comma-separated tenants this (service) key may mint signed read links
     # for via POST /storage/sign (Post 5235). NULL = no signing right.
     sign_tenants = Column(String(500), nullable=True)
+    # Optional narrowing of sign_tenants: comma-separated EXACT scopes this
+    # key may sign (no wildcards). NULL = every scope of its sign_tenants.
+    # A key with sign_scopes may only sign: it cannot move, share, unshare or
+    # look up grants, since those act on arbitrary scopes (Post 5764).
+    sign_scopes = Column(String(1000), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
 
