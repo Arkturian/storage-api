@@ -89,7 +89,9 @@ printf '\n✅ Release pushed to %s. Nothing is deployed by the push itself.\n' "
 
 if [[ "$deploy_target" == "arkserver" ]]; then
   printf '\n==> Deploying %s to arkserver\n' "$MAIN_BRANCH"
-  "$SCRIPT_DIR/deploy-arkserver.sh" ${from_rev:+--from "$from_rev"}
+  # Deploy exactly the commit pushed above, never a newer origin/main.
+  released_sha="$(git rev-parse HEAD)"
+  "$SCRIPT_DIR/deploy-arkserver.sh" --expect "$released_sha" ${from_rev:+--from "$from_rev"}
 fi
 
 printf '\n==> Switching back to %s\n' "$DEV_BRANCH"
