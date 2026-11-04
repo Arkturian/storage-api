@@ -175,6 +175,44 @@ def _apply_cors_for_head(headers: dict, request: Request) -> dict:
     return headers
 
 
+# A key narrowed by sign_scopes is a signing key and nothing else (Post 5764).
+# Without this gate it would still authenticate as its tenant user
+# ({tenant}@api) on every other route — upload, list, replace, delete — so
+# "may sign one scope" would quietly mean much more. One choke point for all
+# routes, because every route reads the key from the X-API-KEY header.
+_SIGN_ONLY_PATHS = frozenset({"/storage/sign"})
+
+
+def _is_sign_only_key(api_key: str) -> bool:
+    from database import get_db
+    from models import TenantAPIKey
+    # Same session source as the routes (honours dependency overrides), and
+    # closed before call_next: never hold a pool connection across it (#2315).
+    gen = app.dependency_overrides.get(get_db, get_db)()
+    db = next(gen)
+    try:
+        row = (
+            db.query(TenantAPIKey.sign_scopes)
+            .filter(TenantAPIKey.api_key == api_key, TenantAPIKey.is_active.is_(True))
+            .first()
+        )
+    finally:
+        gen.close()
+    return row is not None and row[0] is not None
+
+
+@app.middleware("http")
+async def sign_only_keys(request: Request, call_next):
+    key = (request.headers.get("x-api-key") or "").strip()
+    if key and request.url.path not in _SIGN_ONLY_PATHS and _is_sign_only_key(key):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=403,
+            content={"detail": {"error": "this key may only call POST /storage/sign", "code": "sign_only_key"}},
+        )
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def storage_media_head_headers(request: Request, call_next):
     """

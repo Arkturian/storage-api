@@ -105,7 +105,17 @@ def test_narrow_key_cannot_manage_grants(env, path, body):
     c, _ = env
     r = c.post(path, headers={"X-API-KEY": NARROW}, json={"tenant": "arkturian", **body})
     assert r.status_code == 403
-    assert r.json()["detail"]["code"] == "grant_management_not_allowed"
+    # Die Middleware greift zuerst; die Prüfung in der Route bleibt als zweite Linie.
+    assert r.json()["detail"]["code"] == "sign_only_key"
+
+
+def test_route_sperrt_grant_verwaltung_auch_ohne_middleware():
+    from fastapi import HTTPException
+    narrow = SimpleNamespace(sign_scopes=DAILY)
+    with pytest.raises(HTTPException) as e:
+        storage_routes._refuse_scoped_key_for_grant_management(narrow)
+    assert e.value.detail["code"] == "grant_management_not_allowed"
+    storage_routes._refuse_scoped_key_for_grant_management(SimpleNamespace(sign_scopes=None))
 
 
 def test_wide_key_unchanged(env):
@@ -130,3 +140,49 @@ def test_blank_restriction_fails_closed(env, blank):
     r = c.post("/storage/grants/lookup", headers={"X-API-KEY": NARROW},
                json={"tenant": "arkturian", "scope": FREMD, "object_ids": [fremd]})
     assert r.status_code == 403
+
+
+# --- Schlüssel mit sign_scopes ist reiner Signierschlüssel (Middleware) ---
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/storage/list"),
+    ("GET", "/storage/media/1"),
+    ("GET", "/storage/objects/1"),
+    ("POST", "/storage/upload"),
+    ("DELETE", "/storage/1"),
+    ("GET", "/storage/objects/1/grants"),
+    ("GET", "/tenants"),
+    ("GET", "/admin/stats"),
+    ("POST", "/storage/sign/"),
+])
+def test_eingegrenzter_schluessel_nur_sign(env, method, path):
+    c, _ = env
+    r = c.request(method, path, headers={"X-API-KEY": NARROW})
+    assert r.status_code == 403
+    if method != "HEAD":
+        assert r.json()["detail"]["code"] == "sign_only_key"
+
+
+def test_eingegrenzter_schluessel_sign_geht_weiter(env):
+    c, (ref, _) = env
+    r = c.post("/storage/sign", headers={"X-API-KEY": NARROW},
+               json={"tenant": "arkturian", "scope": DAILY, "ids": [ref], "ttl": 60})
+    assert r.status_code == 200
+
+
+def test_breiter_und_fremder_schluessel_nicht_betroffen(env):
+    c, _ = env
+    c_, (ref, _) = env
+    r = c.post("/storage/grants/lookup", headers={"X-API-KEY": WIDE},
+               json={"tenant": "arkturian", "scope": DAILY, "object_ids": [ref]})
+    assert r.status_code == 200
+    r = c.post("/storage/sign", headers={"X-API-KEY": "unbekannt"},
+               json={"tenant": "arkturian", "scope": DAILY, "ids": [1], "ttl": 60})
+    assert r.json()["detail"]["code"] == "sign_not_allowed"
+
+
+def test_inaktiver_eingegrenzter_schluessel_faellt_auf_normale_pruefung(env):
+    c, _ = env
+    assert main._is_sign_only_key(NARROW) is True
+    assert main._is_sign_only_key(WIDE) is False
+    assert main._is_sign_only_key("unbekannt") is False
