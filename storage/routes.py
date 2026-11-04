@@ -7187,11 +7187,15 @@ class GrantRequest(BaseModel):
 
 
 def _key_sign_scopes(row) -> Optional[set]:
-    """Exact scopes a signing key is narrowed to, or None when it is not narrowed."""
-    raw = (getattr(row, "sign_scopes", None) or "").strip() if row is not None else ""
-    if not raw:
+    """Exact scopes a signing key is narrowed to, or None when it is not narrowed.
+
+    Only NULL means "not narrowed". Any set value narrows, and a blank or
+    comma-only value narrows to nothing: a mistyped restriction fails closed
+    instead of silently becoming tenant-wide (review Post 5764)."""
+    raw = getattr(row, "sign_scopes", None) if row is not None else None
+    if raw is None:
         return None
-    return {s.strip() for s in raw.split(",") if s.strip()}
+    return {s.strip() for s in str(raw).split(",") if s.strip()}
 
 
 def _refuse_scoped_key_for_grant_management(row) -> None:

@@ -113,3 +113,20 @@ def test_wide_key_unchanged(env):
     assert _sign(c, WIDE, DAILY, [ref]).json()["items"][0]["signed"] is True
     assert c.post("/storage/grants/lookup", headers={"X-API-KEY": WIDE},
                   json={"tenant": "arkturian", "scope": FREMD, "object_ids": [fremd]}).status_code == 200
+
+
+@pytest.mark.parametrize("blank", ["", "   ", " , ,"])
+def test_blank_restriction_fails_closed(env, blank):
+    """Nur NULL heißt unbeschränkt. Eine leere Einschränkung signiert gar nichts, auch keinen gültigen fremden Scope."""
+    c, (ref, fremd) = env
+    from sqlalchemy import update
+    db = next(main.app.dependency_overrides[get_db]())
+    db.execute(update(TenantAPIKey).where(TenantAPIKey.api_key == NARROW).values(sign_scopes=blank))
+    db.commit(); db.close()
+    for scope, oid in ((FREMD, fremd), (DAILY, ref)):
+        r = _sign(c, NARROW, scope, [oid])
+        assert r.status_code == 403
+        assert r.json()["detail"]["code"] == "scope_not_allowed"
+    r = c.post("/storage/grants/lookup", headers={"X-API-KEY": NARROW},
+               json={"tenant": "arkturian", "scope": FREMD, "object_ids": [fremd]})
+    assert r.status_code == 403
