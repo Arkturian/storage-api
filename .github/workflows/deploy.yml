@@ -1,23 +1,27 @@
 name: Deploy Storage API
 
+# No push trigger: a push to main deploys nothing (Post 5764). arkserver is
+# deployed by ./devops release --deploy arkserver; every other host only on an
+# explicit dispatch with its own box ticked (customer hosts need their human's Go).
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       deploy_arkturian:
         description: 'Deploy to arkturian.com'
         type: boolean
-        default: true
+        default: false
       deploy_arkserver:
         description: 'Deploy to arkserver.arkturian.com'
         type: boolean
-        default: true
+        default: false
       deploy_aiserver:
         description: 'Deploy to aiserver.oneal.eu'
         type: boolean
-        default: true
+        default: false
+      deploy_pdrei:
+        description: 'Deploy to pdrei.arkturian.com (needs Jascha''s Go)'
+        type: boolean
+        default: false
 
 env:
   PYTHON_VERSION: "3.11"
@@ -25,7 +29,7 @@ env:
 jobs:
   test:
     name: Run Tests
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'arkserver' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -72,7 +76,7 @@ jobs:
     # if the VPS ever becomes a storage host again.
     if: ${{ false }}
     needs: test
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'arkserver' }}
     environment:
       name: production
       url: https://api-storage.arkturian.com
@@ -189,7 +193,7 @@ jobs:
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       (github.event_name != 'workflow_dispatch' || inputs.deploy_arkserver)
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'arkserver' }}
     environment:
       name: staging
       url: https://api-storage.arkserver.arkturian.com
@@ -318,7 +322,7 @@ jobs:
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       (github.event_name != 'workflow_dispatch' || inputs.deploy_aiserver)
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'arkserver' }}
     environment:
       name: oneal
       url: https://gsgbot.arkturian.com
@@ -414,8 +418,8 @@ jobs:
     needs: test
     if: |
       github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+      github.event_name == 'workflow_dispatch' && inputs.deploy_pdrei
+    runs-on: ${{ vars.RUNNER_LABEL || 'arkserver' }}
     environment:
       name: pdrei
       url: https://storage-api.pdrei.arkturian.com
@@ -583,7 +587,7 @@ jobs:
       always() &&
       github.ref == 'refs/heads/main' &&
       (needs.deploy-arkturian.result == 'success' || needs.deploy-arkserver.result == 'success')
-    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'arkserver' }}
     steps:
       - name: Trigger C# SDK regeneration
         uses: peter-evans/repository-dispatch@v2
