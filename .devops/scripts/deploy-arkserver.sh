@@ -170,6 +170,6 @@ for f in "${files[@]}"; do
 done
 sudo journalctl -u "$SERVICE" --since "$since" --no-pager | grep -i "migration" || true
 echo "$target" | sudo tee "$LIVE/.deployed-rev" > /dev/null
-note="origin/main @ $short ($(date +%F), deploy-arkserver.sh, backup $B; before: "
+note="origin/main @ $short ($(date +%F), deploy-arkserver.sh, backup $B); before: origin/main @ "
 sudo sed -i "0,/origin\/main @ /s|origin/main @ |$note|" "$LIVE/DEPLOYED_REVISION.txt"
 echo; echo "✅ $short live on arkserver ($SERVICE). Backup: $B"
