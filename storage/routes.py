@@ -7186,6 +7186,21 @@ class GrantRequest(BaseModel):
     scope: str
 
 
+def _key_sign_scopes(row) -> Optional[set]:
+    """Exact scopes a signing key is narrowed to, or None when it is not narrowed."""
+    raw = (getattr(row, "sign_scopes", None) or "").strip() if row is not None else ""
+    if not raw:
+        return None
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def _refuse_scoped_key_for_grant_management(row) -> None:
+    """A key narrowed by sign_scopes may sign, nothing else: move/share/unshare/
+    lookup name arbitrary scopes and would widen what it can reach (Post 5764)."""
+    if _key_sign_scopes(row) is not None:
+        raise HTTPException(status_code=403, detail={"error": "this key is limited to signing its own scopes", "code": "grant_management_not_allowed"})
+
+
 def _presented_tenant_key(request: Request, db: Session):
     from models import TenantAPIKey
     key = (request.headers.get("X-API-KEY") or "").strip()
@@ -7319,6 +7334,9 @@ def sign_media_links(
     if not row or payload.tenant not in tenants:
         raise HTTPException(status_code=403, detail={"error": "this key may not sign for this tenant", "code": "sign_not_allowed"})
     scope = _validate_scope(payload.scope)
+    allowed = _key_sign_scopes(row)
+    if allowed is not None and scope not in allowed:
+        raise HTTPException(status_code=403, detail={"error": "this key may not sign this scope", "code": "scope_not_allowed"})
     if not (1 <= payload.ttl <= _signing.MAX_TTL_SECONDS):
         raise HTTPException(status_code=422, detail={"error": f"ttl must be 1..{_signing.MAX_TTL_SECONDS}", "code": "invalid_ttl"})
     if not (1 <= len(payload.ids) <= _signing.MAX_IDS_PER_REQUEST):
@@ -7457,6 +7475,7 @@ def move_media_grants(
     # on behalf of arbitrary people via X-On-Behalf-Of.
     if not row or payload.tenant not in tenants:
         raise HTTPException(status_code=403, detail={"error": "this key may not manage grants for this tenant", "code": "sign_not_allowed"})
+    _refuse_scoped_key_for_grant_management(row)
     src = _validate_scope(payload.from_scope)
     dst = _validate_scope(payload.to_scope)
     if src == dst:
@@ -7560,6 +7579,7 @@ def share_media_grants(
     tenants = {t.strip() for t in ((row.sign_tenants if row else None) or "").split(",") if t.strip()}
     if not row or payload.tenant not in tenants:
         raise HTTPException(status_code=403, detail={"error": "this key may not manage grants for this tenant", "code": "sign_not_allowed"})
+    _refuse_scoped_key_for_grant_management(row)
     src = _validate_scope(payload.from_scope)
     dsts = list(dict.fromkeys(_validate_scope(d) for d in payload.to_scopes))
     if not (1 <= len(dsts) <= _SHARE_MAX_TARGETS):
@@ -7583,6 +7603,7 @@ def _grant_gate(request: Request, db: Session, tenant: str):
     tenants = {t.strip() for t in ((row.sign_tenants if row else None) or "").split(",") if t.strip()}
     if not row or tenant not in tenants:
         raise HTTPException(status_code=403, detail={"error": "this key may not manage grants for this tenant", "code": "sign_not_allowed"})
+    _refuse_scoped_key_for_grant_management(row)
     return row
 
 
