@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-REPO_ROOT="{{REPO_ROOT}}"
+# Resolved from this file, so the entrypoint works from any checkout.
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SCRIPTS_DIR="$REPO_ROOT/.devops/scripts"
 
 usage() {

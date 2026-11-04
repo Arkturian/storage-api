@@ -12,31 +12,45 @@ BUILD_SCRIPT="$SCRIPT_DIR/build-local.sh"
 
 usage() {
   cat <<'USAGE'
-Usage: release.sh [--no-build]
+Usage: release.sh [--no-build] [--deploy arkserver] [--from <deployed-sha>]
 
-Fast-forwards main from dev, pushes to origin, and
-triggers the GitHub Actions deployment workflow. By default the local build
-script runs beforehand.
+Fast-forwards main from dev and pushes it. A push to main deploys nothing by
+itself (deploy.yml runs only on explicit workflow_dispatch). By default the
+local build script runs beforehand.
 
 Options:
-  --no-build   Skip running the local build before pushing
+  --no-build           Skip running the local build before pushing
+  --deploy arkserver   After the push, deploy main to the arkserver instance
+                       via deploy-arkserver.sh (tests, backup, copy, health)
+  --from <sha>         Passed to deploy-arkserver.sh (deployed revision, once)
 USAGE
 }
 
 run_build=true
+deploy_target=""
+from_rev=""
 
-for arg in "$@"; do
-  case "$arg" in
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --no-build)
       run_build=false
       shift
+      ;;
+    --deploy)
+      deploy_target="${2:-}"
+      [[ "$deploy_target" == "arkserver" ]] || { echo "Error: --deploy supports only 'arkserver'." >&2; exit 1; }
+      shift 2
+      ;;
+    --from)
+      from_rev="${2:?--from needs a revision}"
+      shift 2
       ;;
     -h|--help)
       usage
       exit 0
       ;;
     *)
-      echo "Unknown argument: $arg" >&2
+      echo "Unknown argument: $1" >&2
       usage
       exit 1
       ;;
@@ -71,7 +85,12 @@ fi
 
 git push origin "$MAIN_BRANCH"
 
-printf '\n✅ Release pushed. GitHub Actions will build & deploy from %s.\n' "$MAIN_BRANCH"
+printf '\n✅ Release pushed to %s. Nothing is deployed by the push itself.\n' "$MAIN_BRANCH"
+
+if [[ "$deploy_target" == "arkserver" ]]; then
+  printf '\n==> Deploying %s to arkserver\n' "$MAIN_BRANCH"
+  "$SCRIPT_DIR/deploy-arkserver.sh" ${from_rev:+--from "$from_rev"}
+fi
 
 printf '\n==> Switching back to %s\n' "$DEV_BRANCH"
 "$CHECKOUT_SCRIPT" "$DEV_BRANCH"
