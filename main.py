@@ -24,6 +24,9 @@ logging.basicConfig(
 logging.getLogger("uvicorn.error").setLevel(logging.DEBUG)
 logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 
+from storage.log_redaction import install_access_log_redaction
+install_access_log_redaction()
+
 import os
 import re
 from fastapi import FastAPI, Request, Response
