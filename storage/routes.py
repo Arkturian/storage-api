@@ -2558,6 +2558,77 @@ async def upload_chunk(
     return _resp
 
 
+# Reference mode registers a file that already sits on THIS server's disk and
+# then serves it to the object's owner. Without a fence any authenticated key,
+# including tenant keys that ship in public browser bundles, could register
+# /var/lib/storage-api/storage.db (all API keys) or a secret readable by
+# www-data and download it as its own object. A real admin may use the roots
+# in STORAGE_REFERENCE_ROOTS (colon-separated); a tenant key only the roots of
+# its own tenant in STORAGE_REFERENCE_TENANT_ROOTS ("tenant=/path;tenant=/p2").
+# The path is resolved first, so ".." or a symlink cannot escape a root.
+_DEFAULT_REFERENCE_ROOTS = (
+    "/mnt/mac-Daten2TB:/mnt/mac-daten2tb:/srv/cloudsync/data:"
+    "/mnt/backup-disk/drive:/var/code/comfyui/output"
+)
+# annasacher syncs her own cloudsync folder with her tenant key (334 objects).
+_DEFAULT_REFERENCE_TENANT_ROOTS = "annasacher=/srv/cloudsync/data/anna.sachersantana_at_gmail.com"
+
+
+def _resolve_roots(parts) -> list:
+    roots = []
+    for part in parts:
+        part = part.strip()
+        if part:
+            try:
+                roots.append(Path(part).resolve())
+            except (OSError, RuntimeError):
+                continue
+    return roots
+
+
+def _reference_roots(tenant: Optional[str] = None) -> list:
+    """Admin roots (tenant=None) or the roots one tenant key may use."""
+    if tenant is None:
+        return _resolve_roots(os.getenv("STORAGE_REFERENCE_ROOTS", _DEFAULT_REFERENCE_ROOTS).split(":"))
+    raw = os.getenv("STORAGE_REFERENCE_TENANT_ROOTS", _DEFAULT_REFERENCE_TENANT_ROOTS)
+    mine = []
+    for entry in raw.split(";"):
+        name, sep, path = entry.partition("=")
+        if sep and name.strip() == tenant:
+            mine.append(path)
+    return _resolve_roots(mine)
+
+
+def _check_reference_upload(storage_mode: Optional[str], reference_path: Optional[str],
+                            current_user, db) -> None:
+    """403 unless the path lies under a root this identity may use."""
+    if storage_mode != "reference" and not reference_path:
+        return
+    if _is_privileged_admin(current_user, db):
+        roots = _reference_roots()
+    else:
+        tenant = None
+        key = getattr(current_user, "api_key", None)
+        if key and db is not None and not getattr(current_user, "_storage_on_behalf_of", False):
+            try:
+                tenant = tenant_id_for_api_key(key, db)
+            except Exception:
+                tenant = None
+        roots = _reference_roots(tenant) if tenant else []
+    if not roots:
+        raise HTTPException(status_code=403, detail={
+            "error": "reference mode is not allowed for this key", "code": "reference_forbidden"})
+    if not reference_path:
+        return
+    try:
+        resolved = Path(reference_path).resolve(strict=False)
+    except (OSError, RuntimeError):
+        resolved = None
+    if resolved is None or not any(resolved == r or r in resolved.parents for r in roots):
+        raise HTTPException(status_code=403, detail={
+            "error": "reference_path is outside the allowed roots", "code": "reference_path_forbidden"})
+
+
 @router.post("/upload", response_model=StorageObjectResponse)
 async def upload_file(
     request: Request,
@@ -2593,6 +2664,7 @@ async def upload_file(
     api_key_header: Optional[str] = Security(_APIKeyHeader(name="X-API-KEY", auto_error=False)),
     tenant_id: Optional[str] = Depends(get_tenant_id),
 ):
+    _check_reference_upload(storage_mode, reference_path, current_user, db)
     grant_scope = _check_upload_scope(grant_scope)
     if not (reference_id and hls_result):
         _reject_scope_for_foreign_owner(grant_scope, owner_email, current_user)
