@@ -7669,6 +7669,78 @@ class GrantLookupRequest(BaseModel):
     object_ids: List[int]
 
 
+class GrantListRequest(BaseModel):
+    tenant: str
+    scope: str
+    collection_id: Optional[str] = None
+    limit: int = 100
+    offset: int = 0
+    sort: str = "-created_at"
+
+
+_GRANT_LIST_MAX = 500
+_GRANT_LIST_SORTS = {"created_at": StorageObject.created_at, "id": StorageObject.id}
+
+
+@router.post("/grants/list")
+def list_media_grants(
+    payload: GrantListRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Objects of `tenant` bound to exactly `scope`, page by page (portal gallery).
+
+    Same gate as /grants/lookup: a key with `tenant` in sign_tenants, no
+    X-On-Behalf-Of, not narrowed by sign_scopes. The caller derives `scope`
+    from a verified identity (cloud-api: the bearer's cloud-user:<id>); this
+    route only ever answers for that one scope. No URLs in the answer: bytes
+    go through the caller's own signed read path.
+    """
+    from models import MediaGrant
+
+    _grant_gate(request, db, payload.tenant)
+    scope = _validate_scope(payload.scope)
+    if not (1 <= payload.limit <= _GRANT_LIST_MAX):
+        raise HTTPException(status_code=422, detail={"error": f"limit must be 1..{_GRANT_LIST_MAX}", "code": "invalid_limit"})
+    if payload.offset < 0:
+        raise HTTPException(status_code=422, detail={"error": "offset must be >= 0", "code": "invalid_offset"})
+    field = payload.sort.lstrip("-")
+    if field not in _GRANT_LIST_SORTS:
+        raise HTTPException(status_code=422, detail={"error": "sort: created_at, -created_at, id, -id", "code": "invalid_sort"})
+    col = _GRANT_LIST_SORTS[field]
+    order = col.desc() if payload.sort.startswith("-") else col.asc()
+
+    q = (
+        db.query(StorageObject)
+        .join(MediaGrant, MediaGrant.object_id == StorageObject.id)
+        .filter(MediaGrant.scope == scope, StorageObject.tenant_id == payload.tenant,
+                StorageObject.tombstoned_at.is_(None))
+        .filter((StorageObject.expires_at.is_(None)) | (StorageObject.expires_at > datetime.utcnow()))
+    )
+    if payload.collection_id:
+        q = q.filter(StorageObject.collection_id == payload.collection_id)
+    total = q.count()
+    rows = q.order_by(order, StorageObject.id.desc()).offset(payload.offset).limit(payload.limit).all()
+    return {
+        "scope": scope,
+        "total": total,
+        "limit": payload.limit,
+        "offset": payload.offset,
+        "items": [{
+            "id": o.id,
+            "mime_type": o.mime_type,
+            "created_at": o.created_at.isoformat() if o.created_at else None,
+            "width": o.width,
+            "height": o.height,
+            "file_size_bytes": o.file_size_bytes,
+            "original_filename": o.original_filename,
+            "context": o.context,
+            "collection_id": o.collection_id,
+        } for o in rows],
+    }
+
+
 @router.post("/grants/lookup")
 def lookup_media_grants(
     payload: GrantLookupRequest,
