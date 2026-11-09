@@ -16,6 +16,9 @@ aiofiles>=24.1.0
 Pillow>=11.0.0
 piexif>=1.1.3
 pillow-heif>=0.21.0
+# PDF-Vorschau in /storage/media (erste Seite als PNG). Ohne das Paket
+# liefert die Route still die Roh-PDF aus (PDF_RENDER_AVAILABLE=False).
+pymupdf>=1.24.0,<3
 cairosvg>=2.7.1
 
 # Video/Image Processing
