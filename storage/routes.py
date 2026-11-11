@@ -577,6 +577,21 @@ def _render_pdf_page_to_image(pdf_path: Path, output_path: Path, width: Optional
         pix.save(str(output_path))
 
 
+_PDF_PREVIEW_VARIANTS = {"thumbnail", "medium"}
+_PDF_PREVIEW_FORMATS = {"jpg", "jpeg", "png", "webp"}
+
+
+def _pdf_preview_requested(*, variant, format, width, height, aspect_ratio, trim, download) -> bool:
+    """True when a PDF request asks for an image (page-1 preview), not the file."""
+    if download:
+        return False
+    if (variant or "").strip().lower() in _PDF_PREVIEW_VARIANTS:
+        return True
+    if (format or "").strip().lower() in _PDF_PREVIEW_FORMATS:
+        return True
+    return any(x not in (None, "", False) for x in (width, height, aspect_ratio, trim))
+
+
 def _ensure_pdf_preview(
     obj: "StorageObject",
     pdf_path: Path,
@@ -4327,6 +4342,18 @@ def get_media_variant(
 
     # Resolve file path (handles both local and external URIs)
     src_path = _resolve_storage_object_path(obj, refresh=refresh)
+
+    # PDFs: the PNG preview of page 1 only when an image representation is
+    # actually asked for (thumbnail/medium, an image format, a size). A bare
+    # link, ?variant=full, ?format=original or ?download=1 serves the original
+    # PDF. Until 2026-11-11 every request got the PNG, so file_url, share_url
+    # and signed links handed out an image with a .pdf name, and the sha256
+    # from assets_download never matched (issue #2724).
+    if mime == "application/pdf" and not _pdf_preview_requested(
+        variant=variant, format=format, width=width, height=height,
+        aspect_ratio=aspect_ratio, trim=trim, download=download,
+    ):
+        return FileResponse(src_path, media_type="application/pdf", headers=_media_extra_headers)
 
     if mime == "application/pdf":
         if not PDF_RENDER_AVAILABLE:
