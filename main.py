@@ -88,19 +88,8 @@ async def startup():
         from sqlalchemy import text as _sql_text
         with engine.connect() as _conn:
             _cols = [row[1] for row in _conn.execute(_sql_text("PRAGMA table_info(storage_objects)")).fetchall()]
-            _tk_cols = [r[1] for r in _conn.execute(_sql_text("PRAGMA table_info(tenant_api_keys)")).fetchall()]
-            if _tk_cols and "is_service" not in _tk_cols:
-                _conn.execute(_sql_text("ALTER TABLE tenant_api_keys ADD COLUMN is_service BOOLEAN DEFAULT 0"))
-                _conn.commit()
-                print("✅ migration: added tenant_api_keys.is_service")
-            if _tk_cols and "sign_tenants" not in _tk_cols:
-                _conn.execute(_sql_text("ALTER TABLE tenant_api_keys ADD COLUMN sign_tenants VARCHAR(500)"))
-                _conn.commit()
-                print("✅ migration: added tenant_api_keys.sign_tenants")
-            if _tk_cols and "sign_scopes" not in _tk_cols:
-                _conn.execute(_sql_text("ALTER TABLE tenant_api_keys ADD COLUMN sign_scopes VARCHAR(1000)"))
-                _conn.commit()
-                print("✅ migration: added tenant_api_keys.sign_scopes")
+            # tenant_api_keys columns: database.migrate_tenant_api_keys, which
+            # connect_db() runs before the tenant bootstrap.
             if "tombstoned_at" not in _cols:
                 _conn.execute(_sql_text("ALTER TABLE storage_objects ADD COLUMN tombstoned_at DATETIME"))
                 _conn.commit()

@@ -72,6 +72,30 @@ def get_db():
     finally:
         db.close()
 
+_TENANT_KEY_COLUMNS = (
+    ("is_service", "BOOLEAN DEFAULT 0"),
+    ("sign_tenants", "VARCHAR(500)"),
+    ("sign_scopes", "VARCHAR(1000)"),
+)
+
+
+def migrate_tenant_api_keys(conn) -> None:
+    """Add missing tenant_api_keys columns (SQLite, idempotent).
+
+    Must run BEFORE bootstrap_tenant_registry(): the bootstrap queries the
+    TenantAPIKey model, which selects every mapped column. On an older database
+    the first start otherwise failed with "no such column
+    tenant_api_keys.sign_scopes" and seeded nothing (seen on P3, 11.11.2026).
+    """
+    cols = {row[1] for row in conn.execute(text("PRAGMA table_info(tenant_api_keys)"))}
+    if not cols:
+        return  # table is new: create_all already built it complete
+    for name, ddl in _TENANT_KEY_COLUMNS:
+        if name not in cols:
+            conn.execute(text(f"ALTER TABLE tenant_api_keys ADD COLUMN {name} {ddl}"))
+            print(f"✅ migration: added tenant_api_keys.{name}")
+
+
 async def connect_db():
     """Connect to database (for startup)"""
     await database.connect()
@@ -159,6 +183,15 @@ async def connect_db():
     except Exception as e:
         print(f"Warning: Database migration failed: {e}")
         # Do not fail startup on migration errors
+
+    # Own try block: a failure above must not skip it, the bootstrap below needs it.
+    try:
+        if settings.DATABASE_URL.startswith("sqlite"):
+            with engine.connect() as conn:
+                migrate_tenant_api_keys(conn)
+                conn.commit()
+    except Exception as e:
+        print(f"Warning: tenant_api_keys migration failed: {e}")
 
     try:
         from tenancy.config import bootstrap_tenant_registry
