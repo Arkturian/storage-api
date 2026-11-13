@@ -14,8 +14,14 @@ the bytes in place. Rules from the concept (Pflichtregel 8):
 * The sync never deletes a storage object. A file that is gone sets
   ``reference_state="missing"``; when it comes back (restore from the trash, a
   version, a move back) the object re-attaches through its file id.
-* Only folders listed in the bindings file are synced, and only below the
-  projects root. The personal drives under ``users/`` are never touched.
+* Only the folder sync marks an object missing, and only after it could read
+  the whole bound folder. A folder it may not enter (EACCES) is an error of
+  that run, never a deletion (FileSync, 13.11.: OpenCloud creates new folders
+  0700, the ACL mask then hides them from www-data).
+* Only folders listed in the bindings file are synced: below the projects
+  root, or a read-only view under ``OPENCLOUD_VIEWS_ROOT`` (bindfs) with an
+  explicit ``space_id``. A binding path the running user can write to is
+  refused. The personal drives under ``users/`` are never touched.
 * Sensitive bindings always run with ``ai_mode="none"`` (no analysis, no
   embeddings, nothing leaves the house).
 """
@@ -26,6 +32,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, List, Optional
@@ -38,6 +45,8 @@ STATE_OK = "ok"
 STATE_MISSING = "missing"
 _AI_MODES = {"none", "safety", "vision", "full"}
 _DEFAULT_PROJECTS_ROOT = "/var/lib/opencloud/storage/users/projects"
+_DEFAULT_VIEWS_ROOT = "/srv/opencloud-views"
+_SPACE_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def projects_root() -> Path:
@@ -58,8 +67,8 @@ def file_id(path: Path) -> Optional[str]:
     return _xattr(path, XATTR_ID)
 
 
-def space_root(space_id: str) -> Path:
-    return projects_root() / space_id
+def views_root() -> Path:
+    return Path(os.getenv("OPENCLOUD_VIEWS_ROOT", _DEFAULT_VIEWS_ROOT)).resolve()
 
 
 def _is_hidden(name: str) -> bool:
@@ -67,27 +76,31 @@ def _is_hidden(name: str) -> bool:
     return name.startswith(".")
 
 
-def iter_files(root: Path) -> Iterator[Path]:
-    """Regular files below root, without OpenCloud's internal folders or symlinks."""
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+def iter_files(root: Path, errors: Optional[List[str]] = None) -> Iterator[Path]:
+    """Regular files below root, without OpenCloud's internal folders or symlinks.
+
+    os.walk skips a folder it cannot list without a word. Every such folder,
+    and every file that cannot be stat'ed, is appended to ``errors`` so the
+    caller knows the listing is incomplete.
+    """
+    errs = errors if errors is not None else []
+
+    def _onerror(exc: OSError) -> None:
+        errs.append(f"{exc.filename}: {exc.strerror or exc}")
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_onerror, followlinks=False):
         dirnames[:] = sorted(d for d in dirnames if not _is_hidden(d))
         for name in sorted(filenames):
             if _is_hidden(name):
                 continue
             p = Path(dirpath) / name
-            if p.is_file() and not p.is_symlink():
-                yield p
-
-
-def find_by_file_id(space_id: str, wanted: str) -> Optional[Path]:
-    """Locate a moved or renamed file inside its space by its OpenCloud id."""
-    root = space_root(space_id)
-    if not root.is_dir():
-        return None
-    for p in iter_files(root):
-        if file_id(p) == wanted:
-            return p
-    return None
+            try:
+                if p.is_symlink() or not p.is_file():
+                    continue
+            except OSError as exc:
+                errs.append(f"{p}: {exc.strerror or exc}")
+                continue
+            yield p
 
 
 def _sha256_of(path: Path) -> str:
@@ -126,17 +139,33 @@ def parse_binding(raw: dict) -> Binding:
     for key in ("name", "path", "collection_id", "owner_user_id"):
         if raw.get(key) in (None, ""):
             raise BindingError(f"binding is missing '{key}'")
-    root = projects_root()
+    name = raw["name"]
+    root, views = projects_root(), views_root()
     try:
         path = Path(raw["path"]).resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        raise BindingError(f"binding '{raw['name']}': path not readable ({exc})") from exc
-    if path == root or root not in path.parents:
-        raise BindingError(f"binding '{raw['name']}': path must lie inside a space below {root}")
-    space_id = path.relative_to(root).parts[0]
-    space_xattr = _xattr(root / space_id, XATTR_SPACE_ID)
-    if space_xattr and space_xattr != space_id:
-        raise BindingError(f"binding '{raw['name']}': space id mismatch ({space_xattr} != {space_id})")
+        raise BindingError(f"binding '{name}': path not readable ({exc})") from exc
+    if not path.is_dir():
+        raise BindingError(f"binding '{name}': path is not a folder")
+    given = str(raw.get("space_id") or "").strip().lower() or None
+    if given and not _SPACE_ID_RE.match(given):
+        raise BindingError(f"binding '{name}': space_id is not a space uuid")
+    if root in path.parents:
+        space_id = path.relative_to(root).parts[0]
+        if given and given != space_id:
+            raise BindingError(f"binding '{name}': space_id {given} does not match the path ({space_id})")
+        space_xattr = _xattr(root / space_id, XATTR_SPACE_ID)
+        if space_xattr and space_xattr != space_id:
+            raise BindingError(f"binding '{name}': space id mismatch ({space_xattr} != {space_id})")
+    elif views in path.parents:
+        if not given:
+            raise BindingError(f"binding '{name}': a view below {views} needs an explicit space_id")
+        space_id = given
+    else:
+        raise BindingError(f"binding '{name}': path must lie inside a space below {root} "
+                           f"or in a read-only view below {views}")
+    if os.access(path, os.W_OK) and os.getenv("OPENCLOUD_ALLOW_WRITABLE") != "1":
+        raise BindingError(f"binding '{name}': path is writable for this user; storage must only read (rule 8)")
     ai_mode = str(raw.get("ai_mode") or "none").lower()
     if ai_mode not in _AI_MODES:
         raise BindingError(f"binding '{raw['name']}': unknown ai_mode '{ai_mode}'")
@@ -202,45 +231,47 @@ class RefreshResult:
     changed: bool = False
     missing: bool = False
     restored: bool = False
+    unreadable: bool = False
 
 
-def refresh_reference(obj, db, *, commit: bool = True, search_missing: bool = True) -> RefreshResult:
+def refresh_reference(obj, db, *, at: Optional[Path] = None, commit: bool = True) -> RefreshResult:
     """Bring an OpenCloud reference object in line with its file.
 
-    Re-resolves a moved file by its OpenCloud id, recomputes size and checksum
-    and drops cached derivatives when mtime or size changed, and marks the
-    object missing (never deletes it) when the file is gone.
-
-    search_missing=False skips the walk through the space for an object that
-    is already marked missing (the media route uses it so a dead link does not
-    scan the space on every request; the folder sync still finds a return).
+    ``at`` is where the folder sync just found the file with this object's id
+    (a move or rename); without it the stored ``reference_path`` is checked.
+    Recomputes size and checksum and drops cached derivatives when mtime or
+    size changed. It never marks an object missing: a file that is not where
+    the object points comes back as ``missing`` (or ``unreadable`` on EACCES)
+    without touching the state. Only the folder sync, after a complete walk,
+    decides that a file is gone (``mark_missing``).
     """
     if not is_opencloud_object(obj):
         return RefreshResult(path=Path(obj.reference_path) if obj.reference_path else None)
 
     res = RefreshResult(path=None)
     was_missing = getattr(obj, "reference_state", None) == STATE_MISSING
-    path = Path(obj.reference_path) if obj.reference_path else None
-    if path is None or not path.is_file() or file_id(path) != obj.opencloud_file_id:
-        if was_missing and not search_missing:
-            res.missing = True
-            return res
-        found = find_by_file_id(obj.opencloud_space_id, obj.opencloud_file_id) if obj.opencloud_space_id else None
-        if found is None:
-            if not was_missing:
-                obj.reference_state = STATE_MISSING
-                if commit:
-                    db.commit()
-            res.missing = True
-            return res
-        if path is None or found != path:
-            obj.reference_path = str(found)
-            res.moved = True
-        path = found
+    path = at or (Path(obj.reference_path) if obj.reference_path else None)
+    try:
+        ok = path is not None and path.is_file() and file_id(path) == obj.opencloud_file_id
+        st = path.stat() if ok else None
+    except PermissionError:
+        res.unreadable = True
+        return res
+    except OSError:
+        ok, st = False, None
+    if not ok:
+        res.missing = True
+        return res
+    if obj.reference_path != str(path):
+        obj.reference_path = str(path)
+        res.moved = True
 
-    st = path.stat()
     if (st.st_mtime_ns, st.st_size) != (obj.reference_mtime_ns, obj.reference_size):
-        checksum = _sha256_of(path)
+        try:
+            checksum = _sha256_of(path)
+        except PermissionError:
+            res.unreadable = True
+            return res
         if checksum != obj.checksum or st.st_size != obj.file_size_bytes:
             invalidate_derivatives(obj)
             obj.checksum = checksum
@@ -257,6 +288,16 @@ def refresh_reference(obj, db, *, commit: bool = True, search_missing: bool = Tr
         db.commit()
     res.path = path
     return res
+
+
+def mark_missing(obj, db, *, commit: bool = True) -> bool:
+    """Mark an object whose file left its folder. Never deletes. True if the state changed."""
+    if getattr(obj, "reference_state", None) == STATE_MISSING:
+        return False
+    obj.reference_state = STATE_MISSING
+    if commit:
+        db.commit()
+    return True
 
 
 # --- folder sync ---------------------------------------------------------------------
@@ -323,7 +364,8 @@ async def sync_binding(binding: Binding, db, *, dry_run: bool = False) -> SyncRe
 
     report = SyncReport(binding=binding.name)
     seen: set = set()
-    for path in iter_files(binding.path):
+    walk_errors: List[str] = []
+    for path in iter_files(binding.path, walk_errors):
         fid = file_id(path)
         if not fid:
             report.skipped.append(str(path.relative_to(binding.path)))
@@ -346,7 +388,10 @@ async def sync_binding(binding: Binding, db, *, dry_run: bool = False) -> SyncRe
             continue
         if dry_run:
             continue
-        res = refresh_reference(obj, db)
+        res = refresh_reference(obj, db, at=path)
+        if res.unreadable:
+            report.errors.append(f"{path}: not readable")
+            continue
         if res.moved:
             report.moved.append(obj.id)
         if res.changed:
@@ -357,8 +402,14 @@ async def sync_binding(binding: Binding, db, *, dry_run: bool = False) -> SyncRe
         if res.restored:
             report.restored.append(obj.id)
 
-    # Objects of this folder whose file did not show up: re-resolve by id
-    # (moved elsewhere in the space), otherwise mark missing. Never delete.
+    report.errors.extend(walk_errors)
+    if walk_errors or dry_run:
+        # The listing is incomplete: a file in a folder we could not enter is
+        # not gone. Mark nothing missing in this run.
+        return report
+
+    # Objects of this folder whose file id did not show up anywhere in the
+    # (completely read) folder have left it: mark missing, never delete.
     stale = (db.query(StorageObject)
              .filter(StorageObject.collection_id == binding.collection_id,
                      StorageObject.tenant_id == binding.tenant_id,
@@ -366,13 +417,10 @@ async def sync_binding(binding: Binding, db, *, dry_run: bool = False) -> SyncRe
                      StorageObject.opencloud_file_id.isnot(None))
              .all())
     for obj in stale:
-        if obj.opencloud_file_id in seen or dry_run:
+        if obj.opencloud_file_id in seen:
             continue
-        res = refresh_reference(obj, db)
-        if res.missing:
+        if mark_missing(obj, db):
             report.missing.append(obj.id)
-        elif res.moved:
-            report.moved.append(obj.id)
     return report
 
 

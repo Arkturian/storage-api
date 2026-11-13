@@ -48,6 +48,8 @@ def env(tmp_path, monkeypatch):
     os.setxattr(str(space), oc.XATTR_ID, space_id.encode())
     (tmp_path / "users" / "privat").mkdir(parents=True)
     monkeypatch.setenv("OPENCLOUD_PROJECTS_ROOT", str(projects))
+    monkeypatch.setenv("OPENCLOUD_VIEWS_ROOT", str(tmp_path / "views"))
+    monkeypatch.setenv("OPENCLOUD_ALLOW_WRITABLE", "1")  # tmp_path gehört dem Testlauf
 
     models._hwm_ready.clear()
     eng = create_engine(f"sqlite:///{tmp_path / 's.db'}")
@@ -166,8 +168,8 @@ def test_geloeschte_datei_loescht_nie_das_objekt_und_kommt_zurueck(env):
     assert rep.missing == [o.id]
     assert env["db"].query(StorageObject).count() == 1
     assert o.reference_state == oc.STATE_MISSING
-    # Media-Route: kein Durchsuchen des Space bei bereits fehlender Datei
-    assert oc.refresh_reference(o, env["db"], search_missing=False).missing
+    # Media-Route (ohne Fundort): meldet fehlend, ändert den Zustand nicht
+    assert oc.refresh_reference(o, env["db"]).missing
 
     trash.rename(a)  # wiederhergestellt
     rep = _sync(env, _binding(env))
@@ -182,3 +184,69 @@ def test_fremde_objekte_bleiben_unberuehrt(env):
     db.add(legacy); db.commit()
     res = oc.refresh_reference(legacy, db)
     assert not res.missing and legacy.reference_state is None
+
+
+def test_unlesbarer_ordner_markiert_nichts_als_fehlend(env):
+    """FileSync 13.11.: OpenCloud legt neue Ordner 0700 an, www-data kommt nicht hinein."""
+    a = _file(env["space"] / "docs" / "bild.png", "png")
+    _sync(env, _binding(env))
+    o = env["db"].query(StorageObject).one()
+    sub = env["space"] / "docs" / "bilder"
+    sub.mkdir()
+    a.rename(sub / "logo.png")
+    sub.chmod(0)
+    try:
+        if os.access(sub, os.R_OK):
+            pytest.skip("läuft als root, chmod 0 sperrt nicht")
+        rep = _sync(env, _binding(env))
+        env["db"].refresh(o)
+        assert rep.missing == [] and any("bilder" in e for e in rep.errors)
+        assert o.reference_state == oc.STATE_OK
+        # Media-Route: Datei nicht am bekannten Ort -> missing, Zustand bleibt
+        assert oc.refresh_reference(o, env["db"]).missing
+        env["db"].refresh(o)
+        assert o.reference_state == oc.STATE_OK
+    finally:
+        sub.chmod(0o755)
+    rep = _sync(env, _binding(env))
+    env["db"].refresh(o)
+    assert rep.moved == [o.id] and rep.errors == []
+    assert o.reference_path.endswith("bilder/logo.png")
+
+
+def test_beschreibbarer_binding_pfad_wird_abgelehnt(env, monkeypatch):
+    monkeypatch.delenv("OPENCLOUD_ALLOW_WRITABLE")
+    if not os.access(env["space"] / "docs", os.W_OK):
+        pytest.skip("Testordner nicht beschreibbar")
+    with pytest.raises(oc.BindingError, match="writable"):
+        _binding(env)
+
+
+def test_bindfs_sicht_braucht_space_id(env):
+    view = env["tmp"] / "views" / "pilot"
+    view.mkdir(parents=True)
+    raw = {"name": "v", "path": str(view), "collection_id": "c", "owner_user_id": 2}
+    with pytest.raises(oc.BindingError, match="space_id"):
+        oc.parse_binding(raw)
+    b = oc.parse_binding(dict(raw, space_id=env["space_id"]))
+    assert b.space_id == env["space_id"] and b.path == view.resolve()
+    with pytest.raises(oc.BindingError, match="does not match"):
+        _binding(env, space_id=str(uuid.uuid4()))
+
+
+def test_umzug_auf_die_sicht_haengt_bestehende_objekte_um(env):
+    """Bindings-Pfad wechselt von projects/... auf eine bindfs-Sicht: gleiche Objekte, neuer Pfad."""
+    import shutil
+
+    _file(env["space"] / "docs" / "konzept.md", "text")
+    _sync(env, _binding(env))
+    o = env["db"].query(StorageObject).one()
+    view = env["tmp"] / "views" / "pilot"
+    # copy2 nimmt die xattr mit, steht im Test für den Mount mit denselben Datei-IDs
+    shutil.copytree(env["space"] / "docs", view, copy_function=shutil.copy2)
+    b = oc.parse_binding({"name": "pilot", "path": str(view), "collection_id": "opencloud:pilot",
+                          "owner_user_id": 2, "space_id": env["space_id"]})
+    rep = _sync(env, b)
+    env["db"].refresh(o)
+    assert rep.created == [] and rep.missing == [] and rep.moved == [o.id]
+    assert o.reference_path == str(view / "konzept.md") and o.reference_state == oc.STATE_OK
