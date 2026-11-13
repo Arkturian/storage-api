@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, Float, Text, DateTime, ForeignKey, JSON, Index, UniqueConstraint
+from sqlalchemy import BigInteger, Column, Integer, String, Boolean, Float, Text, DateTime, ForeignKey, JSON, Index, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -164,6 +164,15 @@ class StorageObject(Base):
     reference_path = Column(String, nullable=True, index=True)  # Filesystem path when using reference mode
     external_uri = Column(String, nullable=True, index=True)  # External web URI when using external mode
     ai_context_metadata = Column(JSON, nullable=True)  # Context for AI analysis (file_path, semantic hints, etc.)
+
+    # OpenCloud reference objects (#2810, Post 5939). The file id survives a
+    # move or rename inside its space; mtime/size detect edits made in OpenCloud.
+    # reference_state is "ok" or "missing" — a vanished file never deletes the object.
+    opencloud_space_id = Column(String, nullable=True)
+    opencloud_file_id = Column(String, nullable=True, index=True)
+    reference_mtime_ns = Column(BigInteger, nullable=True)
+    reference_size = Column(BigInteger, nullable=True)
+    reference_state = Column(String, nullable=True)
 
     # Multi-Tenancy (v4.0)
     tenant_id = Column(String(50), default="arkturian", index=True)  # Tenant identifier for multi-tenancy

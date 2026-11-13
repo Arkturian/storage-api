@@ -1,0 +1,12 @@
+[
+  {
+    "name": "agentos-docs",
+    "path": "/var/lib/opencloud/storage/users/projects/<space-id>/docs",
+    "collection_id": "opencloud:agentos-docs",
+    "tenant_id": "arkturian",
+    "owner_user_id": 2,
+    "sensitive": false,
+    "ai_mode": "none",
+    "is_public": false
+  }
+]

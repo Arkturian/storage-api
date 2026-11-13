@@ -179,6 +179,15 @@ async def connect_db():
                     conn.execute(text("ALTER TABLE storage_objects ADD COLUMN expires_at DATETIME"))
                     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_storage_expires_at ON storage_objects (expires_at)"))
 
+                # OpenCloud reference objects (#2810)
+                for _col, _ddl in (("opencloud_space_id", "VARCHAR"), ("opencloud_file_id", "VARCHAR"),
+                                   ("reference_mtime_ns", "BIGINT"), ("reference_size", "BIGINT"),
+                                   ("reference_state", "VARCHAR")):
+                    if _col not in scols:
+                        conn.execute(text(f"ALTER TABLE storage_objects ADD COLUMN {_col} {_ddl}"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_storage_objects_opencloud_file_id "
+                                  "ON storage_objects (opencloud_file_id)"))
+
                 conn.commit()
     except Exception as e:
         print(f"Warning: Database migration failed: {e}")
