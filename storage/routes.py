@@ -630,6 +630,7 @@ from storage.domain import save_file_and_record, update_file_and_record
 from storage.service import generic_storage, bulk_delete_objects, GenericStorageService
 from storage.external_proxy import fetch_external_file, external_cache
 from storage.url_builder import build_share_url, build_storage_urls, get_base_url_from_request
+from storage import opencloud as _opencloud
 from admin import routes as admin_routes
 from tenancy.config import tenant_id_for_api_key, get_tenant_id, get_tenant_id_optional
 
@@ -4238,6 +4239,14 @@ def get_media_variant(
     _check_quarantine(obj, current_user, db, signed=_signed)
     if not _signed:
         _check_media_access(obj, current_user, db)
+
+    # OpenCloud reference (#2810): follow a move inside the space, pick up an
+    # edit made in OpenCloud (new checksum, so a new ETag, derivatives dropped),
+    # and answer 404 file_missing while the file is gone. Never deletes.
+    if _opencloud.is_opencloud_object(obj):
+        if _opencloud.refresh_reference(obj, db, search_missing=False).missing:
+            raise HTTPException(status_code=404, detail={
+                "error": "file is missing in OpenCloud", "code": "file_missing"})
 
     media_type_current = (obj.mime_type or "application/octet-stream")
     mime = media_type_current.lower()
