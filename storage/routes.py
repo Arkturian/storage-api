@@ -4312,11 +4312,16 @@ def get_media_variant(
     if not _signed:
         _check_media_access(obj, current_user, db)
 
-    # OpenCloud reference (#2810): follow a move inside the space, pick up an
-    # edit made in OpenCloud (new checksum, so a new ETag, derivatives dropped),
-    # and answer 404 file_missing while the file is gone. Never deletes.
+    # OpenCloud reference (#2810): pick up an edit made in OpenCloud (new
+    # checksum, so a new ETag, derivatives dropped). A file that is not where
+    # the object points answers 404 file_missing, an unreadable one 503; the
+    # state itself only changes in the folder sync. Never deletes.
     if _opencloud.is_opencloud_object(obj):
-        if _opencloud.refresh_reference(obj, db, search_missing=False).missing:
+        _oc = _opencloud.refresh_reference(obj, db)
+        if _oc.unreadable:
+            raise HTTPException(status_code=503, detail={
+                "error": "file in OpenCloud is not readable for storage", "code": "file_unreadable"})
+        if _oc.missing:
             raise HTTPException(status_code=404, detail={
                 "error": "file is missing in OpenCloud", "code": "file_missing"})
 
