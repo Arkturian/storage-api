@@ -15,10 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+      # No actions/setup-python: on the self-hosted Debian 12 runner it finds
+      # no 3.11 in its tool cache and fails before any check runs (#2583).
+      # Debian 12 ships python3.11 itself, which is what production runs on.
+      - name: Python
+        run: /usr/bin/python3.11 --version
 
       # NOTE: we intentionally do NOT `pip install -r requirements.txt` here —
       # it pulls a private git dep (mac-transcoding-api) the GitHub runner can't
@@ -26,4 +27,4 @@ jobs:
       # compileall doesn't import modules, so it catches syntax/indent errors
       # across the codebase without needing the dependencies installed.
       - name: Syntax / compile check
-        run: python -m compileall -q main.py storage tasks ai_analysis knowledge_graph tenancy admin
+        run: /usr/bin/python3.11 -m compileall -q main.py storage tasks ai_analysis knowledge_graph tenancy admin
