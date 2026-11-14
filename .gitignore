@@ -51,3 +51,4 @@ Thumbs.db
 
 # DevOps (will be generated)
 .devops/starter-config.json
+tenant_config.json

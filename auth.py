@@ -12,7 +12,7 @@ import logging
 logger = logging.getLogger(__name__)
 from models import User
 from config import settings
-from tenancy.config import tenant_id_for_api_key
+from tenancy.config import tenant_id_for_api_key, tenant_key_state
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -57,6 +57,12 @@ def verify_api_key(api_key: str, db: Session) -> Optional[User]:
         user.last_active_at = datetime.utcnow()
         db.commit()
         return user
+
+    # A deactivated tenant key authenticates nobody (#2911 follow-up). Without
+    # this, the auto-provisioned <tenant>@api user still carried the key in
+    # users.api_key and kept working after the key was switched off.
+    if tenant_key_state(api_key, db) is False:
+        return None
 
     # Check user API keys
     user = db.query(User).filter(User.api_key == api_key).first()
@@ -239,7 +245,11 @@ def is_privileged_admin(current_user, db) -> bool:
         # No key to classify -> not provably an operator. Fail closed.
         return False
     try:
-        result = not tenant_id_for_api_key(key, db)
+        # Any tenant key, active OR deactivated, is not an operator credential;
+        # nor is any auto-provisioned machine account (<tenant>@api).
+        email = str(getattr(current_user, "email", "") or "").lower()
+        machine_account = email.endswith("@api") and email != "system@api"
+        result = tenant_key_state(key, db) is None and not machine_account
     except Exception:
         return False
     try:

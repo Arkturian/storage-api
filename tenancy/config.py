@@ -130,6 +130,24 @@ def tenant_id_for_api_key(api_key: Optional[str], db: Optional[Session] = None) 
         return key.tenant_id if key else None
 
 
+def tenant_key_state(api_key: Optional[str], db: Optional[Session] = None) -> Optional[bool]:
+    """None = not a tenant key at all, True = active tenant key, False = a
+    tenant key that was deactivated (#2911 follow-up). Callers that decide
+    "is this an operator?" must treat a deactivated tenant key as a tenant
+    key, not as "unknown"."""
+    if not api_key:
+        return None
+    with _manage_session(db) as session:
+        row = (
+            session.query(TenantAPIKey.is_active)
+            .filter(TenantAPIKey.api_key == api_key)
+            .first()
+        )
+        if row is None:
+            return None
+        return bool(row[0])
+
+
 def list_tenant_keys(db: Optional[Session] = None) -> Dict[str, str]:
     with _manage_session(db) as session:
         rows = (

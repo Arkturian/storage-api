@@ -130,3 +130,22 @@ def test_no_hardcoded_keys_in_tenancy_or_admin():
     for rel in ("tenancy/config.py", "admin/routes.py"):
         src = (root / rel).read_text()
         assert "oneal_demo_token" not in src and '"Inetpass1"' not in src, rel
+
+
+def test_deactivated_tenant_key_is_rejected_not_promoted(client, db):
+    # Deactivating must never turn the key's <tenant>@api user (trust admin)
+    # into an operator: before the follow-up it lost its "tenant key" label.
+    row = db.query(TenantAPIKey).filter(TenantAPIKey.api_key == TENANT_KEY).one()
+    row.is_active = False
+    db.commit()
+    assert client.get("/tenants/keys", headers=_h(TENANT_KEY)).status_code == 401
+    u = db.query(User).filter(User.email == "oneal@api").one()
+    assert auth.is_privileged_admin(u, db) is False
+
+
+def test_machine_account_never_operator(db):
+    u = User(email="koralmbahn@api", display_name="k", password_hash="", api_key="random-not-a-tenant-key",
+             trust_level="admin", device_ids=[])
+    assert auth.is_privileged_admin(u, db) is False
+    sys_user = db.query(User).filter(User.email == "system@api").one()
+    assert auth.is_privileged_admin(sys_user, db) is True
