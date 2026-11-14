@@ -26,6 +26,11 @@ from storage.external_proxy import fetch_external_file
 
 from config import settings
 from database import get_db
+
+# #2913: deterministic TTS cache names and file extensions that may reach the
+# filesystem unchanged.
+_TTS_CACHE_NAME_RE = re.compile(r"tts_[A-Za-z0-9_.-]{1,160}\.[A-Za-z0-9]{1,8}")
+_SAFE_EXT_RE = re.compile(r"(\.[a-z0-9]{1,10})?")
 from tenancy.config import api_key_for_tenant
 
 # TTS functionality is optional
@@ -168,16 +173,34 @@ class GenericStorageService:
     def _checksum(self, data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
 
+    @staticmethod
+    def _confined(base: Path, filename: str) -> Path:
+        """base / filename, proven to stay a direct child of base (#2913)."""
+        base_real = Path(base).resolve()
+        target = base_real / filename
+        if Path(filename).name != filename or target.parent != base_real or target.is_symlink():
+            raise ValueError("unsafe storage filename")
+        return target
+
     def _create_filename(self, original_filename: str, owner_user_id: int, context: Optional[str]) -> str:
         # IMPORTANT: For TTS caching, preserve deterministic filenames that start with "tts_"
         # These are cache-friendly identifiers sent by the client
-        if original_filename.startswith("tts_") and len(original_filename) > 20:
-            # This is a deterministic TTS cache filename - use it as-is
+        # #2913: only a single, plain path component qualifies. Before, any
+        # name starting with "tts_" was used verbatim, so "tts_xxxxxxxxxxxxxxxxx/
+        # ../../../etc/x" wrote anywhere www-data can write.
+        original_filename = original_filename or ""
+        if (
+            len(original_filename) > 20
+            and _TTS_CACHE_NAME_RE.fullmatch(original_filename)
+            and ".." not in original_filename
+        ):
             return original_filename
 
         # For all other files, generate a unique filename with timestamp and UUID
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        ext = Path(original_filename).suffix.lower()
+        ext = Path(original_filename.replace("\\", "/").split("/")[-1]).suffix.lower()
+        if not _SAFE_EXT_RE.fullmatch(ext or ""):
+            ext = ""
         uid = str(uuid.uuid4())[:8]
         safe_ctx = (context or "").strip()
         # Restrict to a portable character set. macOS nodes (mac, tommy) treat
@@ -389,7 +412,7 @@ class GenericStorageService:
         mime = mime_type if mime_type and mime_type != "application/octet-stream" else self._detect_mime_type(data, original_filename)
         filename = self._create_filename(original_filename, owner_user_id, context)
         tenant_media_dir = self._get_tenant_dir(self.media_dir, tenant_id)
-        file_path = tenant_media_dir / filename
+        file_path = self._confined(tenant_media_dir, filename)
 
         async with aiofiles.open(file_path, "wb") as f:
             await f.write(data)
@@ -449,7 +472,7 @@ class GenericStorageService:
         # Create temporary file for metadata extraction and thumbnail generation
         temp_filename = self._create_filename(original_filename, owner_user_id, context)
         tenant_media_dir = self._get_tenant_dir(self.media_dir, tenant_id)
-        temp_file_path = tenant_media_dir / f"temp_{temp_filename}"
+        temp_file_path = self._confined(tenant_media_dir, f"temp_{temp_filename}")
 
         try:
             # Write temporary file
@@ -1158,6 +1181,16 @@ def bulk_delete_objects(
     from models import StorageObject, User
     import shutil
 
+    # #2915: only an operator may delete across owners; everyone else only
+    # their own objects. Tenant keys carry trust_level=admin in the DB and
+    # used to skip the owner filter entirely (cross-tenant mass delete).
+    from auth import is_privileged_admin
+    privileged = is_privileged_admin(current_user, db)
+    if current_user is None:
+        return 0
+    if not (name or collection_like or context_like):
+        raise ValueError("at least one filter (name, collection_like, context_like) is required")
+
     # Step 1: Find initial objects based on filters
     q = db.query(StorageObject)
     if collection_like:
@@ -1170,7 +1203,7 @@ def bulk_delete_objects(
     if tenant_id:
         q = q.filter(StorageObject.tenant_id == tenant_id)
 
-    if current_user and current_user.trust_level != "admin" and not tenant_id:
+    if not privileged:
         q = q.filter(StorageObject.owner_user_id == current_user.id)
 
     initial_objects = q.all()
@@ -1183,9 +1216,12 @@ def bulk_delete_objects(
     # Step 3: Find all objects that share those link_ids
     all_objects_to_delete_map = {obj.id: obj for obj in initial_objects}
     if link_ids_to_find:
+        # #2915: a shared link_id never reaches across owner or tenant.
+        owner_tenant = {(o.owner_user_id, o.tenant_id) for o in initial_objects}
         linked_objects = db.query(StorageObject).filter(StorageObject.link_id.in_(link_ids_to_find)).all()
         for obj in linked_objects:
-            all_objects_to_delete_map[obj.id] = obj # Use map to ensure uniqueness
+            if (obj.owner_user_id, obj.tenant_id) in owner_tenant:
+                all_objects_to_delete_map[obj.id] = obj # Use map to ensure uniqueness
 
     final_objects_to_delete = list(all_objects_to_delete_map.values())
     
@@ -1304,7 +1340,7 @@ async def _process_tts_request_from_storage(storage_obj, tts_request):
                 # Google API/SDK. Reuses the same /ai/chatgpt path as the safety
                 # pipeline (subscription-backed, no per-call billing).
                 _ai_api_base = os.getenv("AI_API_BASE_URL", "http://127.0.0.1:8000")
-                _ai_api_key = os.getenv("AI_INTERNAL_API_KEY", "Inetpass1")
+                _ai_api_key = os.getenv("AI_INTERNAL_API_KEY") or settings.API_KEY  # no literal (#2911)
                 image_prompt_request = (
                     "Based on the following dialog, create a short, visually descriptive prompt for a text-to-image AI. "
                     "The prompt should capture the essence and mood of the conversation in a single scene. "
@@ -1330,7 +1366,7 @@ async def _process_tts_request_from_storage(storage_obj, tts_request):
                         link_id=storage_obj.link_id or tts_request.id, 
                         owner_user_id=storage_obj.owner_user_id
                     ),
-                    "Inetpass1", # Internal API Key
+                    settings.API_KEY,  # internal master, no literal (#2911)
                     db_session
                 )
             except Exception as img_e:
@@ -1479,13 +1515,22 @@ async def enqueue_ai_safety_and_transcoding(storage_obj, db=None, skip_ai_safety
 
             print(f"🌐 [EXTERNAL MODE] Downloading file for AI analysis from: {external_uri}")
             try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                from storage.safe_fetch import check_url, safe_async_client  # #2912
+                check_url(external_uri)
+                async with safe_async_client(timeout=60.0) as client:
                     response = await client.get(external_uri)
                     response.raise_for_status()
 
-                    # Save to temporary file
-                    temp_file_for_external = Path(f"/tmp/external_ai_{storage_obj.id}_{storage_obj.original_filename}")
-                    temp_file_for_external.parent.mkdir(parents=True, exist_ok=True)
+                    # Save to temporary file. #2913: never put the client's
+                    # filename into the path (it allowed ../ overwrite + unlink);
+                    # only a sanitised extension survives.
+                    import tempfile as _tempfile
+                    _ext = Path(str(storage_obj.original_filename or "").replace("\\", "/").split("/")[-1]).suffix.lower()
+                    if not _SAFE_EXT_RE.fullmatch(_ext or ""):
+                        _ext = ""
+                    _fd, _tmp = _tempfile.mkstemp(prefix=f"external_ai_{int(storage_obj.id)}_", suffix=_ext, dir="/tmp")
+                    os.close(_fd)
+                    temp_file_for_external = Path(_tmp)
                     temp_file_for_external.write_bytes(response.content)
                     file_path = temp_file_for_external
                     print(f"✅ [EXTERNAL MODE] Downloaded {len(response.content)} bytes to {file_path}")

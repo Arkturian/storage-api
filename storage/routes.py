@@ -8,6 +8,7 @@ from typing import Optional, List, Any, Dict, Tuple
 import json
 import os
 import re
+import hmac
 import time
 import shutil
 import hashlib
@@ -360,7 +361,8 @@ def _resolve_storage_object_path(obj: Any, refresh: bool = False) -> Path:
             _evict_share_proxy_cache(cache_dir)
             tmp_file = cache_dir / f"obj_{obj.id}.part"
             try:
-                with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+                from storage.safe_fetch import safe_client  # #2912
+                with safe_client(timeout=30.0) as client:
                     with client.stream("GET", obj.external_uri) as response:
                         if response.status_code != 200:
                             raise HTTPException(
@@ -797,9 +799,12 @@ def get_media_cache_status(
     include_original: bool = Query(True, description="Include original file status"),
     reuse_existing: bool = Form(False),
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    current_user: User = Depends(get_current_user),
     tenant_id: Optional[str] = Depends(get_tenant_id_optional),
 ):
+    # #2914: key required; per object the caller must be allowed to see it,
+    # and server paths are shown to operators only.
+    show_paths = _is_privileged_admin(current_user, db)
     unique_ids = list(dict.fromkeys(int(oid) for oid in object_ids if int(oid) > 0))
     if not unique_ids:
         raise HTTPException(status_code=400, detail="No valid object IDs provided")
@@ -841,15 +846,20 @@ def get_media_cache_status(
             )
             continue
 
-        if tenant_id and record.tenant_id and record.tenant_id != tenant_id:
+        try:
+            _check_media_access(record, current_user, db)
+            _allowed = show_paths or not (tenant_id and record.tenant_id and record.tenant_id != tenant_id)
+        except HTTPException:
+            _allowed = False
+        if not _allowed:
             response.append(
                 MediaCacheStatus(
                     object_id=object_id,
-                    tenant_id=record.tenant_id,
+                    tenant_id=None,
                     original_exists=False,
                     original_path=None,
                     derivatives=[],
-                    message="Object belongs to different tenant",
+                    message="Object not found",
                 )
             )
             continue
@@ -890,7 +900,7 @@ def get_media_cache_status(
                     format=image_format.lower(),
                     exists=exists,
                     size_bytes=size_bytes,
-                    path=resolved_path,
+                    path=resolved_path if show_paths else None,
                     mtime=mtime_iso,
                 )
             )
@@ -913,7 +923,7 @@ def get_media_cache_status(
                 object_id=object_id,
                 tenant_id=record.tenant_id,
                 original_exists=original_exists,
-                original_path=original_path,
+                original_path=original_path if show_paths else None,
                 derivatives=derivatives,
                 message=message,
             )
@@ -926,7 +936,7 @@ def get_media_cache_status(
 def clear_media_cache(
     object_ids: List[int] = Query(..., alias="object_id", description="List of storage object IDs to clear cache for"),
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    current_user: User = Depends(get_current_user),
     tenant_id: Optional[str] = Depends(get_tenant_id_optional),
 ):
     """
@@ -970,14 +980,17 @@ def clear_media_cache(
                 failed += 1
                 continue
 
-            # Check tenant access
-            if tenant_id and record.tenant_id and record.tenant_id != tenant_id:
+            # #2914: deleting derivatives is a write -> owner or operator only.
+            if not (
+                getattr(record, "owner_user_id", None) == getattr(current_user, "id", None)
+                or _is_privileged_admin(current_user, db)
+            ):
                 results.append(
                     CacheClearResult(
                         object_id=object_id,
                         success=False,
                         files_deleted=0,
-                        message="Object belongs to different tenant",
+                        message="Object not found",
                     )
                 )
                 failed += 1
@@ -1789,8 +1802,10 @@ def bulk_delete_filtered_objects(
             current_user=current_user
         )
         return {"deleted_count": deleted_count, "message": f"{deleted_count} items deleted successfully."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="bulk delete failed")
 
 
 @router.post("/admin/clean-tenant")
@@ -2741,6 +2756,15 @@ async def upload_file(
             original_video = db.query(StorageObject).filter(StorageObject.id == reference_id_int).first()
             if not original_video:
                 raise HTTPException(status_code=404, detail=f"Original video {reference_id} not found")
+            # #2915: an HLS result may only be attached by the video's owner or
+            # an operator (the transcoding service uploads with the master key).
+            # Before, any authenticated key could overwrite a foreign tenant's
+            # HLS directory and hls_url.
+            if not (
+                getattr(current_user, "id", None) == original_video.owner_user_id
+                or _is_privileged_admin(current_user, db)
+            ):
+                raise HTTPException(status_code=404, detail=f"Original video {reference_id} not found")
 
             # Use tenant and owner from original video
             tenant_id = original_video.tenant_id
@@ -2790,6 +2814,8 @@ async def upload_file(
                 candidate = q.order_by(StorageObject.created_at.desc()).first()
                 if candidate:
                     reference_id = str(candidate.id)
+                    reference_id_int = candidate.id
+                    original_video = candidate
                     print(f"📦 Auto-resolved original video by {'link_id' if link_id else 'owner'}: {reference_id}")
             except Exception as _e:
                 print(f"📦 WARN: Auto-resolve original video failed: {_e}")
@@ -3143,7 +3169,9 @@ async def fetch_and_store_remote(
 
     # Download the remote file
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as client:
+        from storage.safe_fetch import check_url, safe_async_client  # #2912
+        check_url(payload.url)
+        async with safe_async_client(timeout=20.0) as client:
             # Many CDNs (e.g., Wikimedia) require a proper User-Agent and may return errors for missing headers
             request_headers = {
                 "User-Agent": "3DPresenter/1.0 (+https://arkturian.com; contact: support@arkturian.com)",
@@ -3319,6 +3347,9 @@ async def fetch_and_store_remote(
     except HTTPException:
         raise
     except Exception as e:
+        from storage.safe_fetch import OutboundBlocked
+        if isinstance(e, OutboundBlocked) or isinstance(getattr(e, "__cause__", None), OutboundBlocked):
+            raise HTTPException(status_code=400, detail={"error": "url not allowed", "code": "outbound_blocked"})
         raise HTTPException(status_code=500, detail=f"Fetch-and-store failed: {str(e)}")
 
 @router.post("/objects/{object_id}/analyze", response_model=StorageObjectResponse)
@@ -3902,38 +3933,11 @@ def _require_bulk_admin(current_user, db) -> None:
 
 
 def _is_privileged_admin(current_user, db) -> bool:
-    """True only for a REAL admin identity — never for a tenant API key.
-
-    auth.py auto-provisions tenant keys with trust_level="admin", and those
-    keys ship inside public browser bundles (3DPresenter, vod, Tscheppa). A
-    logged-out visitor could therefore reach admin-only paths: listing foreign
-    inventory via mine=false, DELETE and PATCH on objects they do not own
-    (Issue #799). Uploading on someone's behalf (owner_email) stays allowed —
-    that is normal tenant work and breaking it would take out real pipelines.
-    """
-    if current_user is None or getattr(current_user, "trust_level", None) != "admin":
-        return False
-    # An impersonated principal (X-On-Behalf-Of) never gets admin-wide powers,
-    # even if that user happens to be an admin — the service key must not be
-    # able to widen its reach by picking a privileged principal.
-    if getattr(current_user, "_storage_on_behalf_of", False):
-        return False
-    cached = getattr(current_user, "_storage_privileged_admin", None)
-    if cached is not None:
-        return cached
-    key = getattr(current_user, "api_key", None)
-    if not key or db is None:
-        return True
-    try:
-        result = not tenant_id_for_api_key(key, db)
-    except Exception:
-        return False
-    # Per-request memo: list/search routes ask once per row (Issue #2282).
-    try:
-        current_user._storage_privileged_admin = result
-    except Exception:
-        pass
-    return result
+    """True only for a REAL admin identity — never for a tenant API key
+    (Issue #799/#2282). Single source of truth lives in auth.py (#2911) so the
+    tenancy/ and admin/ routers apply exactly the same rule."""
+    from auth import is_privileged_admin
+    return is_privileged_admin(current_user, db)
 
 
 def media_repr_etag(obj, **repr_params) -> Optional[str]:
@@ -5164,6 +5168,7 @@ def get_media_trim_bounds(
 
     if not obj:
         raise HTTPException(status_code=404, detail="Storage object not found")
+    _check_media_access(obj, current_user, db)  # #2914
 
     # Check permissions
     # Tenant ownership is resolved from the API key by the dedicated tenancy
@@ -5297,7 +5302,9 @@ def _focal_access_check(object_id: int, db: Session, current_user: Optional[User
     obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Storage object not found")
-    # Same safety gate as the media endpoint (451 if quarantined, owner/admin bypass).
+    # Same gates as the media endpoint: who may see it (#2914), then the
+    # safety verdict (451 if quarantined, owner/admin bypass).
+    _check_media_access(obj, current_user, db)
     _check_quarantine(obj, current_user, db)
     mime = (obj.mime_type or "").lower()
     if not mime.startswith("image/"):
@@ -5533,7 +5540,8 @@ def get_batch_trim_bounds(
 
     Example: /storage/media/batch/trim-bounds?id=1763&id=3571&id=4200
     """
-    tenant = current_user.tenant_id if current_user else "public"
+    # #2914: the old first line read current_user.tenant_id (no such column)
+    # and 500ed for every authenticated caller.
     objects = db.query(StorageObject).filter(
         StorageObject.id.in_(object_ids)
     ).all()
@@ -5541,6 +5549,10 @@ def get_batch_trim_bounds(
     results: Dict[str, Any] = {}
 
     for obj in objects:
+        try:
+            _check_media_access(obj, current_user, db)  # #2914
+        except HTTPException:
+            continue
         # Skip non-images
         if not (obj.mime_type or "").startswith("image/"):
             continue
@@ -5594,9 +5606,16 @@ def get_batch_trim_bounds(
     }
 
 
+_PROXY_SAFE_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+    "X-Content-Type-Options": "nosniff",
+}
+
+
 @router.get("/proxy")
 async def proxy_external_image(
     url: str = Query(..., description="External image URL to proxy"),
+    current_user: User = Depends(get_current_user),
     width: Optional[int] = Query(None, ge=1, description="Target width in pixels"),
     height: Optional[int] = Query(None, ge=1, description="Target height in pixels"),
     format: Optional[str] = Query(None, description="Output format: jpg | png | webp"),
@@ -5621,16 +5640,20 @@ async def proxy_external_image(
         # Determine source format from content-type
         content_type = metadata.get('content-type', 'image/jpeg')
         
-        # If no transformations requested, return original
-        if not width and not height and not format and not quality:
-            return Response(content=data, media_type=content_type)
-        
-        # Apply transformations using PIL
-        from PIL import Image
+        # #2912: never pass the remote body through. It is always decoded as a
+        # raster image and re-encoded, so no HTML/SVG/JS can be served from
+        # this origin, whatever Content-Type the remote claims.
+        from PIL import Image, UnidentifiedImageError
         from io import BytesIO
-        
-        # Load image
-        img = Image.open(BytesIO(data))
+
+        try:
+            img = Image.open(BytesIO(data))
+            img.load()
+        except (UnidentifiedImageError, OSError, ValueError):
+            raise HTTPException(status_code=415, detail={"error": "not a raster image", "code": "proxy_not_image"})
+        if not format:
+            src = (img.format or "").upper()
+            format = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp"}.get(src, "webp")
         
         # Resize if requested
         if width or height:
@@ -5676,12 +5699,17 @@ async def proxy_external_image(
         img.save(output, format=pil_format, **save_kwargs)
         output.seek(0)
         
-        return Response(content=output.read(), media_type=media_type)
-        
+        return Response(content=output.read(), media_type=media_type, headers=_PROXY_SAFE_HEADERS)
+
+    except HTTPException:
+        raise
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch external URL: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Image processing failed: {str(e)}")
+        from storage.safe_fetch import OutboundBlocked
+        if isinstance(e, OutboundBlocked):
+            raise HTTPException(status_code=400, detail={"error": "url not allowed", "code": "outbound_blocked"})
+        raise HTTPException(status_code=502, detail="Failed to fetch external URL")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Image processing failed")
 
 
 def _anon_hidden_collections() -> List[str]:
@@ -6126,22 +6154,28 @@ def download_file(
     return FileResponse(path, media_type=obj.mime_type, headers={"Content-Disposition": "inline"})
 
 
-@router.post("/objects/{object_id}/like", response_model=StorageObjectResponse)
+@router.post("/objects/{object_id}/like")
 def like_object(
     object_id: int,
     db: Session = Depends(get_db),
     tenant_id: str = Depends(get_tenant_id),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
+    """#2914: only objects the caller may see, and only the counter comes back
+    (it used to return the full object incl. ai_context_metadata, paths, GPS)."""
     obj = db.query(StorageObject).filter(
         StorageObject.id == object_id,
         StorageObject.tenant_id == tenant_id
     ).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Not found")
+    try:
+        _check_media_access(obj, current_user, db)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Not found")
     obj.likes = (obj.likes or 0) + 1
     db.commit()
-    db.refresh(obj)
-    return StorageObjectResponse.from_orm(obj)
+    return {"id": obj.id, "likes": obj.likes}
 
 
 def _perform_delete(object_id: int, db: Session, owner_user_id: int, is_admin: bool = False) -> dict:
@@ -6183,8 +6217,13 @@ def _perform_delete(object_id: int, db: Session, owner_user_id: int, is_admin: b
         print(f"Error cleaning transcoding queue: {e}")
 
     # CASCADE DELETE: Find and delete all linked child objects
+    # #2915: link_id children of the same owner and tenant only. Anyone could
+    # set link_id=<foreign id> on their own upload; the reverse direction (a
+    # foreign child of my object) must not be deleted with mine either.
     linked_children = db.query(StorageObject).filter(
-        StorageObject.link_id == str(obj.id)
+        StorageObject.link_id == str(obj.id),
+        StorageObject.owner_user_id == obj.owner_user_id,
+        StorageObject.tenant_id == obj.tenant_id,
     ).all()
 
     if linked_children:
@@ -6488,6 +6527,18 @@ async def update_object_metadata(
         raise HTTPException(status_code=404, detail="Not found or forbidden")
 
     update_data = payload.dict(exclude_unset=True)
+
+    # #2915: the safety verdict is set by the pipeline, not by the uploader.
+    # Writing ai_safety_rating="safe" or a new safety_info lifted a 451
+    # quarantine on one's own flagged file. Operators may still correct it.
+    _SAFETY_FIELDS = ("ai_safety_rating", "safety_info")
+    if any(f in update_data for f in _SAFETY_FIELDS) and not (
+        _is_privileged_admin(current_user, db) and not _is_public_default_master(current_user)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "safety fields are set by the safety pipeline", "code": "safety_fields_read_only"},
+        )
 
     # Check if ai_context_metadata is being updated
     ai_metadata_updated = "ai_context_metadata" in update_data
@@ -6966,6 +7017,12 @@ async def get_task_status(
 
     if not task_info:
         raise HTTPException(status_code=404, detail="Task not found")
+    # #2915: only tasks of the caller's own objects (operators see all).
+    if not _is_privileged_admin(current_user, db):
+        _oid = task_info.get("object_id") if isinstance(task_info, dict) else None
+        _obj = db.query(StorageObject).filter(StorageObject.id == _oid).first() if _oid else None
+        if not _obj or _obj.owner_user_id != current_user.id:
+            raise HTTPException(status_code=404, detail="Task not found")
 
     return task_info
 
@@ -6989,6 +7046,15 @@ async def list_tasks(
     from storage.async_pipeline import pipeline_manager
 
     tasks = pipeline_manager.get_all_tasks(db, limit=limit, object_id=object_id)
+    # #2915: non-operators see only tasks of their own objects.
+    if not _is_privileged_admin(current_user, db):
+        _ids = {t.get("object_id") for t in tasks if isinstance(t, dict) and t.get("object_id")}
+        _own = {
+            oid for (oid,) in db.query(StorageObject.id)
+            .filter(StorageObject.id.in_(_ids), StorageObject.owner_user_id == current_user.id)
+            .all()
+        } if _ids else set()
+        tasks = [t for t in tasks if isinstance(t, dict) and t.get("object_id") in _own]
 
     return {
         "tasks": tasks,
@@ -7012,6 +7078,10 @@ async def get_embedding_text(
     ).first()
     
     if not obj:
+        raise HTTPException(status_code=404, detail="Object not found")
+    try:
+        _check_media_access(obj, current_user, db)  # #2915
+    except HTTPException:
         raise HTTPException(status_code=404, detail="Object not found")
     
     metadata = obj.ai_context_metadata or {}
@@ -7091,6 +7161,9 @@ async def update_embedding_text(
     ).first()
 
     if not obj:
+        raise HTTPException(status_code=404, detail="Object not found")
+    # #2915: rewriting the search embedding is an owner/operator action.
+    if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=404, detail="Object not found")
 
     new_text = request.get("embedding_text", "").strip()
@@ -7298,7 +7371,57 @@ async def get_object_data_uri(
     }
 
 
-@router.post("/transcode/callback")
+_TRANSCODE_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_TRANSCODE_ACTIVE_STATES = {"queued", "processing"}
+
+
+def _transcode_output_roots() -> List[Path]:
+    """Directories a transcoding callback may point output_dir into (#2910)."""
+    raw = os.getenv(
+        "TRANSCODE_CALLBACK_OUTPUT_ROOTS",
+        os.pathsep.join(["/var/code/transcoding_work", "/var/lib/transcoding-api/work"]),
+    )
+    return [Path(p.strip()) for p in raw.split(os.pathsep) if p.strip()]
+
+
+def _require_transcode_callback_secret(
+    x_transcode_callback_secret: Optional[str] = Header(None),
+) -> None:
+    """Shared secret for /storage/transcode/callback (#2910).
+
+    Fail-closed: without TRANSCODE_CALLBACK_SECRET configured the endpoint is
+    disabled. No component in the federation sends this callback today (the
+    transcoding API's notify_server() is a no-op), so disabled is the safe
+    default rather than an outage.
+    """
+    expected = os.getenv("TRANSCODE_CALLBACK_SECRET", "")
+    if not expected:
+        raise HTTPException(status_code=403, detail="transcode_callback_disabled")
+    if not x_transcode_callback_secret or not hmac.compare_digest(
+        x_transcode_callback_secret.encode(), expected.encode()
+    ):
+        raise HTTPException(status_code=401, detail="transcode_callback_secret_invalid")
+
+
+def _resolve_callback_output_dir(output_dir: str) -> Path:
+    """output_dir must be an existing directory strictly below an allowed root."""
+    try:
+        real = Path(output_dir).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=400, detail="output_dir_not_found")
+    if not real.is_dir():
+        raise HTTPException(status_code=400, detail="output_dir_not_a_directory")
+    for root in _transcode_output_roots():
+        try:
+            root_real = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if real != root_real and real.is_relative_to(root_real):
+            return real
+    raise HTTPException(status_code=403, detail="output_dir_not_allowed")
+
+
+@router.post("/transcode/callback", dependencies=[Depends(_require_transcode_callback_secret)])
 async def transcoding_callback(
     job_id: str = Body(...),
     status: str = Body(...),
@@ -7308,102 +7431,88 @@ async def transcoding_callback(
     db: Session = Depends(get_db)
 ):
     """
-    Callback endpoint for transcoding API to report job completion
+    Callback endpoint for transcoding API to report job completion.
+
+    #2910: requires X-Transcode-Callback-Secret, accepts only objects that are
+    actually being transcoded, copies HLS output only from a directory below
+    TRANSCODE_CALLBACK_OUTPUT_ROOTS and never deletes anything outside it.
     """
+    if not _TRANSCODE_JOB_ID_RE.fullmatch(job_id or ""):
+        raise HTTPException(status_code=400, detail="invalid_job_id")
+    if status not in ("completed", "failed", "processing", "queued"):
+        raise HTTPException(status_code=400, detail="invalid_status")
     print(f"📨 Transcoding callback: job_id={job_id}, status={status}, storage_object_id={storage_object_id}, output_dir={output_dir}")
-    
+
+    storage_obj = db.query(StorageObject).filter(StorageObject.id == storage_object_id).first()
+    if not storage_obj:
+        raise HTTPException(status_code=404, detail="Storage object not found")
+    if (storage_obj.transcoding_status or "") not in _TRANSCODE_ACTIVE_STATES:
+        raise HTTPException(status_code=409, detail="object_not_transcoding")
+
+    temp_output = None
+    if status == "completed" and output_dir:
+        temp_output = _resolve_callback_output_dir(output_dir)
+
     try:
-        # Get storage object
-        storage_obj = db.query(StorageObject).filter(StorageObject.id == storage_object_id).first()
-        
-        if not storage_obj:
-            print(f"⚠️  Storage object {storage_object_id} not found")
-            raise HTTPException(status_code=404, detail="Storage object not found")
-        
-        # Update transcoding status
         if status == "completed":
             storage_obj.transcoding_status = "completed"
             storage_obj.transcoding_progress = 100
             storage_obj.transcoding_error = None
 
-            # Copy HLS files from temp directory to storage and set hls_url
-            if output_dir:
+            if temp_output is not None:
+                import shutil
+                from sqlalchemy.orm.attributes import flag_modified
+                from storage.service import generic_storage
+
+                storage_file_path = generic_storage.absolute_path_for_key(
+                    storage_obj.object_key,
+                    storage_obj.tenant_id
+                )
+                original_basename = Path(storage_obj.object_key).stem
+                hls_dir = storage_file_path.parent / original_basename
+
+                print(f"📁 Copying HLS files from {temp_output} to {hls_dir}")
+                if hls_dir.exists():
+                    shutil.rmtree(hls_dir)
+                # symlinks=True copies links as links instead of following them
+                # out of the output root.
+                shutil.copytree(temp_output, hls_dir, symlinks=True)
+
+                tenant_id = storage_obj.tenant_id or "arkturian"
+                storage_obj.hls_url = build_hls_url(tenant_id, original_basename)
+
+                # Only the validated output dir itself is removed, never its
+                # parent (#2910: rmtree(parent) could wipe /var/lib/storage-api).
                 try:
-                    from pathlib import Path
-                    import shutil
-                    from sqlalchemy.orm.attributes import flag_modified
-                    from storage.service import generic_storage
+                    shutil.rmtree(temp_output)
+                except Exception as cleanup_error:
+                    print(f"⚠️  Could not cleanup output dir: {cleanup_error}")
 
-                    # Get the storage file path and create HLS directory
-                    storage_file_path = generic_storage.absolute_path_for_key(
-                        storage_obj.object_key,
-                        storage_obj.tenant_id
-                    )
-                    original_basename = Path(storage_obj.object_key).stem
-                    hls_dir = storage_file_path.parent / original_basename
+                if not storage_obj.metadata_json:
+                    storage_obj.metadata_json = {}
+                storage_obj.metadata_json["transcoding_output_dir"] = str(temp_output)
+                storage_obj.metadata_json["transcoding_callback_job_id"] = job_id
+                flag_modified(storage_obj, "metadata_json")
 
-                    # Copy HLS files from temp dir to storage
-                    temp_output = Path(output_dir)
-                    if temp_output.exists():
-                        print(f"📁 Copying HLS files from {temp_output} to {hls_dir}")
-
-                        # Remove old HLS directory if exists
-                        if hls_dir.exists():
-                            shutil.rmtree(hls_dir)
-
-                        # Copy all files
-                        shutil.copytree(temp_output, hls_dir)
-                        print(f"✅ Copied {len(list(hls_dir.glob('*')))} files to {hls_dir}")
-
-                        # Set HLS URL
-                        tenant_id = storage_obj.tenant_id or "arkturian"
-                        hls_url = build_hls_url(tenant_id, original_basename)
-                        storage_obj.hls_url = hls_url
-                        print(f"🎬 HLS URL set: {hls_url}")
-
-                        # Clean up temp directory
-                        try:
-                            shutil.rmtree(temp_output.parent)
-                            print(f"🧹 Cleaned up temp dir: {temp_output.parent}")
-                        except Exception as cleanup_error:
-                            print(f"⚠️  Could not cleanup temp dir: {cleanup_error}")
-                    else:
-                        print(f"⚠️  Output directory not found: {output_dir}")
-
-                    # Save output_dir in metadata for reference
-                    if not storage_obj.metadata_json:
-                        storage_obj.metadata_json = {}
-                    storage_obj.metadata_json["transcoding_output_dir"] = output_dir
-                    flag_modified(storage_obj, "metadata_json")
-
-                except Exception as copy_error:
-                    print(f"❌ Error copying HLS files: {copy_error}")
-                    import traceback
-                    traceback.print_exc()
-
-            print(f"✅ Transcoding completed for storage object {storage_object_id}")
-            
         elif status == "failed":
             storage_obj.transcoding_status = "failed"
-            storage_obj.transcoding_error = error or "Unknown error"
-            print(f"❌ Transcoding failed for storage object {storage_object_id}: {error}")
-            
+            storage_obj.transcoding_error = (error or "Unknown error")[:2000]
         else:
             storage_obj.transcoding_status = status
-            print(f"🔄 Transcoding status updated: {status}")
-        
+
         db.commit()
-        
         return {
             "success": True,
             "message": f"Status updated to {status}",
             "storage_object_id": storage_object_id
         }
-        
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         print(f"❌ Callback error: {str(e)}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="transcode_callback_failed")
 
 
 # ---------------------------------------------------------------------------

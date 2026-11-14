@@ -47,7 +47,8 @@ def _sanitize_for_prompt(value: Optional[str], *, max_len: int = 200, label: str
 import asyncio
 
 # API configuration
-INTERNAL_API_KEY = os.getenv("AI_INTERNAL_API_KEY", "Inetpass1")
+from config import settings as _settings
+INTERNAL_API_KEY = os.getenv("AI_INTERNAL_API_KEY") or _settings.API_KEY  # no literal (#2911)
 # Make AI API base configurable to avoid hardcoding wrong ports on prod
 API_BASE_URL = os.getenv("AI_API_BASE_URL", "http://127.0.0.1:8000")
 # Public storage base used to hand image URLs to the (CLI-based) AI backends,

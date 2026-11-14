@@ -645,7 +645,8 @@ class KnowledgeGraphPipeline:
             from pathlib import Path
 
             # HEAD request to get metadata WITHOUT downloading full file
-            async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+            from storage.safe_fetch import safe_async_client  # #2912
+            async with safe_async_client(timeout=10) as client:
                 response = await client.head(uri)
 
                 if response.status_code != 200:
@@ -690,7 +691,8 @@ class KnowledgeGraphPipeline:
             # Download FULL image for comprehensive vision analysis
             print(f"  🖼️  Downloading full image for vision analysis: {uri}")
 
-            async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            from storage.safe_fetch import safe_async_client  # #2912
+            async with safe_async_client(timeout=30) as client:
                 response = await client.get(uri)
                 if response.status_code != 200:
                     print(f"  ⚠️  Failed to download full image: {uri} (status: {response.status_code})")
