@@ -1424,7 +1424,15 @@ async def enqueue_ai_safety_and_transcoding(storage_obj, db=None, skip_ai_safety
     ctx = (storage_obj.context or "").lower()
     mime_lc = (storage_obj.mime_type or "").lower()
     fname_lc = (storage_obj.original_filename or "").lower()
-    is_markup = (
+    # #2916: the context and the file name are chosen by the uploader, so
+    # they may only bypass the check for content that is not media or an
+    # active document. Before, context="template" let an image, video or HTML
+    # file skip the safety check and be marked safe.
+    _media_or_active = (
+        mime_lc.startswith(("image/", "video/", "audio/"))
+        or mime_lc in ("text/html", "application/xhtml+xml", "application/javascript", "text/javascript")
+    )
+    is_markup = not _media_or_active and (
         ctx in SAFETY_BYPASS_CONTEXTS
         or mime_lc in SAFETY_BYPASS_MIMES
         or fname_lc.endswith((".md", ".markdown", ".json", ".yaml", ".yml", ".xml", ".toml", ".csv"))
