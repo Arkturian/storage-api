@@ -470,3 +470,7 @@ class _MediaFilenameAlias:
 
 # Added last = outermost, so the HEAD middleware and the router see the bare id.
 app.add_middleware(_MediaFilenameAlias)
+
+# #2916: sandbox active documents (HTML/SVG/XML/JS) wherever they are served.
+from storage.active_content import ActiveContentGuard  # noqa: E402
+app.add_middleware(ActiveContentGuard)

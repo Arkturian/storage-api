@@ -114,6 +114,11 @@ def build_storage_urls(
     }
 
 
+def _trusted_hosts() -> set:
+    raw = os.getenv("STORAGE_TRUSTED_HOSTS", "")
+    return {h.strip().lower() for h in raw.split(",") if h.strip()}
+
+
 def get_base_url_from_request(request: Request) -> str:
     """
     Extract base URL from FastAPI request.
@@ -136,8 +141,20 @@ def get_base_url_from_request(request: Request) -> str:
 
     if forwarded_proto:
         scheme = forwarded_proto
+    # #2916: X-Forwarded-Host is client-controlled unless a proxy overwrites
+    # it, and the result ends up in signed links (/storage/sign) and other
+    # absolute URLs. Use it only when it names the same host as Host or is in
+    # STORAGE_TRUSTED_HOSTS. With STORAGE_TRUSTED_HOSTS set, a host outside the
+    # list falls back to STORAGE_BASE_URL.
+    trusted = _trusted_hosts()
     if forwarded_host:
-        host = forwarded_host
+        fh = forwarded_host.split(",")[0].strip()
+        if fh.lower() == (host or "").lower() or fh.lower() in trusted:
+            host = fh
+    if trusted and (host or "").strip().lower() not in trusted:
+        fallback = os.getenv("STORAGE_BASE_URL", "").rstrip("/")
+        if fallback:
+            return fallback
 
     # Clean scheme: remove any trailing slashes, backslashes, or colons
     if scheme:
