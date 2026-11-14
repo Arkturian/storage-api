@@ -799,9 +799,12 @@ def get_media_cache_status(
     include_original: bool = Query(True, description="Include original file status"),
     reuse_existing: bool = Form(False),
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    current_user: User = Depends(get_current_user),
     tenant_id: Optional[str] = Depends(get_tenant_id_optional),
 ):
+    # #2914: key required; per object the caller must be allowed to see it,
+    # and server paths are shown to operators only.
+    show_paths = _is_privileged_admin(current_user, db)
     unique_ids = list(dict.fromkeys(int(oid) for oid in object_ids if int(oid) > 0))
     if not unique_ids:
         raise HTTPException(status_code=400, detail="No valid object IDs provided")
@@ -843,15 +846,20 @@ def get_media_cache_status(
             )
             continue
 
-        if tenant_id and record.tenant_id and record.tenant_id != tenant_id:
+        try:
+            _check_media_access(record, current_user, db)
+            _allowed = show_paths or not (tenant_id and record.tenant_id and record.tenant_id != tenant_id)
+        except HTTPException:
+            _allowed = False
+        if not _allowed:
             response.append(
                 MediaCacheStatus(
                     object_id=object_id,
-                    tenant_id=record.tenant_id,
+                    tenant_id=None,
                     original_exists=False,
                     original_path=None,
                     derivatives=[],
-                    message="Object belongs to different tenant",
+                    message="Object not found",
                 )
             )
             continue
@@ -892,7 +900,7 @@ def get_media_cache_status(
                     format=image_format.lower(),
                     exists=exists,
                     size_bytes=size_bytes,
-                    path=resolved_path,
+                    path=resolved_path if show_paths else None,
                     mtime=mtime_iso,
                 )
             )
@@ -915,7 +923,7 @@ def get_media_cache_status(
                 object_id=object_id,
                 tenant_id=record.tenant_id,
                 original_exists=original_exists,
-                original_path=original_path,
+                original_path=original_path if show_paths else None,
                 derivatives=derivatives,
                 message=message,
             )
@@ -928,7 +936,7 @@ def get_media_cache_status(
 def clear_media_cache(
     object_ids: List[int] = Query(..., alias="object_id", description="List of storage object IDs to clear cache for"),
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    current_user: User = Depends(get_current_user),
     tenant_id: Optional[str] = Depends(get_tenant_id_optional),
 ):
     """
@@ -972,14 +980,17 @@ def clear_media_cache(
                 failed += 1
                 continue
 
-            # Check tenant access
-            if tenant_id and record.tenant_id and record.tenant_id != tenant_id:
+            # #2914: deleting derivatives is a write -> owner or operator only.
+            if not (
+                getattr(record, "owner_user_id", None) == getattr(current_user, "id", None)
+                or _is_privileged_admin(current_user, db)
+            ):
                 results.append(
                     CacheClearResult(
                         object_id=object_id,
                         success=False,
                         files_deleted=0,
-                        message="Object belongs to different tenant",
+                        message="Object not found",
                     )
                 )
                 failed += 1
@@ -5144,6 +5155,7 @@ def get_media_trim_bounds(
 
     if not obj:
         raise HTTPException(status_code=404, detail="Storage object not found")
+    _check_media_access(obj, current_user, db)  # #2914
 
     # Check permissions
     # Tenant ownership is resolved from the API key by the dedicated tenancy
@@ -5277,7 +5289,9 @@ def _focal_access_check(object_id: int, db: Session, current_user: Optional[User
     obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Storage object not found")
-    # Same safety gate as the media endpoint (451 if quarantined, owner/admin bypass).
+    # Same gates as the media endpoint: who may see it (#2914), then the
+    # safety verdict (451 if quarantined, owner/admin bypass).
+    _check_media_access(obj, current_user, db)
     _check_quarantine(obj, current_user, db)
     mime = (obj.mime_type or "").lower()
     if not mime.startswith("image/"):
@@ -5513,7 +5527,8 @@ def get_batch_trim_bounds(
 
     Example: /storage/media/batch/trim-bounds?id=1763&id=3571&id=4200
     """
-    tenant = current_user.tenant_id if current_user else "public"
+    # #2914: the old first line read current_user.tenant_id (no such column)
+    # and 500ed for every authenticated caller.
     objects = db.query(StorageObject).filter(
         StorageObject.id.in_(object_ids)
     ).all()
@@ -5521,6 +5536,10 @@ def get_batch_trim_bounds(
     results: Dict[str, Any] = {}
 
     for obj in objects:
+        try:
+            _check_media_access(obj, current_user, db)  # #2914
+        except HTTPException:
+            continue
         # Skip non-images
         if not (obj.mime_type or "").startswith("image/"):
             continue
@@ -6122,22 +6141,28 @@ def download_file(
     return FileResponse(path, media_type=obj.mime_type, headers={"Content-Disposition": "inline"})
 
 
-@router.post("/objects/{object_id}/like", response_model=StorageObjectResponse)
+@router.post("/objects/{object_id}/like")
 def like_object(
     object_id: int,
     db: Session = Depends(get_db),
     tenant_id: str = Depends(get_tenant_id),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
+    """#2914: only objects the caller may see, and only the counter comes back
+    (it used to return the full object incl. ai_context_metadata, paths, GPS)."""
     obj = db.query(StorageObject).filter(
         StorageObject.id == object_id,
         StorageObject.tenant_id == tenant_id
     ).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Not found")
+    try:
+        _check_media_access(obj, current_user, db)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Not found")
     obj.likes = (obj.likes or 0) + 1
     db.commit()
-    db.refresh(obj)
-    return StorageObjectResponse.from_orm(obj)
+    return {"id": obj.id, "likes": obj.likes}
 
 
 def _perform_delete(object_id: int, db: Session, owner_user_id: int, is_admin: bool = False) -> dict:
