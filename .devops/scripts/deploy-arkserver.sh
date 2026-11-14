@@ -159,6 +159,13 @@ for line in "${changes[@]}"; do
     tests/*|docs/*|.github/*|.devops/*|devops|*.md|.gitignore|.env*.example) continue ;;
     requirements.txt) die "requirements.txt changed — LIVE keeps a deliberate local-path difference; deploy that by hand" ;;
   esac
+  # A deletion whose file is already gone from LIVE needs no decision any more
+  # (e.g. tenant_config.json, removed by hand with a backup for #2911). Any
+  # deletion of a file that still exists in LIVE stays a manual decision.
+  if [[ "$status" == "D" && ! -e "$LIVE/$path" ]]; then
+    echo "  $path: deleted in this release and already absent in LIVE — nothing to do"
+    continue
+  fi
   [[ "$status" == "M" || "$status" == "A" ]] || die "$status $path — deletions need a manual decision"
   files+=("$path")
 done
