@@ -25,6 +25,43 @@ QUEUE_FILE = os.getenv("AI_QUEUE_FILE", "/var/log/ai_analysis_queue.txt")
 LOG_FILE = "/var/log/ai_worker.log"
 
 
+def _validated_content_path(object_id: int, candidate: Path) -> Path:
+    """Only read what belongs to this object (#2913).
+
+    The queue file is a plain text channel; whoever can write a line used to
+    make this worker (running as root) read any file and copy its content
+    into ai_context_metadata. A queued path is accepted only if it is the
+    object's own stored file, or its scratch dir ai_thumbs_<id>/ai_images_<id>
+    directly under AI_SCRATCH_DIR, after resolving symlinks.
+    """
+    from storage.service import generic_storage
+
+    try:
+        real = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError(f"content path does not exist for object {object_id}")
+
+    db = next(get_db())
+    try:
+        obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
+        if not obj:
+            raise ValueError(f"object {object_id} not found")
+        own = generic_storage.absolute_path_for_key(obj.object_key, obj.tenant_id or "arkturian")
+    finally:
+        db.close()
+
+    try:
+        if real == Path(own).resolve(strict=True):
+            return real
+    except (OSError, RuntimeError):
+        pass
+
+    scratch = Path(os.getenv("AI_SCRATCH_DIR", "/var/lib/storage-api/tmp-ai")).resolve()
+    if real.parent == scratch and real.name in (f"ai_thumbs_{object_id}", f"ai_images_{object_id}"):
+        return real
+    raise ValueError(f"content path not allowed for object {object_id}")
+
+
 def log(message: str):
     """Log to both stdout and log file"""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -343,7 +380,7 @@ async def process_job_async(job_line: str):
         object_id_str, job_type, content_path_str, filename = job_line.split("|", 3)
         object_id = int(object_id_str.strip())
         job_type = job_type.strip()
-        content_path = Path(content_path_str.strip())
+        content_path = _validated_content_path(object_id, Path(content_path_str.strip()))
         filename = filename.strip()
         
         log(f"Worker found job: {object_id} | {job_type} | {filename}")
