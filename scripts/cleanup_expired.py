@@ -63,7 +63,11 @@ def _full_delete(db, obj: StorageObject):
     # 1. Cascade delete linked children
     linked_children = (
         db.query(StorageObject)
-        .filter(StorageObject.link_id == str(obj.id))
+        .filter(
+            StorageObject.link_id == str(obj.id),
+            StorageObject.owner_user_id == obj.owner_user_id,  # #2915
+            StorageObject.tenant_id == obj.tenant_id,
+        )
         .all()
     )
     for child in linked_children:

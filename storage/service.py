@@ -1181,6 +1181,16 @@ def bulk_delete_objects(
     from models import StorageObject, User
     import shutil
 
+    # #2915: only an operator may delete across owners; everyone else only
+    # their own objects. Tenant keys carry trust_level=admin in the DB and
+    # used to skip the owner filter entirely (cross-tenant mass delete).
+    from auth import is_privileged_admin
+    privileged = is_privileged_admin(current_user, db)
+    if current_user is None:
+        return 0
+    if not (name or collection_like or context_like):
+        raise ValueError("at least one filter (name, collection_like, context_like) is required")
+
     # Step 1: Find initial objects based on filters
     q = db.query(StorageObject)
     if collection_like:
@@ -1193,7 +1203,7 @@ def bulk_delete_objects(
     if tenant_id:
         q = q.filter(StorageObject.tenant_id == tenant_id)
 
-    if current_user and current_user.trust_level != "admin" and not tenant_id:
+    if not privileged:
         q = q.filter(StorageObject.owner_user_id == current_user.id)
 
     initial_objects = q.all()
@@ -1206,9 +1216,12 @@ def bulk_delete_objects(
     # Step 3: Find all objects that share those link_ids
     all_objects_to_delete_map = {obj.id: obj for obj in initial_objects}
     if link_ids_to_find:
+        # #2915: a shared link_id never reaches across owner or tenant.
+        owner_tenant = {(o.owner_user_id, o.tenant_id) for o in initial_objects}
         linked_objects = db.query(StorageObject).filter(StorageObject.link_id.in_(link_ids_to_find)).all()
         for obj in linked_objects:
-            all_objects_to_delete_map[obj.id] = obj # Use map to ensure uniqueness
+            if (obj.owner_user_id, obj.tenant_id) in owner_tenant:
+                all_objects_to_delete_map[obj.id] = obj # Use map to ensure uniqueness
 
     final_objects_to_delete = list(all_objects_to_delete_map.values())
     

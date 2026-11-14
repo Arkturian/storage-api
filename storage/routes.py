@@ -1802,8 +1802,10 @@ def bulk_delete_filtered_objects(
             current_user=current_user
         )
         return {"deleted_count": deleted_count, "message": f"{deleted_count} items deleted successfully."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="bulk delete failed")
 
 
 @router.post("/admin/clean-tenant")
@@ -2754,6 +2756,15 @@ async def upload_file(
             original_video = db.query(StorageObject).filter(StorageObject.id == reference_id_int).first()
             if not original_video:
                 raise HTTPException(status_code=404, detail=f"Original video {reference_id} not found")
+            # #2915: an HLS result may only be attached by the video's owner or
+            # an operator (the transcoding service uploads with the master key).
+            # Before, any authenticated key could overwrite a foreign tenant's
+            # HLS directory and hls_url.
+            if not (
+                getattr(current_user, "id", None) == original_video.owner_user_id
+                or _is_privileged_admin(current_user, db)
+            ):
+                raise HTTPException(status_code=404, detail=f"Original video {reference_id} not found")
 
             # Use tenant and owner from original video
             tenant_id = original_video.tenant_id
@@ -2803,6 +2814,8 @@ async def upload_file(
                 candidate = q.order_by(StorageObject.created_at.desc()).first()
                 if candidate:
                     reference_id = str(candidate.id)
+                    reference_id_int = candidate.id
+                    original_video = candidate
                     print(f"📦 Auto-resolved original video by {'link_id' if link_id else 'owner'}: {reference_id}")
             except Exception as _e:
                 print(f"📦 WARN: Auto-resolve original video failed: {_e}")
@@ -6204,8 +6217,13 @@ def _perform_delete(object_id: int, db: Session, owner_user_id: int, is_admin: b
         print(f"Error cleaning transcoding queue: {e}")
 
     # CASCADE DELETE: Find and delete all linked child objects
+    # #2915: link_id children of the same owner and tenant only. Anyone could
+    # set link_id=<foreign id> on their own upload; the reverse direction (a
+    # foreign child of my object) must not be deleted with mine either.
     linked_children = db.query(StorageObject).filter(
-        StorageObject.link_id == str(obj.id)
+        StorageObject.link_id == str(obj.id),
+        StorageObject.owner_user_id == obj.owner_user_id,
+        StorageObject.tenant_id == obj.tenant_id,
     ).all()
 
     if linked_children:
@@ -6509,6 +6527,18 @@ async def update_object_metadata(
         raise HTTPException(status_code=404, detail="Not found or forbidden")
 
     update_data = payload.dict(exclude_unset=True)
+
+    # #2915: the safety verdict is set by the pipeline, not by the uploader.
+    # Writing ai_safety_rating="safe" or a new safety_info lifted a 451
+    # quarantine on one's own flagged file. Operators may still correct it.
+    _SAFETY_FIELDS = ("ai_safety_rating", "safety_info")
+    if any(f in update_data for f in _SAFETY_FIELDS) and not (
+        _is_privileged_admin(current_user, db) and not _is_public_default_master(current_user)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "safety fields are set by the safety pipeline", "code": "safety_fields_read_only"},
+        )
 
     # Check if ai_context_metadata is being updated
     ai_metadata_updated = "ai_context_metadata" in update_data
@@ -6987,6 +7017,12 @@ async def get_task_status(
 
     if not task_info:
         raise HTTPException(status_code=404, detail="Task not found")
+    # #2915: only tasks of the caller's own objects (operators see all).
+    if not _is_privileged_admin(current_user, db):
+        _oid = task_info.get("object_id") if isinstance(task_info, dict) else None
+        _obj = db.query(StorageObject).filter(StorageObject.id == _oid).first() if _oid else None
+        if not _obj or _obj.owner_user_id != current_user.id:
+            raise HTTPException(status_code=404, detail="Task not found")
 
     return task_info
 
@@ -7010,6 +7046,15 @@ async def list_tasks(
     from storage.async_pipeline import pipeline_manager
 
     tasks = pipeline_manager.get_all_tasks(db, limit=limit, object_id=object_id)
+    # #2915: non-operators see only tasks of their own objects.
+    if not _is_privileged_admin(current_user, db):
+        _ids = {t.get("object_id") for t in tasks if isinstance(t, dict) and t.get("object_id")}
+        _own = {
+            oid for (oid,) in db.query(StorageObject.id)
+            .filter(StorageObject.id.in_(_ids), StorageObject.owner_user_id == current_user.id)
+            .all()
+        } if _ids else set()
+        tasks = [t for t in tasks if isinstance(t, dict) and t.get("object_id") in _own]
 
     return {
         "tasks": tasks,
@@ -7033,6 +7078,10 @@ async def get_embedding_text(
     ).first()
     
     if not obj:
+        raise HTTPException(status_code=404, detail="Object not found")
+    try:
+        _check_media_access(obj, current_user, db)  # #2915
+    except HTTPException:
         raise HTTPException(status_code=404, detail="Object not found")
     
     metadata = obj.ai_context_metadata or {}
@@ -7112,6 +7161,9 @@ async def update_embedding_text(
     ).first()
 
     if not obj:
+        raise HTTPException(status_code=404, detail="Object not found")
+    # #2915: rewriting the search embedding is an owner/operator action.
+    if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=404, detail="Object not found")
 
     new_text = request.get("embedding_text", "").strip()
