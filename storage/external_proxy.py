@@ -229,6 +229,14 @@ async def fetch_external_file(uri: str, use_cache: bool = True) -> Tuple[bytes, 
     Raises:
         httpx.HTTPError: If fetch fails
     """
+    # #2912: reject bad URLs before the cache, so an entry cached before the
+    # fix (e.g. a loopback URL) can never be served again.
+    from storage.safe_fetch import check_url, resolve_public
+    from urllib.parse import urlsplit as _us
+    check_url(uri)
+    _p = _us(uri)
+    resolve_public(_p.hostname, _p.port or (443 if _p.scheme == "https" else 80))
+
     # Try cache first
     if use_cache:
         cached = external_cache.get_from_cache(uri)
@@ -238,7 +246,9 @@ async def fetch_external_file(uri: str, use_cache: bool = True) -> Tuple[bytes, 
     # Fetch from external source
     print(f"🌐 Fetching external URI: {uri[:80]}...")
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+    # #2912: user-supplied URL -> public addresses only, checked per hop.
+    from storage.safe_fetch import safe_async_client
+    async with safe_async_client(timeout=30) as client:
         # Stream + size-guard: never pull an oversized ref fully into RAM. Reject
         # via Content-Length up front, and hard-stop the stream if a server omits
         # or understates it (2026-07-10: 19 GB ZIPs mislabeled as images OOM-killed

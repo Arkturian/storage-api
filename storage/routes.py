@@ -361,7 +361,8 @@ def _resolve_storage_object_path(obj: Any, refresh: bool = False) -> Path:
             _evict_share_proxy_cache(cache_dir)
             tmp_file = cache_dir / f"obj_{obj.id}.part"
             try:
-                with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+                from storage.safe_fetch import safe_client  # #2912
+                with safe_client(timeout=30.0) as client:
                     with client.stream("GET", obj.external_uri) as response:
                         if response.status_code != 200:
                             raise HTTPException(
@@ -3144,7 +3145,9 @@ async def fetch_and_store_remote(
 
     # Download the remote file
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as client:
+        from storage.safe_fetch import check_url, safe_async_client  # #2912
+        check_url(payload.url)
+        async with safe_async_client(timeout=20.0) as client:
             # Many CDNs (e.g., Wikimedia) require a proper User-Agent and may return errors for missing headers
             request_headers = {
                 "User-Agent": "3DPresenter/1.0 (+https://arkturian.com; contact: support@arkturian.com)",
@@ -3320,6 +3323,9 @@ async def fetch_and_store_remote(
     except HTTPException:
         raise
     except Exception as e:
+        from storage.safe_fetch import OutboundBlocked
+        if isinstance(e, OutboundBlocked) or isinstance(getattr(e, "__cause__", None), OutboundBlocked):
+            raise HTTPException(status_code=400, detail={"error": "url not allowed", "code": "outbound_blocked"})
         raise HTTPException(status_code=500, detail=f"Fetch-and-store failed: {str(e)}")
 
 @router.post("/objects/{object_id}/analyze", response_model=StorageObjectResponse)
@@ -5568,9 +5574,16 @@ def get_batch_trim_bounds(
     }
 
 
+_PROXY_SAFE_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+    "X-Content-Type-Options": "nosniff",
+}
+
+
 @router.get("/proxy")
 async def proxy_external_image(
     url: str = Query(..., description="External image URL to proxy"),
+    current_user: User = Depends(get_current_user),
     width: Optional[int] = Query(None, ge=1, description="Target width in pixels"),
     height: Optional[int] = Query(None, ge=1, description="Target height in pixels"),
     format: Optional[str] = Query(None, description="Output format: jpg | png | webp"),
@@ -5595,16 +5608,20 @@ async def proxy_external_image(
         # Determine source format from content-type
         content_type = metadata.get('content-type', 'image/jpeg')
         
-        # If no transformations requested, return original
-        if not width and not height and not format and not quality:
-            return Response(content=data, media_type=content_type)
-        
-        # Apply transformations using PIL
-        from PIL import Image
+        # #2912: never pass the remote body through. It is always decoded as a
+        # raster image and re-encoded, so no HTML/SVG/JS can be served from
+        # this origin, whatever Content-Type the remote claims.
+        from PIL import Image, UnidentifiedImageError
         from io import BytesIO
-        
-        # Load image
-        img = Image.open(BytesIO(data))
+
+        try:
+            img = Image.open(BytesIO(data))
+            img.load()
+        except (UnidentifiedImageError, OSError, ValueError):
+            raise HTTPException(status_code=415, detail={"error": "not a raster image", "code": "proxy_not_image"})
+        if not format:
+            src = (img.format or "").upper()
+            format = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp"}.get(src, "webp")
         
         # Resize if requested
         if width or height:
@@ -5650,12 +5667,17 @@ async def proxy_external_image(
         img.save(output, format=pil_format, **save_kwargs)
         output.seek(0)
         
-        return Response(content=output.read(), media_type=media_type)
-        
+        return Response(content=output.read(), media_type=media_type, headers=_PROXY_SAFE_HEADERS)
+
+    except HTTPException:
+        raise
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch external URL: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Image processing failed: {str(e)}")
+        from storage.safe_fetch import OutboundBlocked
+        if isinstance(e, OutboundBlocked):
+            raise HTTPException(status_code=400, detail={"error": "url not allowed", "code": "outbound_blocked"})
+        raise HTTPException(status_code=502, detail="Failed to fetch external URL")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Image processing failed")
 
 
 def _anon_hidden_collections() -> List[str]:
