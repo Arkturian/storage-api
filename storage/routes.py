@@ -8,6 +8,7 @@ from typing import Optional, List, Any, Dict, Tuple
 import json
 import os
 import re
+import hmac
 import time
 import shutil
 import hashlib
@@ -7298,7 +7299,57 @@ async def get_object_data_uri(
     }
 
 
-@router.post("/transcode/callback")
+_TRANSCODE_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_TRANSCODE_ACTIVE_STATES = {"queued", "processing"}
+
+
+def _transcode_output_roots() -> List[Path]:
+    """Directories a transcoding callback may point output_dir into (#2910)."""
+    raw = os.getenv(
+        "TRANSCODE_CALLBACK_OUTPUT_ROOTS",
+        os.pathsep.join(["/var/code/transcoding_work", "/var/lib/transcoding-api/work"]),
+    )
+    return [Path(p.strip()) for p in raw.split(os.pathsep) if p.strip()]
+
+
+def _require_transcode_callback_secret(
+    x_transcode_callback_secret: Optional[str] = Header(None),
+) -> None:
+    """Shared secret for /storage/transcode/callback (#2910).
+
+    Fail-closed: without TRANSCODE_CALLBACK_SECRET configured the endpoint is
+    disabled. No component in the federation sends this callback today (the
+    transcoding API's notify_server() is a no-op), so disabled is the safe
+    default rather than an outage.
+    """
+    expected = os.getenv("TRANSCODE_CALLBACK_SECRET", "")
+    if not expected:
+        raise HTTPException(status_code=403, detail="transcode_callback_disabled")
+    if not x_transcode_callback_secret or not hmac.compare_digest(
+        x_transcode_callback_secret.encode(), expected.encode()
+    ):
+        raise HTTPException(status_code=401, detail="transcode_callback_secret_invalid")
+
+
+def _resolve_callback_output_dir(output_dir: str) -> Path:
+    """output_dir must be an existing directory strictly below an allowed root."""
+    try:
+        real = Path(output_dir).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=400, detail="output_dir_not_found")
+    if not real.is_dir():
+        raise HTTPException(status_code=400, detail="output_dir_not_a_directory")
+    for root in _transcode_output_roots():
+        try:
+            root_real = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if real != root_real and real.is_relative_to(root_real):
+            return real
+    raise HTTPException(status_code=403, detail="output_dir_not_allowed")
+
+
+@router.post("/transcode/callback", dependencies=[Depends(_require_transcode_callback_secret)])
 async def transcoding_callback(
     job_id: str = Body(...),
     status: str = Body(...),
@@ -7308,102 +7359,88 @@ async def transcoding_callback(
     db: Session = Depends(get_db)
 ):
     """
-    Callback endpoint for transcoding API to report job completion
+    Callback endpoint for transcoding API to report job completion.
+
+    #2910: requires X-Transcode-Callback-Secret, accepts only objects that are
+    actually being transcoded, copies HLS output only from a directory below
+    TRANSCODE_CALLBACK_OUTPUT_ROOTS and never deletes anything outside it.
     """
+    if not _TRANSCODE_JOB_ID_RE.fullmatch(job_id or ""):
+        raise HTTPException(status_code=400, detail="invalid_job_id")
+    if status not in ("completed", "failed", "processing", "queued"):
+        raise HTTPException(status_code=400, detail="invalid_status")
     print(f"📨 Transcoding callback: job_id={job_id}, status={status}, storage_object_id={storage_object_id}, output_dir={output_dir}")
-    
+
+    storage_obj = db.query(StorageObject).filter(StorageObject.id == storage_object_id).first()
+    if not storage_obj:
+        raise HTTPException(status_code=404, detail="Storage object not found")
+    if (storage_obj.transcoding_status or "") not in _TRANSCODE_ACTIVE_STATES:
+        raise HTTPException(status_code=409, detail="object_not_transcoding")
+
+    temp_output = None
+    if status == "completed" and output_dir:
+        temp_output = _resolve_callback_output_dir(output_dir)
+
     try:
-        # Get storage object
-        storage_obj = db.query(StorageObject).filter(StorageObject.id == storage_object_id).first()
-        
-        if not storage_obj:
-            print(f"⚠️  Storage object {storage_object_id} not found")
-            raise HTTPException(status_code=404, detail="Storage object not found")
-        
-        # Update transcoding status
         if status == "completed":
             storage_obj.transcoding_status = "completed"
             storage_obj.transcoding_progress = 100
             storage_obj.transcoding_error = None
 
-            # Copy HLS files from temp directory to storage and set hls_url
-            if output_dir:
+            if temp_output is not None:
+                import shutil
+                from sqlalchemy.orm.attributes import flag_modified
+                from storage.service import generic_storage
+
+                storage_file_path = generic_storage.absolute_path_for_key(
+                    storage_obj.object_key,
+                    storage_obj.tenant_id
+                )
+                original_basename = Path(storage_obj.object_key).stem
+                hls_dir = storage_file_path.parent / original_basename
+
+                print(f"📁 Copying HLS files from {temp_output} to {hls_dir}")
+                if hls_dir.exists():
+                    shutil.rmtree(hls_dir)
+                # symlinks=True copies links as links instead of following them
+                # out of the output root.
+                shutil.copytree(temp_output, hls_dir, symlinks=True)
+
+                tenant_id = storage_obj.tenant_id or "arkturian"
+                storage_obj.hls_url = build_hls_url(tenant_id, original_basename)
+
+                # Only the validated output dir itself is removed, never its
+                # parent (#2910: rmtree(parent) could wipe /var/lib/storage-api).
                 try:
-                    from pathlib import Path
-                    import shutil
-                    from sqlalchemy.orm.attributes import flag_modified
-                    from storage.service import generic_storage
+                    shutil.rmtree(temp_output)
+                except Exception as cleanup_error:
+                    print(f"⚠️  Could not cleanup output dir: {cleanup_error}")
 
-                    # Get the storage file path and create HLS directory
-                    storage_file_path = generic_storage.absolute_path_for_key(
-                        storage_obj.object_key,
-                        storage_obj.tenant_id
-                    )
-                    original_basename = Path(storage_obj.object_key).stem
-                    hls_dir = storage_file_path.parent / original_basename
+                if not storage_obj.metadata_json:
+                    storage_obj.metadata_json = {}
+                storage_obj.metadata_json["transcoding_output_dir"] = str(temp_output)
+                storage_obj.metadata_json["transcoding_callback_job_id"] = job_id
+                flag_modified(storage_obj, "metadata_json")
 
-                    # Copy HLS files from temp dir to storage
-                    temp_output = Path(output_dir)
-                    if temp_output.exists():
-                        print(f"📁 Copying HLS files from {temp_output} to {hls_dir}")
-
-                        # Remove old HLS directory if exists
-                        if hls_dir.exists():
-                            shutil.rmtree(hls_dir)
-
-                        # Copy all files
-                        shutil.copytree(temp_output, hls_dir)
-                        print(f"✅ Copied {len(list(hls_dir.glob('*')))} files to {hls_dir}")
-
-                        # Set HLS URL
-                        tenant_id = storage_obj.tenant_id or "arkturian"
-                        hls_url = build_hls_url(tenant_id, original_basename)
-                        storage_obj.hls_url = hls_url
-                        print(f"🎬 HLS URL set: {hls_url}")
-
-                        # Clean up temp directory
-                        try:
-                            shutil.rmtree(temp_output.parent)
-                            print(f"🧹 Cleaned up temp dir: {temp_output.parent}")
-                        except Exception as cleanup_error:
-                            print(f"⚠️  Could not cleanup temp dir: {cleanup_error}")
-                    else:
-                        print(f"⚠️  Output directory not found: {output_dir}")
-
-                    # Save output_dir in metadata for reference
-                    if not storage_obj.metadata_json:
-                        storage_obj.metadata_json = {}
-                    storage_obj.metadata_json["transcoding_output_dir"] = output_dir
-                    flag_modified(storage_obj, "metadata_json")
-
-                except Exception as copy_error:
-                    print(f"❌ Error copying HLS files: {copy_error}")
-                    import traceback
-                    traceback.print_exc()
-
-            print(f"✅ Transcoding completed for storage object {storage_object_id}")
-            
         elif status == "failed":
             storage_obj.transcoding_status = "failed"
-            storage_obj.transcoding_error = error or "Unknown error"
-            print(f"❌ Transcoding failed for storage object {storage_object_id}: {error}")
-            
+            storage_obj.transcoding_error = (error or "Unknown error")[:2000]
         else:
             storage_obj.transcoding_status = status
-            print(f"🔄 Transcoding status updated: {status}")
-        
+
         db.commit()
-        
         return {
             "success": True,
             "message": f"Status updated to {status}",
             "storage_object_id": storage_object_id
         }
-        
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         print(f"❌ Callback error: {str(e)}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="transcode_callback_failed")
 
 
 # ---------------------------------------------------------------------------
