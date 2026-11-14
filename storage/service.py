@@ -1304,7 +1304,7 @@ async def _process_tts_request_from_storage(storage_obj, tts_request):
                 # Google API/SDK. Reuses the same /ai/chatgpt path as the safety
                 # pipeline (subscription-backed, no per-call billing).
                 _ai_api_base = os.getenv("AI_API_BASE_URL", "http://127.0.0.1:8000")
-                _ai_api_key = os.getenv("AI_INTERNAL_API_KEY", "Inetpass1")
+                _ai_api_key = os.getenv("AI_INTERNAL_API_KEY") or settings.API_KEY  # no literal (#2911)
                 image_prompt_request = (
                     "Based on the following dialog, create a short, visually descriptive prompt for a text-to-image AI. "
                     "The prompt should capture the essence and mood of the conversation in a single scene. "
@@ -1330,7 +1330,7 @@ async def _process_tts_request_from_storage(storage_obj, tts_request):
                         link_id=storage_obj.link_id or tts_request.id, 
                         owner_user_id=storage_obj.owner_user_id
                     ),
-                    "Inetpass1", # Internal API Key
+                    settings.API_KEY,  # internal master, no literal (#2911)
                     db_session
                 )
             except Exception as img_e:

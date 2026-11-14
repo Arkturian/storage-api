@@ -3903,38 +3903,11 @@ def _require_bulk_admin(current_user, db) -> None:
 
 
 def _is_privileged_admin(current_user, db) -> bool:
-    """True only for a REAL admin identity — never for a tenant API key.
-
-    auth.py auto-provisions tenant keys with trust_level="admin", and those
-    keys ship inside public browser bundles (3DPresenter, vod, Tscheppa). A
-    logged-out visitor could therefore reach admin-only paths: listing foreign
-    inventory via mine=false, DELETE and PATCH on objects they do not own
-    (Issue #799). Uploading on someone's behalf (owner_email) stays allowed —
-    that is normal tenant work and breaking it would take out real pipelines.
-    """
-    if current_user is None or getattr(current_user, "trust_level", None) != "admin":
-        return False
-    # An impersonated principal (X-On-Behalf-Of) never gets admin-wide powers,
-    # even if that user happens to be an admin — the service key must not be
-    # able to widen its reach by picking a privileged principal.
-    if getattr(current_user, "_storage_on_behalf_of", False):
-        return False
-    cached = getattr(current_user, "_storage_privileged_admin", None)
-    if cached is not None:
-        return cached
-    key = getattr(current_user, "api_key", None)
-    if not key or db is None:
-        return True
-    try:
-        result = not tenant_id_for_api_key(key, db)
-    except Exception:
-        return False
-    # Per-request memo: list/search routes ask once per row (Issue #2282).
-    try:
-        current_user._storage_privileged_admin = result
-    except Exception:
-        pass
-    return result
+    """True only for a REAL admin identity — never for a tenant API key
+    (Issue #799/#2282). Single source of truth lives in auth.py (#2911) so the
+    tenancy/ and admin/ routers apply exactly the same rule."""
+    from auth import is_privileged_admin
+    return is_privileged_admin(current_user, db)
 
 
 def media_repr_etag(obj, **repr_params) -> Optional[str]:

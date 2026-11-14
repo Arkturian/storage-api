@@ -6,10 +6,11 @@ from typing import Optional, List
 from datetime import datetime
 import os
 from database import get_db
-from auth import get_current_user
+from auth import get_current_user, is_privileged_admin
 from models import StorageObject, User
 from pydantic import BaseModel
 from storage.service import generic_storage
+from config import settings
 
 router = APIRouter()
 
@@ -28,7 +29,12 @@ def _admin_keys() -> dict:
             name, key = pair.split(":", 1)
             if key.strip():
                 keys[key.strip()] = name.strip()
-    keys.setdefault(os.getenv("AI_INTERNAL_API_KEY", "Inetpass1"), "master")
+    # #2911: no literal fallback. Unset AI_INTERNAL_API_KEY follows the master
+    # key from settings (same value as before on hosts that never set it, and a
+    # rotation of API_KEY now carries over instead of leaving the old literal).
+    master = os.getenv("AI_INTERNAL_API_KEY") or settings.API_KEY
+    if master:
+        keys.setdefault(master, "master")
     return keys
 
 
@@ -63,7 +69,7 @@ def get_users_with_collections(
     current_user: User = Depends(get_current_user)
 ):
     """Get all users who have collections in storage"""
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
     
     # Query users who have storage objects with collection_id, grouped by tenant
@@ -103,7 +109,7 @@ def get_collections_for_user(
     current_user: User = Depends(get_current_user)
 ):
     """Get collections for a specific user or public collections"""
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
     
     if public_only:
@@ -158,7 +164,7 @@ def search_collections(
     current_user: User = Depends(get_current_user)
 ):
     """Search for collections across all tenants and users by collection name"""
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
 
     # Search for collections with name matching the query (case-insensitive)
@@ -221,7 +227,7 @@ def cleanup_by_collection(
     current_user: User = Depends(get_current_user)
 ):
     """Delete all storage objects within a specific collection"""
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
 
     return purge_objects_by_collection(db, request.collection_id)
@@ -234,7 +240,7 @@ def cleanup_by_user(
     current_user: User = Depends(get_current_user)
 ):
     """Delete all storage objects owned by a specific user"""
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
 
     try:
@@ -250,7 +256,7 @@ def cleanup_by_age(
     current_user: User = Depends(get_current_user)
 ):
     """Delete storage objects older than specified days"""
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
 
     return cleanup_objects_older_than(db, request.days)
@@ -450,7 +456,7 @@ def blast_radius(
     radius = {"asset_id": asset_id, "local": local, "downstream": {}}
     if downstream:
         import httpx
-        key = os.getenv("AI_INTERNAL_API_KEY", "Inetpass1")
+        key = os.getenv("AI_INTERNAL_API_KEY") or settings.API_KEY
         # ARTrack gets its own outbound key (Issue #2385): after the ARTrack
         # master rotation the shared value no longer authenticates there.
         # Same variable as _notify_artrack_storage_deleted in storage/routes.py.

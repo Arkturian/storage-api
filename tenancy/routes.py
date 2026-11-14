@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from auth import get_current_user
+from auth import get_current_user, is_privileged_admin
 from database import get_db
 from models import AsyncTask, StorageObject, Tenant, TenantAPIKey, User
 from storage.service import generic_storage
@@ -58,14 +58,30 @@ class TenantDeleteResponse(BaseModel):
     removed_directories: List[str]
 
 
+def _mask_key(key: str) -> str:
+    """Never return a full API key from a listing (#2911)."""
+    key = str(key or "")
+    return f"{key[:4]}…" if len(key) > 8 else "…"
+
+
+def _masked(mapping: Dict[str, str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for key, tenant in mapping.items():
+        label = _mask_key(key)
+        while label in out:
+            label += "·"
+        out[label] = tenant
+    return out
+
+
 @router.get("/keys")
 def list_keys(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, str]:
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
-    return list_tenant_keys(db)
+    return _masked(list_tenant_keys(db))
 
 
 @router.post("/keys")
@@ -74,9 +90,9 @@ def upsert_key(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, str]:
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
-    return upsert_tenant_key(req.api_key, req.tenant_id, db=db)
+    return _masked(upsert_tenant_key(req.api_key, req.tenant_id, db=db))
 
 
 @router.delete("/keys/{key}")
@@ -85,9 +101,9 @@ def delete_key(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, str]:
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
-    return delete_tenant_key(key, db=db)
+    return _masked(delete_tenant_key(key, db=db))
 
 
 @router.get("/status", response_model=TenantStatusResponse)
@@ -95,7 +111,7 @@ def tenant_status(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TenantStatusResponse:
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
 
     rows = (
@@ -160,7 +176,7 @@ def create_tenant(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TenantCreateResponse:
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
 
     tenant_id = (req.tenant_id or "").strip()
@@ -208,7 +224,7 @@ def delete_tenant(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TenantDeleteResponse:
-    if current_user.trust_level != "admin":
+    if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
 
     tenant_id = tenant_id.strip().lower()
@@ -251,7 +267,7 @@ def delete_tenant(
         tenant_id=tenant_id,
         deleted_objects=deleted_objects,
         deleted_bytes=deleted_bytes,
-        removed_api_keys=removed_keys,
+        removed_api_keys=[_mask_key(k) for k in removed_keys],
         removed_directories=removed_dirs,
     )
 

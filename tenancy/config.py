@@ -23,10 +23,16 @@ from models import Tenant, TenantAPIKey
 
 TENANT_CONFIG_PATH = Path(os.getenv("TENANT_CONFIG_PATH", "./tenant_config.json"))
 DEFAULT_TENANT_ID = os.getenv("DEFAULT_TENANT_ID", "arkturian")
-_DEFAULT_MAP: Dict[str, str] = {
-    "Inetpass1": "arkturian",
-    "oneal_demo_token": "oneal",  # O'Neal tenant access
-}
+# Tenants that must exist on every instance. No API keys here (#2911): keys
+# live only in tenant_api_keys, and a key an operator deactivated stays
+# deactivated across restarts. (Before, the O'Neal demo token and the master value
+# were hard-coded here and re-activated on every start.)
+_DEFAULT_TENANTS = ("arkturian", "oneal")
+
+# tenant_config.json is a legacy mirror that held every active key in plain
+# text. It is neither written nor imported unless explicitly enabled.
+_LEGACY_SNAPSHOT_ENABLED = os.getenv("TENANT_LEGACY_SNAPSHOT", "0") == "1"
+_LEGACY_IMPORT_ENABLED = os.getenv("TENANT_LEGACY_IMPORT", "0") == "1"
 
 
 def _load_legacy_map() -> Dict[str, str]:
@@ -96,7 +102,11 @@ def _ensure_tenant(
 
 
 def _persist_legacy_snapshot(db: Session) -> None:
-    """Mirror the DB state back into the legacy JSON file (best effort)."""
+    """Mirror the DB state back into the legacy JSON file (best effort).
+
+    Off by default (#2911): it wrote all active keys in plain text."""
+    if not _LEGACY_SNAPSHOT_ENABLED:
+        return
     try:
         mapping = list_tenant_keys(db)
         _write_legacy_map(mapping)
@@ -220,31 +230,14 @@ def bootstrap_tenant_registry() -> None:
     """Ensure default tenants exist and import legacy mappings."""
     session = SessionLocal()
     try:
-        # Seed default tenants/keys
-        for api_key, tenant_id in _DEFAULT_MAP.items():
-            tenant = _ensure_tenant(session, tenant_id, is_system=True)
-            record = (
-                session.query(TenantAPIKey)
-                .filter(TenantAPIKey.api_key == api_key)
-                .one_or_none()
-            )
-            if record:
-                record.tenant_id = tenant_id
-                record.is_active = True
-            else:
-                session.add(
-                    TenantAPIKey(
-                        api_key=api_key,
-                        tenant_id=tenant_id,
-                        label="default",
-                    )
-                )
-            if not tenant.default_api_key:
-                tenant.default_api_key = api_key
+        # Seed default tenants only; never create or re-activate keys (#2911).
+        for tenant_id in _DEFAULT_TENANTS:
+            _ensure_tenant(session, tenant_id, is_system=True)
 
-        # Import from legacy JSON (if present)
-        for api_key, tenant_id in _load_legacy_map().items():
-            upsert_tenant_key(api_key, tenant_id, db=session)
+        # Import from legacy JSON only when explicitly enabled.
+        if _LEGACY_IMPORT_ENABLED:
+            for api_key, tenant_id in _load_legacy_map().items():
+                upsert_tenant_key(api_key, tenant_id, db=session)
 
         session.commit()
         _persist_legacy_snapshot(session)

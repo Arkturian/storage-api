@@ -159,6 +159,18 @@ def resolve_on_behalf_of(api_key: Optional[str], on_behalf: Optional[str], db: S
             status_code=403,
             detail={"error": "X-On-Behalf-Of user unknown", "code": "unknown_principal"},
         )
+    # #2911: never act as an admin or a machine/tenant account. Those carry
+    # trust_level=admin in the DB (system@api, <tenant>@api, <tenant>@system);
+    # impersonating them reached the trust_level-only admin routes.
+    if (
+        getattr(user, "trust_level", None) == "admin"
+        or value.lower() == "system@api"
+        or value.lower().endswith("@api")
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "X-On-Behalf-Of principal not allowed", "code": "principal_not_allowed"},
+        )
     # The acting user must not inherit admin powers from the service key, and an
     # admin principal must not be impersonated into admin-wide operations either.
     setattr(user, _ON_BEHALF_FLAG, True)
@@ -205,3 +217,46 @@ def get_current_user_optional(
 def get_user_by_email(db: Session, email: str) -> Optional[User]:
     """Get user by email"""
     return db.query(User).filter(User.email == email).first()
+
+
+# --- Operator-only routes (#2911) -------------------------------------------
+# A request is a *privileged admin* only when it authenticates with an
+# operator credential: the master key (-> system@api) or a personal admin
+# account key. Tenant keys are auto-provisioned as <tenant>@api users that
+# historically carry trust_level="admin" and ship in public browser bundles,
+# and X-On-Behalf-Of principals never count. tenancy/, admin/ and the admin
+# paths in storage/routes.py all go through this one predicate.
+def is_privileged_admin(current_user, db) -> bool:
+    if current_user is None or getattr(current_user, "trust_level", None) != "admin":
+        return False
+    if getattr(current_user, _ON_BEHALF_FLAG, False):
+        return False
+    cached = getattr(current_user, "_storage_privileged_admin", None)
+    if cached is not None:
+        return cached
+    key = getattr(current_user, "api_key", None)
+    if not key or db is None:
+        # No key to classify -> not provably an operator. Fail closed.
+        return False
+    try:
+        result = not tenant_id_for_api_key(key, db)
+    except Exception:
+        return False
+    try:
+        current_user._storage_privileged_admin = result
+    except Exception:
+        pass
+    return result
+
+
+def require_superadmin(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    """FastAPI dependency: operator credential required (#2911)."""
+    if not is_privileged_admin(current_user, db):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "operator credential required", "code": "superadmin_required"},
+        )
+    return current_user
