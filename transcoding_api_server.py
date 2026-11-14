@@ -4,18 +4,26 @@ Local Transcoding API Server
 FastAPI server that wraps the transcoding package for local FFmpeg transcoding.
 Provides the same API interface as the Mac Transcoding API.
 
-Run with: uvicorn transcoding_api_server:app --host 0.0.0.0 --port 8087
+Run with: uvicorn transcoding_api_server:app --host 127.0.0.1 --port 8087
+
+Security (#2909): every route requires an internal caller (loopback by
+default, or X-Transcoding-Token when TRANSCODING_API_TOKEN is set), and
+uploaded file names are reduced to a basename that provably stays in the
+job directory. Never bind this service to 0.0.0.0 or run it as root.
 """
 
 import asyncio
+import hmac
+import ipaddress
 import logging
+import os
 import uuid
 import zipfile
 from pathlib import Path
 from typing import Dict, Optional
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form
+from fastapi import Depends, FastAPI, HTTPException, File, UploadFile, Form, Request
 from fastapi.responses import FileResponse
 
 # Configure logging at module level
@@ -34,7 +42,47 @@ except ImportError:
     TRANSCODING_AVAILABLE = False
     logging.warning("Transcoding package not available - install with: pip install -e /path/to/mac_transcoding_api")
 
-app = FastAPI(title="Local Transcoding API", version="1.0.0")
+def _safe_basename(name: Optional[str], default: str = "upload.bin") -> str:
+    """Client file name -> one harmless path component (#2909)."""
+    if not name:
+        return default
+    candidate = str(name).replace("\\", "/").split("/")[-1]
+    candidate = "".join(ch for ch in candidate if ch >= " " and ch != "\x7f").strip().lstrip(".")
+    if not candidate or candidate in (".", ".."):
+        return default
+    return candidate[:200]
+
+
+def _safe_child(base: Path, name: Optional[str]) -> Path:
+    base_real = base.resolve(strict=True)
+    target = base_real / _safe_basename(name)
+    if target.is_symlink() or not target.resolve().is_relative_to(base_real):
+        raise HTTPException(status_code=400, detail="invalid_filename")
+    return target
+
+
+def _require_internal_caller(request: Request) -> None:
+    """Loopback only, or X-Transcoding-Token when TRANSCODING_API_TOKEN is set."""
+    token = os.getenv("TRANSCODING_API_TOKEN", "")
+    if token:
+        sent = request.headers.get("x-transcoding-token", "")
+        if sent and hmac.compare_digest(sent.encode(), token.encode()):
+            return
+        raise HTTPException(status_code=401, detail="transcoding_token_required")
+    try:
+        addr = ipaddress.ip_address(request.client.host if request.client else "")
+    except ValueError:
+        raise HTTPException(status_code=403, detail="caller_not_allowed")
+    if addr.is_loopback:
+        return
+    raise HTTPException(status_code=403, detail="caller_not_allowed")
+
+
+app = FastAPI(
+    title="Local Transcoding API",
+    version="1.0.0",
+    dependencies=[Depends(_require_internal_caller)],
+)
 
 # Job storage (in-memory, simple implementation)
 jobs: Dict[str, dict] = {}
@@ -126,7 +174,8 @@ async def transcode(
     temp_dir = Path(f"/tmp/transcode_{job_id}")
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    source_file = temp_dir / file.filename
+    original_filename = _safe_basename(file.filename)
+    source_file = _safe_child(temp_dir, original_filename)
 
     # Write uploaded file
     with open(source_file, "wb") as f:
@@ -142,7 +191,7 @@ async def transcode(
         "progress": 0,
         "message": "Job queued",
         "source_file": str(source_file),
-        "original_filename": file.filename,
+        "original_filename": original_filename,
         "file_size": len(content),
         "started_at": datetime.utcnow().isoformat(),
         "completed_at": None,
@@ -189,7 +238,7 @@ async def transcode(
         return FileResponse(
             path=str(zip_path),
             media_type="application/zip",
-            filename=f"{Path(file.filename).stem}_transcoded.zip",
+            filename=f"{Path(original_filename).stem}_transcoded.zip",
             headers={
                 "X-Job-ID": job_id,
                 "X-Transcoding-Status": job_result["status"],
@@ -334,4 +383,4 @@ if __name__ == "__main__":
     )
 
     # Run server
-    uvicorn.run(app, host="0.0.0.0", port=8087)
+    uvicorn.run(app, host="127.0.0.1", port=8087)

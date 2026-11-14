@@ -4,12 +4,16 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=www-data
+Group=www-data
 WorkingDirectory=/var/www/api-storage.arkturian.com
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/var/www/api-storage.arkturian.com/venv/bin/python -m uvicorn transcoding_api_server:app --host 0.0.0.0 --port 8082
+ExecStart=/var/www/api-storage.arkturian.com/venv/bin/python -m uvicorn transcoding_api_server:app --host 127.0.0.1 --port 8082
 Restart=always
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
 RestartSec=10
 
 # Logging
