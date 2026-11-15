@@ -6547,6 +6547,23 @@ async def update_object_metadata(
             detail={"error": "safety fields are set by the safety pipeline", "code": "safety_fields_read_only"},
         )
 
+    # AP 2.6: private_media is a one-way flag, as at upload. metadata_json is
+    # replaced wholesale here, so a PATCH without the key (or with it false)
+    # used to lift the confidentiality gate in _check_quarantine — the public
+    # default master owns most objects and could do exactly that. Setting it is
+    # allowed; clearing it is not, for anyone. Omitting it keeps it.
+    _old_md = obj.metadata_json if isinstance(obj.metadata_json, dict) else {}
+    if "metadata_json" in update_data and _old_md.get("private_media"):
+        _new_md = update_data["metadata_json"]
+        if isinstance(_new_md, dict) and "private_media" in _new_md and not _new_md.get("private_media"):
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "private_media cannot be removed", "code": "private_media_one_way"},
+            )
+        _new_md = dict(_new_md) if isinstance(_new_md, dict) else {}
+        _new_md["private_media"] = True
+        update_data["metadata_json"] = _new_md
+
     # Check if ai_context_metadata is being updated
     ai_metadata_updated = "ai_context_metadata" in update_data
 

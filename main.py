@@ -474,3 +474,8 @@ app.add_middleware(_MediaFilenameAlias)
 # #2916: sandbox active documents (HTML/SVG/XML/JS) wherever they are served.
 from storage.active_content import ActiveContentGuard  # noqa: E402
 app.add_middleware(ActiveContentGuard)
+
+# AP 2.6 / #1960: count who still sends the built-in default master key, before
+# it loses operator rights. Records peer/UA/path only, never the key.
+from storage.default_master_tally import DefaultMasterTally  # noqa: E402
+app.add_middleware(DefaultMasterTally)

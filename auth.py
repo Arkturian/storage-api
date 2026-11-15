@@ -5,6 +5,10 @@ from datetime import datetime
 import secrets
 import string
 from typing import Optional
+import os
+
+# config.py falls back to this literal when API_KEY is unset; it is public (#1960).
+_BUILTIN_DEFAULT_MASTER = "Inetpass1"
 
 from database import get_db
 import logging
@@ -252,6 +256,19 @@ def is_privileged_admin(current_user, db) -> bool:
         result = tenant_key_state(key, db) is None and not machine_account
     except Exception:
         return False
+    if result and email == "system@api" and settings.API_KEY == _BUILTIN_DEFAULT_MASTER:
+        # AP 2.6 / #1960: while API_KEY is unset, the master is config.py's
+        # publicly known literal, so system@api is whoever read a frontend
+        # bundle. It must not be an operator. Switched by
+        # STORAGE_DEFAULT_MASTER_UNPRIVILEGED until the usage tally
+        # (storage/default_master_tally.py) shows nobody depends on it.
+        try:
+            from storage.default_master_tally import note_privilege_use
+            note_privilege_use()
+        except Exception:
+            pass
+        if os.getenv("STORAGE_DEFAULT_MASTER_UNPRIVILEGED", "0").strip() == "1":
+            result = False
     try:
         current_user._storage_privileged_admin = result
     except Exception:
