@@ -248,6 +248,8 @@ def delete_tenant(
 
     if object_ids:
         db.query(AsyncTask).filter(AsyncTask.object_id.in_(object_ids)).delete(synchronize_session=False)
+        from models import delete_grants_for
+        delete_grants_for(db, object_ids)  # #3031: bulk delete skips the ORM event
         db.query(StorageObject).filter(StorageObject.id.in_(object_ids)).delete(synchronize_session=False)
     db.commit()
 

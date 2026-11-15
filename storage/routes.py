@@ -4373,6 +4373,18 @@ def get_media_variant(
     _check_quarantine(obj, current_user, db, signed=_signed)
     if not _signed:
         _check_media_access(obj, current_user, db)
+    # #3031: ?refresh=true drops every cached derivative and, for GLBs,
+    # triggers a synchronous 3D-API run of up to 300 s. The signature binds
+    # only id:exp:kid, so any public or signed link could force that. Only the
+    # owner or a real operator (never the public default master) may refresh;
+    # for everyone else the flag is ignored. 0 such calls in 14 days of logs.
+    if refresh:
+        _may_refresh = (
+            not _signed and current_user is not None and not _is_public_default_master(current_user)
+            and (getattr(obj, "owner_user_id", None) == current_user.id or _is_privileged_admin(current_user, db))
+        )
+        if not _may_refresh:
+            refresh = False
 
     # OpenCloud reference (#2810): pick up an edit made in OpenCloud (new
     # checksum, so a new ETag, derivatives dropped). A file that is not where

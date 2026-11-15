@@ -1257,6 +1257,8 @@ def bulk_delete_objects(
         except Exception as e:
             print(f"Warning: Could not clean up embeddings: {e}")
 
+        from models import delete_grants_for
+        delete_grants_for(db, object_ids_to_delete)  # #3031: bulk delete skips the ORM event
         db.query(StorageObject).filter(StorageObject.id.in_(object_ids_to_delete)).delete(synchronize_session=False)
         db.commit()
 

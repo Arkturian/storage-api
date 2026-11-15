@@ -348,3 +348,12 @@ def _grants_mit_loeschen(mapper, connection, target):
         _grants_tabelle[key] = _sa_inspect(connection).has_table(MediaGrant.__tablename__)
     if _grants_tabelle[key]:
         connection.execute(MediaGrant.__table__.delete().where(MediaGrant.object_id == target.id))
+
+
+def delete_grants_for(db, object_ids) -> int:
+    """Drop media_grants of objects removed by a bulk Query.delete(), which
+    bypasses the after_delete event above (#3031)."""
+    ids = [int(i) for i in (object_ids or [])]
+    if not ids:
+        return 0
+    return db.query(MediaGrant).filter(MediaGrant.object_id.in_(ids)).delete(synchronize_session=False)
