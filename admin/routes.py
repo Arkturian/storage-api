@@ -33,6 +33,10 @@ def _admin_keys() -> dict:
     # key from settings (same value as before on hosts that never set it, and a
     # rotation of API_KEY now carries over instead of leaving the old literal).
     master = os.getenv("AI_INTERNAL_API_KEY") or settings.API_KEY
+    # AP 2.6 / #3027: the built-in default is public; once the switch is on it
+    # opens no admin route (same switch as auth.is_privileged_admin).
+    if master == "Inetpass1" and os.getenv("STORAGE_DEFAULT_MASTER_UNPRIVILEGED", "0").strip() == "1":
+        master = None
     if master:
         keys.setdefault(master, "master")
     return keys

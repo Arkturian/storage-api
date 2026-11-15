@@ -165,3 +165,17 @@ def test_other_fields_untouched_flag(patch_env):
     r = patch_env.c.patch(f"/storage/objects/{patch_env.priv.id}", json={"title": "x"})
     assert r.status_code == 200
     assert _md(patch_env, patch_env.priv) == {"private_media": True, "note": "a"}
+
+
+def test_admin_key_gate_follows_switch(monkeypatch):
+    from admin import routes as A
+    monkeypatch.delenv("AI_INTERNAL_API_KEY", raising=False)
+    monkeypatch.delenv("ADMIN_API_KEYS", raising=False)
+    monkeypatch.setattr(A.settings, "API_KEY", "Inetpass1")
+    monkeypatch.delenv("STORAGE_DEFAULT_MASTER_UNPRIVILEGED", raising=False)
+    assert A.require_admin_key("Inetpass1") == "master"
+    monkeypatch.setenv("STORAGE_DEFAULT_MASTER_UNPRIVILEGED", "1")
+    with pytest.raises(Exception):
+        A.require_admin_key("Inetpass1")
+    monkeypatch.setattr(A.settings, "API_KEY", "real-secret")
+    assert A.require_admin_key("real-secret") == "master"
