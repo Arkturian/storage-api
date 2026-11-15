@@ -3,7 +3,7 @@ from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Q
 from fastapi.responses import FileResponse
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_, not_
+from sqlalchemy import func, or_, not_, and_
 from typing import Optional, List, Any, Dict, Tuple
 import json
 import os
@@ -1103,17 +1103,11 @@ async def find_similar_objects(
             if _is_privileged_admin(current_user, db):
                 where = None
             else:
-                # Prefer tenant from API key mapping; fallback to email domain
-                tenant_from_key = tenant_id_for_api_key(api_key_header)
-                tenant_email_domain = None
-                if getattr(current_user, "email", None) and "@" in current_user.email:
-                    tenant_email_domain = current_user.email.split("@", 1)[1].strip().lower()
-
-                tenant_scope = tenant_from_key or tenant_email_domain
-                if tenant_scope:
-                    where = {"tenant_id": tenant_scope}
-                else:
-                    where = {"owner_user_id": current_user.id}
+                # The vector collection is already per tenant. Its "tenant_id"
+                # metadata is the owner's e-mail DOMAIN, so filtering on it made
+                # every @gmail.com owner one company (#2998). Narrow candidates
+                # to what the caller may see; the DB row below stays the judge.
+                where = {"$or": [{"owner_user_id": current_user.id}, {"is_public": True}]}
         except Exception:
             where = None
 
@@ -1135,25 +1129,15 @@ async def find_similar_objects(
             StorageObject.tenant_id == tenant_id
         )
 
-        # Enforce access control: owner, public, or same-tenant (API key tenant or email domain); admin bypass
+        # Access control as on /storage/media and /kg/search: owner, public, or
+        # operator. It used to also admit every object whose owner's e-mail
+        # ended in the caller's domain — for @gmail.com that was every private
+        # object of every freemail customer (#2998, Befund 84).
         if not _is_privileged_admin(current_user, db):
-            tenant_domain = None
-            try:
-                if getattr(current_user, "email", None) and "@" in current_user.email:
-                    tenant_domain = current_user.email.split("@", 1)[1].strip().lower()
-            except Exception:
-                tenant_domain = None
-            tenant_from_key = tenant_id_for_api_key(api_key_header)
-            effective_tenant = tenant_from_key or tenant_domain
-
-            filters = [
-                (StorageObject.owner_user_id == current_user.id),
-                (StorageObject.is_public == True),  # noqa: E712
-            ]
-            if effective_tenant:
-                filters.append(func.lower(User.email).like(f"%@{effective_tenant}"))
-
-            base_q = base_q.filter(or_(*filters))
+            base_q = base_q.filter(or_(
+                StorageObject.owner_user_id == current_user.id,
+                StorageObject.is_public.is_(True),
+            ))
 
         rows = base_q.all()
 
@@ -5923,10 +5907,31 @@ def list_objects(
     elif collection_like:
         like = f"%{collection_like}%"
         q = q.filter(StorageObject.collection_id.ilike(like))
-    elif anonymous:
+
+    # Ownership scope. link_id / collection_id / collection_like used to switch
+    # the owner filter off entirely, so any key of the tenant could list every
+    # PRIVATE object of every other owner — ?collection_like=% returned all of
+    # them with filenames, AI metadata, transcripts and the capability hls_url
+    # (#2998, Befund 84). Grouping filters now only widen the view to objects a
+    # stranger could already see: the caller's own rows plus foreign rows that
+    # the anonymous listing above would show as well. Operators keep the full
+    # view, and without a grouping filter mine=false stays operator-only.
+    grouping = bool(link_id or collection_id or collection_like)
+    operator_view = (not anonymous) and _is_privileged_admin(current_user, db)
+    if anonymous:
         pass  # no ownership concept without a key — the public filter above rules
-    elif not mine and _is_privileged_admin(current_user, db):
+    elif operator_view and (grouping or not mine):
         pass
+    elif grouping:
+        foreign_visible = [
+            StorageObject.is_public.is_(True),
+            StorageObject.tombstoned_at.is_(None),
+            func.coalesce(func.json_extract(StorageObject.metadata_json, "$.private_media"), 0) != 1,
+        ]
+        _hidden = _anon_hidden_collections()
+        if _hidden:
+            foreign_visible.append(or_(StorageObject.collection_id.is_(None), ~StorageObject.collection_id.in_(_hidden)))
+        q = q.filter(or_(StorageObject.owner_user_id == current_user.id, and_(*foreign_visible)))
     else:
         q = q.filter(StorageObject.owner_user_id == current_user.id)
 
@@ -6009,7 +6014,9 @@ def list_objects(
             print(f"DEBUG 33648: After from_orm, transcoding_status = {response_obj.transcoding_status}")
         # Add owner_email to the response
         response_obj.owner_email = owner_email
-        if anonymous:
+        # A foreign row reached through a grouping filter is shown as a stranger
+        # sees it — tenant keys ship in browser bundles (#2998).
+        if anonymous or (grouping and not operator_view and storage_obj.owner_user_id != current_user.id):
             _strip_owner_for_anonymous(response_obj)
 
         # Build URLs dynamically based on object ID and current request
