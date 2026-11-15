@@ -30,7 +30,7 @@ def _fake_dns(monkeypatch, mapping):
 
 @pytest.mark.parametrize("ip", ["188.65.73.164", "192.46.232.130", "62.225.187.68",
                                 "::ffff:188.65.73.164", "64:ff9b::bc41:49a4", "2002:bc41:49a4::1",
-                                "2a01:7e01::f03c:94ff:feb3:d807"])
+                                "2a01:7e01::f03c:94ff:feb3:d807", "217.149.167.157", "217.149.160.166"])
 def test_own_node_addresses_blocked(monkeypatch, ip):
     _fake_dns(monkeypatch, {"own.example": [ip]})
     with pytest.raises(SF.OutboundBlocked):
@@ -182,3 +182,9 @@ def test_no_raw_client_on_user_urls(rel):
             # the next lines after a raw client must not fetch a user-supplied URL
             assert not re.search(r"\.(get|head|stream|post)\((\"GET\", )?(obj\.external_uri|external_uri|uri)\b",
                                  window), f"{rel}:{i+1} raw httpx client on a user URL"
+
+
+def test_former_pdrei_address_not_own(monkeypatch):
+    # 172.104.235.73 belongs to someone else since #2595: an ordinary public host
+    _fake_dns(monkeypatch, {"x.example": ["172.104.235.73"]})
+    assert SF.resolve_public("x.example", 443) == ["172.104.235.73"]

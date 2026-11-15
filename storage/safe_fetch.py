@@ -49,9 +49,11 @@ def _extra_allowed_hosts() -> set:
 # Befund 108: our own nodes have PUBLIC addresses, so "globally routable" let
 # a fetch reach this host and its siblings through their public IP (nginx
 # vhosts, services bound to 0.0.0.0). These are refused like loopback.
-_DEFAULT_OWN_IPS = ("188.65.73.164,192.46.232.130,62.225.187.68,62.225.187.66,"
-                    "172.104.235.73,217.149.160.166,"
-                    "2a01:7e01::f03c:94ff:feb3:d807")  # arkturian IPv6 (same list as api-ai, #3033)
+# Same list as api-ai (#3033, Cloud 15.11.): arkserver/mac-NAT, arkturian v4+v6,
+# oneal (.68 and .66), tommy (NAT, both addresses seen). pdrei's old
+# 172.104.235.73 is NOT ours any more (#2595) and must not be listed.
+_DEFAULT_OWN_IPS = ("188.65.73.164,192.46.232.130,2a01:7e01::f03c:94ff:feb3:d807,"
+                    "62.225.187.68,62.225.187.66,217.149.160.166,217.149.167.157")
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 _SIXTOFOUR = ipaddress.ip_network("2002::/16")
 
