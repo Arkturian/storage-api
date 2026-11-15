@@ -4042,7 +4042,7 @@ def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] =
 
 
 def _check_presence_and_privacy(obj, current_user: Optional[User], db: Optional[Session] = None,
-                                signed: bool = False) -> None:
+                                signed: bool = False, metadata: bool = False) -> None:
     """Tombstone, expiry and private_media — the part of the gate every read
     path needs, not only the byte routes (#3029, Befund 104: /objects, HEAD,
     /public and the KG searches checked is_public alone)."""
@@ -4084,7 +4084,11 @@ def _check_presence_and_privacy(obj, current_user: Optional[User], db: Optional[
         # master key is the known default, the system@api identity gets NO bypass
         # for confidential objects. Setting a real API_KEY env var restores it
         # automatically — the restriction is tied to the actual risk condition.
-        if _is_public_default_master(current_user):
+        # metadata=True (GET /objects/{id}): the default master keeps owner
+        # access to the METADATA of its own objects, as before #3029 — the MCP
+        # gateway reads them right after signing (assets_download). Only the
+        # bytes stay closed to it. Lifted by #3027's switch / the key rotation.
+        if _is_public_default_master(current_user) and not metadata:
             _is_admin = False
             _is_owner = False
         # A valid signed link (POST /storage/sign) stands in for the owner:
@@ -5866,7 +5870,7 @@ def get_object_metadata(
     # routes. Until #3029 only anonymous callers were held back from
     # private_media, so any tenant key read OCR, transcripts and hls_url of
     # objects that were is_public=1 and private_media=true.
-    _check_presence_and_privacy(obj, current_user, db)
+    _check_presence_and_privacy(obj, current_user, db, metadata=True)
 
     response_obj = StorageObjectResponse.from_orm(obj)
 

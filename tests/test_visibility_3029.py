@@ -125,3 +125,17 @@ def test_head_checks_tombstone_and_expiry():
 def test_hls_url_uses_object_tenant():
     assert "build_hls_url(storage_obj.tenant_id or tenant_id, basename)" in SRC
     assert "build_hls_url(obj.tenant_id or tenant_id, basename)" in SRC
+
+
+def test_default_master_owner_keeps_metadata_of_private(env, monkeypatch):
+    # regression 15.11.: assets_download reads metadata with the gateway key
+    env.state["user"] = env.owner
+    monkeypatch.setattr(env.R, "_is_public_default_master", lambda u: True)
+    assert env.c.get(f"/storage/objects/{env.o.pub_priv.id}").status_code == 200
+
+
+def test_default_master_still_no_bytes_gate(env, monkeypatch):
+    monkeypatch.setattr(env.R, "_is_public_default_master", lambda u: True)
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException):
+        env.R._check_presence_and_privacy(env.o.pub_priv, env.owner, env.s)
