@@ -929,106 +929,189 @@ def extract_thumbnails_for_ai(video_path: Path, output_dir: Path, n_frames: int 
     return 0 if written > 0 else 1
 
 
+_HLS_REF_RE = re.compile(r"^[A-Za-z0-9._/-]{1,120}\.(m3u8|ts|m4s|mp4)$")
+
+
+def _hls_limits() -> tuple:
+    return (int(os.getenv("STORAGE_HLS_ZIP_MAX_ENTRIES", "20000")),
+            int(os.getenv("STORAGE_HLS_ZIP_MAX_BYTES", str(16 * 1024 ** 3))),
+            int(os.getenv("STORAGE_HLS_ZIP_MAX_RATIO", "200")))
+
+
+def _hls_ref(base: Path, ref: str) -> Optional[Path]:
+    """A playlist line as a file inside base, or None (#3042).
+
+    Lines in master.m3u8 and the variant playlists were joined unchecked
+    (extract_dir / line): a leading "/" or "../" escaped the directory and
+    turned the parser into an existence and line oracle for any file
+    www-data can read."""
+    ref = (ref or "").strip()
+    if not _HLS_REF_RE.fullmatch(ref) or ref.startswith("/") or ".." in ref.split("/"):
+        return None
+    root = base.resolve()
+    cand = base / ref
+    try:
+        if cand.is_symlink():
+            return None
+        resolved = cand.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return resolved
+
+
+def _extract_hls_zip_safely(zip_path: Path, target: Path) -> None:
+    """Stream-extract with entry, byte and ratio budgets; no absolute names,
+    no "..", no symlinks, no special files (#3042: extractall had no limit)."""
+    import stat as _stat
+    import zipfile
+
+    max_entries, max_bytes, max_ratio = _hls_limits()
+    root = target.resolve()
+    written = 0
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        infos = zf.infolist()
+        if len(infos) > max_entries:
+            raise ValueError(f"too many entries in zip ({len(infos)} > {max_entries})")
+        for info in infos:
+            name = info.filename
+            if name.startswith("/") or "\\" in name or ".." in name.split("/") or ":" in name:
+                raise ValueError(f"unsafe entry name: {name!r}")
+            mode = (info.external_attr >> 16) & 0o170000
+            if mode and not (_stat.S_ISREG(mode) or _stat.S_ISDIR(mode)):
+                raise ValueError(f"special file in zip: {name!r}")
+            if info.is_dir():
+                (target / name).mkdir(parents=True, exist_ok=True)
+                continue
+            if info.compress_size and info.file_size / max(info.compress_size, 1) > max_ratio:
+                raise ValueError(f"suspicious compression ratio for {name!r}")
+            dest = (target / name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if not dest.resolve().is_relative_to(root):
+                raise ValueError(f"entry escapes target: {name!r}")
+            with zf.open(info) as src, open(dest, "xb") as out:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise ValueError(f"zip expands beyond {max_bytes} bytes")
+                    out.write(chunk)
+
+
 def validate_and_extract_hls_zip(zip_path: Path, extract_dir: Path) -> dict:
     """
     Validates and extracts a pre-transcoded HLS video zip file.
-    
-    Args:
-        zip_path: Path to the zip file
-        extract_dir: Directory to extract contents to
-        
+
+    Extracts into a staging directory next to extract_dir and validates there.
+    Only a valid result replaces extract_dir, so a broken or hostile ZIP never
+    destroys the video's existing HLS output, and every failure removes the
+    staging directory (#3042).
+
     Returns:
         dict with validation results and metadata
     """
-    import zipfile
-    
+    import uuid
+
+    extract_dir = Path(extract_dir)
+    stage = extract_dir.parent / f".{extract_dir.name}.incoming-{uuid.uuid4().hex[:12]}"
     try:
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        
-        with zipfile.ZipFile(zip_path, 'r') as zip_file:
-            # Extract all files
-            zip_file.extractall(extract_dir)
-            
-            # Check for required HLS files
-            master_m3u8 = extract_dir / "master.m3u8"
-            if not master_m3u8.exists():
-                return {"valid": False, "error": "Missing master.m3u8 file"}
-            
-            # Parse master.m3u8 to find quality streams and extract metadata
-            quality_streams = []
-            ts_files = []
-            max_width = 0
-            max_height = 0
-            max_bitrate = 0
-            duration_seconds = 0.0
-            
-            with open(master_m3u8, 'r') as f:
-                lines = f.readlines()
-                for i, line in enumerate(lines):
-                    if line.startswith('#EXT-X-STREAM-INF:'):
-                        # Extract resolution and bandwidth from stream info
-                        if 'RESOLUTION=' in line:
-                            res_part = line.split('RESOLUTION=')[1].split(',')[0] if ',' in line.split('RESOLUTION=')[1] else line.split('RESOLUTION=')[1]
-                            try:
-                                w, h = map(int, res_part.strip().split('x'))
-                                if w * h > max_width * max_height:
-                                    max_width, max_height = w, h
-                            except:
-                                pass
-                        if 'BANDWIDTH=' in line:
-                            try:
-                                bandwidth = int(line.split('BANDWIDTH=')[1].split(',')[0])
-                                max_bitrate = max(max_bitrate, bandwidth)
-                            except:
-                                pass
-                        # Next line should contain the quality m3u8 file
-                        if i + 1 < len(lines):
-                            quality_file = lines[i + 1].strip()
-                            quality_path = extract_dir / quality_file
-                            if quality_path.exists():
-                                quality_streams.append(quality_file)
-                                
-                                # Parse individual quality m3u8 to find .ts files and extract duration
-                                with open(quality_path, 'r') as qf:
-                                    qlines = qf.readlines()
-                                    for qline in qlines:
-                                        if qline.strip().endswith('.ts'):
-                                            ts_file = qline.strip()
-                                            ts_path = extract_dir / ts_file
-                                            if ts_path.exists():
-                                                ts_files.append(ts_file)
-                                            else:
-                                                return {"valid": False, "error": f"Missing .ts file: {ts_file}"}
-                                        elif qline.startswith('#EXTINF:') and duration_seconds == 0.0:
-                                            # Extract duration from first segment of highest quality stream
-                                            try:
-                                                duration_seconds = float(qline.split('#EXTINF:')[1].split(',')[0])
-                                            except:
-                                                pass
-            
-            if not quality_streams:
-                return {"valid": False, "error": "No valid quality streams found in master.m3u8"}
-            
-            # Calculate total HLS file size
-            total_size = sum(f.stat().st_size for f in extract_dir.glob('*') if f.is_file())
-            
-            # Write size info
-            (extract_dir / "hls_size.txt").write_text(str(total_size))
-            
-            return {
-                "valid": True,
-                "quality_streams": quality_streams,
-                "ts_files": ts_files,
-                "total_size": total_size,
-                "file_count": len(list(extract_dir.glob('*'))),
-                "width": max_width if max_width > 0 else None,
-                "height": max_height if max_height > 0 else None,
-                "duration_seconds": duration_seconds if duration_seconds > 0 else None,
-                "bit_rate": max_bitrate if max_bitrate > 0 else None,
-            }
-            
+        stage.mkdir(parents=True, exist_ok=False)
+        result = _validate_hls_tree(zip_path, stage)
+        if not result.get("valid"):
+            return result
+        if extract_dir.is_symlink():
+            return {"valid": False, "error": "target HLS directory is a symlink"}
+        old = None
+        if extract_dir.exists():
+            old = extract_dir.parent / f".{extract_dir.name}.old-{uuid.uuid4().hex[:12]}"
+            extract_dir.rename(old)
+        stage.rename(extract_dir)
+        if old is not None:
+            shutil.rmtree(old, ignore_errors=True)
+        return result
     except Exception as e:
         return {"valid": False, "error": f"Zip extraction failed: {str(e)}"}
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def _validate_hls_tree(zip_path: Path, extract_dir: Path) -> dict:
+    _extract_hls_zip_safely(zip_path, extract_dir)
+
+    master_m3u8 = extract_dir / "master.m3u8"
+    if master_m3u8.is_symlink() or not master_m3u8.is_file():
+        return {"valid": False, "error": "Missing master.m3u8 file"}
+
+    quality_streams = []
+    ts_files = []
+    max_width = 0
+    max_height = 0
+    max_bitrate = 0
+    duration_seconds = 0.0
+
+    with open(master_m3u8, "r", encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+    for i, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        if "RESOLUTION=" in line:
+            res_part = line.split("RESOLUTION=")[1].split(",")[0]
+            try:
+                w, h = map(int, res_part.strip().split("x"))
+                if w * h > max_width * max_height:
+                    max_width, max_height = w, h
+            except Exception:
+                pass
+        if "BANDWIDTH=" in line:
+            try:
+                max_bitrate = max(max_bitrate, int(line.split("BANDWIDTH=")[1].split(",")[0]))
+            except Exception:
+                pass
+        if i + 1 >= len(lines):
+            continue
+        quality_file = lines[i + 1].strip()
+        quality_path = _hls_ref(extract_dir, quality_file)
+        if quality_path is None:
+            return {"valid": False, "error": f"Invalid playlist reference: {quality_file[:120]!r}"}
+        if not quality_path.is_file():
+            continue
+        quality_streams.append(quality_file)
+        with open(quality_path, "r", encoding="utf-8", errors="replace") as qf:
+            for qline in qf:
+                q = qline.strip()
+                if q.endswith(".ts"):
+                    ts_path = _hls_ref(quality_path.parent, q)
+                    if ts_path is None:
+                        return {"valid": False, "error": f"Invalid segment reference: {q[:120]!r}"}
+                    if not ts_path.is_file():
+                        return {"valid": False, "error": f"Missing .ts file: {q}"}
+                    ts_files.append(q)
+                elif q.startswith("#EXTINF:") and duration_seconds == 0.0:
+                    try:
+                        duration_seconds = float(q.split("#EXTINF:")[1].split(",")[0])
+                    except Exception:
+                        pass
+
+    if not quality_streams:
+        return {"valid": False, "error": "No valid quality streams found in master.m3u8"}
+
+    total_size = sum(f.stat().st_size for f in extract_dir.rglob("*") if f.is_file() and not f.is_symlink())
+    (extract_dir / "hls_size.txt").write_text(str(total_size))
+
+    return {
+        "valid": True,
+        "quality_streams": quality_streams,
+        "ts_files": ts_files,
+        "total_size": total_size,
+        "file_count": len(list(extract_dir.glob("*"))),
+        "width": max_width if max_width > 0 else None,
+        "height": max_height if max_height > 0 else None,
+        "duration_seconds": duration_seconds if duration_seconds > 0 else None,
+        "bit_rate": max_bitrate if max_bitrate > 0 else None,
+    }
 
 
 def _is_audio_only_webm_helper(file_path: Path) -> bool:

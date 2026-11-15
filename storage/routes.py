@@ -2878,6 +2878,7 @@ async def upload_file(
             saved_obj = temp_zip
             
             # Process the HLS ZIP directly (avoid transcoding loop)
+            hls_error = None
             try:
                 from storage.service import validate_and_extract_hls_zip
                 from pathlib import Path
@@ -2954,11 +2955,26 @@ async def upload_file(
                     saved_obj = original_video
                 else:
                     print(f"📦 ERROR: HLS ZIP validation failed: {validation_result}")
-                    saved_obj = temp_zip  # Return temp ZIP if processing failed
-                    
+                    hls_error = validation_result.get("error") or "invalid HLS zip"
+
             except Exception as e:
                 print(f"📦 ERROR processing HLS ZIP: {e}")
-                saved_obj = temp_zip  # Return temp ZIP if processing failed
+                hls_error = "HLS zip processing failed"
+
+            # #3042: a rejected HLS ZIP left the temp object and its file behind.
+            # Clean up and say so; the video's existing HLS output is untouched
+            # (validate_and_extract_hls_zip only swaps in a valid result).
+            if saved_obj is temp_zip:
+                try:
+                    generic_storage.absolute_path_for_key(temp_zip.object_key, temp_zip.tenant_id).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
+                    db.delete(temp_zip)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                raise HTTPException(status_code=422, detail={"error": hls_error or "invalid HLS zip", "code": "hls_invalid"})
                 
             # Return immediately after HLS processing (successful or failed) - avoid normal upload pipeline
             _resp = StorageObjectResponse.from_orm(saved_obj)
