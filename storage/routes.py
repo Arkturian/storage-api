@@ -691,7 +691,38 @@ def build_hls_url(tenant_id: str, basename: str) -> str:
     return f"{vod_base}/media/{tenant_id}/{basename}/master.m3u8"
 
 
-router = APIRouter()
+from storage import grant_restrict as _grant_restrict  # noqa: E402
+
+
+def _grant_restriction_gate(request: Request) -> None:
+    """#3030: under X-Grant-Scope-Restrict, any route on one object
+    (path parameter object_id) answers 404 unless that object is visible to
+    the scope. Signed media reads carry their own proof and pass."""
+    if not _grant_restrict.current_scope():
+        return
+    raw = request.path_params.get("object_id")
+    if raw is None:
+        return
+    try:
+        oid = int(raw)
+    except (TypeError, ValueError):
+        return
+    if request.query_params.get("sig"):
+        return  # verified by the media route itself
+    # Own short-lived session, never Depends(get_db): a router-wide dependency
+    # would hold a pooled session for the whole of every media stream (#2315).
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        obj = db.query(StorageObject).filter(StorageObject.id == oid).first()
+        ok = obj is not None and _grant_restrict.allowed(obj, db)
+    finally:
+        db.close()
+    if not ok:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+router = APIRouter(dependencies=[Depends(_grant_restriction_gate)])
 admin_router = APIRouter(prefix="/admin")
 
 
@@ -3118,6 +3149,7 @@ class RemoteFetchRequest(BaseModel):
     filename: Optional[str] = None
     analyze: bool = False
     grant_scope: Optional[str] = None  # Post 5250: bind the fetched object to this scope
+    private: bool = False  # #3030: metadata_json.private_media at creation, as on /upload
 
 
 @router.post("/fetch", response_model=StorageObjectResponse)
@@ -3247,6 +3279,12 @@ async def fetch_and_store_remote(
             link_id=payload.link_id,
             tenant_id=tenant_id,
         )
+        if payload.private:
+            _mj_f = dict(saved_obj.metadata_json or {})
+            _mj_f["private_media"] = True
+            saved_obj.metadata_json = _mj_f
+            db.commit()
+            db.refresh(saved_obj)
 
         # Attach tenant_id derived from API key for downstream KG processing
         try:
@@ -3512,7 +3550,7 @@ def get_asset_variant_references(
     for obj in results:
         # Enforce access: allow owner, public, or admin
         try:
-            if not (getattr(obj, "is_public", False) or obj.owner_user_id == current_user.id or _is_privileged_admin(current_user, db)):
+            if not _row_visible(obj, current_user, db):
                 continue
         except Exception:
             continue  # fail closed (#2282): an access check that throws must not admit the row
@@ -3658,7 +3696,7 @@ def get_asset_variant_references_batch(
     for obj in results:
         # Enforce access: allow owner, public, or admin
         try:
-            if not (getattr(obj, "is_public", False) or obj.owner_user_id == current_user.id or _is_privileged_admin(current_user, db)):
+            if not _row_visible(obj, current_user, db):
                 continue
         except Exception:
             continue  # fail closed (#2282): an access check that throws must not admit the row
@@ -4048,6 +4086,11 @@ def _check_presence_and_privacy(obj, current_user: Optional[User], db: Optional[
                 status_code=403,
                 detail={"error": "This object is private", "code": "private_media"},
             )
+    # #3030: a request narrowed to one grant scope (MCP gateway, per agent)
+    # sees non-public rows only when they are bound to that scope. A signed
+    # link already proves that binding.
+    if not signed and not _grant_restrict.allowed(obj, db):
+        raise HTTPException(status_code=404, detail="Not found")
 
 
 def _row_visible(obj, current_user: Optional[User], db: Optional[Session] = None) -> bool:
@@ -5972,6 +6015,10 @@ def list_objects(
         q = q.filter(or_(StorageObject.owner_user_id == current_user.id, and_(*foreign_visible)))
     else:
         q = q.filter(StorageObject.owner_user_id == current_user.id)
+
+    _restrict = _grant_restrict.sql_filter(StorageObject, db)
+    if _restrict is not None:
+        q = q.filter(_restrict)
 
     if context:
         q = q.filter(StorageObject.context == context)

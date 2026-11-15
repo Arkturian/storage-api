@@ -243,6 +243,16 @@ async def storage_media_head_headers(request: Request, call_next):
                 db.close()
             if not obj:
                 return Response(status_code=404, headers=_apply_cors_for_head({}, request))
+            # #3030: narrowed to one grant scope, a non-public row needs its grant.
+            from storage import grant_restrict as _gr
+            if _gr.current_scope() and not _head_signed:
+                _db_gr = SessionLocal()
+                try:
+                    _gr_ok = _gr.allowed(obj, _db_gr)
+                finally:
+                    _db_gr.close()
+                if not _gr_ok:
+                    return Response(status_code=404, headers=_apply_cors_for_head({}, request))
             # #3029: tombstoned or expired is gone, as on GET — HEAD used to
             # confirm existence, size and type of both.
             from storage.routes import _ist_abgelaufen as _expired
@@ -487,3 +497,8 @@ app.add_middleware(ActiveContentGuard)
 # it loses operator rights. Records peer/UA/path only, never the key.
 from storage.default_master_tally import DefaultMasterTally  # noqa: E402
 app.add_middleware(DefaultMasterTally)
+
+# #3030: X-Grant-Scope-Restrict narrows a request to one grant scope (MCP
+# gateway, per agent). Outermost, so every layer below sees the scope.
+from storage.grant_restrict import GrantScopeRestrict  # noqa: E402
+app.add_middleware(GrantScopeRestrict)
