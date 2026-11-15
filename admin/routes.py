@@ -35,7 +35,8 @@ def _admin_keys() -> dict:
     master = os.getenv("AI_INTERNAL_API_KEY") or settings.API_KEY
     # AP 2.6 / #3027: the built-in default is public; once the switch is on it
     # opens no admin route (same switch as auth.is_privileged_admin).
-    if master == "Inetpass1" and os.getenv("STORAGE_DEFAULT_MASTER_UNPRIVILEGED", "0").strip() == "1":
+    from auth import _BUILTIN_DEFAULT_MASTER
+    if master == _BUILTIN_DEFAULT_MASTER and os.getenv("STORAGE_DEFAULT_MASTER_UNPRIVILEGED", "0").strip() == "1":
         master = None
     if master:
         keys.setdefault(master, "master")
