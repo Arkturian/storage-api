@@ -9,6 +9,7 @@ to work, while the database is treated as the canonical source of truth.
 from __future__ import annotations
 
 import json
+import re
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -73,6 +74,18 @@ def _manage_session(db: Optional[Session] = None):
         session.close()
 
 
+_TENANT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def validate_tenant_id(tenant_id) -> str:
+    """A tenant id is a path component (media/<tenant>, rmtree on delete), so
+    it must be a plain slug (#3044, Befund 117: "../" and "/" were accepted)."""
+    tid = str(tenant_id or "").strip().lower()
+    if not _TENANT_ID_RE.fullmatch(tid):
+        raise ValueError("tenant_id must match ^[a-z0-9][a-z0-9_-]{0,63}$")
+    return tid
+
+
 def _ensure_tenant(
     db: Session,
     tenant_id: str,
@@ -80,6 +93,7 @@ def _ensure_tenant(
     display_name: Optional[str] = None,
     is_system: bool = False,
 ) -> Tenant:
+    tenant_id = validate_tenant_id(tenant_id)
     tenant = db.query(Tenant).filter(Tenant.id == tenant_id).one_or_none()
     if tenant:
         if display_name and not tenant.display_name:
@@ -187,9 +201,9 @@ def upsert_tenant_key(
     db: Optional[Session] = None,
 ) -> Dict[str, str]:
     api_key = str(api_key).strip()
-    tenant_id = str(tenant_id).strip().lower()
-    if not api_key or not tenant_id:
+    if not api_key or not str(tenant_id or "").strip():
         raise ValueError("api_key and tenant_id are required")
+    tenant_id = validate_tenant_id(tenant_id)
 
     with _manage_session(db) as session:
         try:

@@ -138,9 +138,20 @@ class GenericStorageService:
             self.thumbnails_dir.mkdir(exist_ok=True)
             self.webview_dir.mkdir(exist_ok=True)
 
+    @staticmethod
+    def _tenant_subdir(base_dir: Path, tenant_id: str) -> Path:
+        """base_dir/<tenant> for a valid slug, confined to base_dir (#3044)."""
+        from tenancy.config import validate_tenant_id
+        tid = validate_tenant_id(tenant_id)
+        root = Path(base_dir).resolve()
+        target = (Path(base_dir) / tid)
+        if target.is_symlink() or target.resolve().parent != root:
+            raise ValueError("tenant directory escapes its base")
+        return target
+
     def _get_tenant_dir(self, base_dir: Path, tenant_id: str) -> Path:
         """Get or create tenant-specific subdirectory."""
-        tenant_dir = base_dir / tenant_id
+        tenant_dir = self._tenant_subdir(base_dir, tenant_id)
         tenant_dir.mkdir(exist_ok=True)
         return tenant_dir
 
@@ -539,7 +550,7 @@ class GenericStorageService:
         created: list[str] = []
         for base_dir in (self.media_dir, self.thumbnails_dir, self.webview_dir):
             try:
-                target = base_dir / tenant_id
+                target = self._tenant_subdir(base_dir, tenant_id)
                 target.mkdir(parents=True, exist_ok=True)
                 created.append(str(target))
             except Exception:
@@ -549,7 +560,7 @@ class GenericStorageService:
     def delete_tenant_directories(self, tenant_id: str) -> list[str]:
         removed: list[str] = []
         for base_dir in (self.media_dir, self.thumbnails_dir, self.webview_dir):
-            target = base_dir / tenant_id
+            target = self._tenant_subdir(base_dir, tenant_id)  # raises on "../", "/", symlink
             if target.exists():
                 shutil.rmtree(target, ignore_errors=True)
                 removed.append(str(target))

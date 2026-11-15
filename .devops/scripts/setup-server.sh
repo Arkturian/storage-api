@@ -219,7 +219,7 @@ Group=www-data
 WorkingDirectory=$DEPLOY_PATH
 Environment="PATH=$DEPLOY_PATH/$VENV_PATH/bin"
 $(echo -e "$ENV_LINES")
-ExecStart=$DEPLOY_PATH/$VENV_PATH/bin/python -m uvicorn main:app --host 0.0.0.0 --port $SERVICE_PORT
+ExecStart=$DEPLOY_PATH/$VENV_PATH/bin/python -m uvicorn main:app --host 127.0.0.1 --port $SERVICE_PORT
 Restart=always
 RestartSec=10
 

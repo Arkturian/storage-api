@@ -23,7 +23,7 @@ environment:
   OPENAI_API_KEY: "${OPENAI_API_KEY}"
   CHROMA_DB_PATH: "/var/www/storage-api/chroma_db"
   CHROMA_COLLECTION_NAME: "tenant_knowledge"
-  HOST: "0.0.0.0"
+  HOST: "127.0.0.1"  # #3044: loopback only, nginx proxies
   PORT: "8001"
   DEFAULT_TENANT_ID: "arkserver"
 

@@ -199,7 +199,7 @@ ExecStart=/root/.pyenv/versions/3.11.9/bin/gunicorn \\
     --timeout 1200 \\
     --graceful-timeout 20 \\
     --keep-alive 5 \\
-    --bind 0.0.0.0:8002 \\
+    --bind 127.0.0.1:8002 \\
     main:app \\
     --access-logfile /var/log/storage-api-${CUSTOMER_NAME}-access.log \\
     --error-logfile /var/log/storage-api-${CUSTOMER_NAME}-error.log \\

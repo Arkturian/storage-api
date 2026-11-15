@@ -12,7 +12,7 @@ from auth import get_current_user, is_privileged_admin
 from database import get_db
 from models import AsyncTask, StorageObject, Tenant, TenantAPIKey, User
 from storage.service import generic_storage
-from tenancy.config import list_tenant_keys, upsert_tenant_key, delete_tenant_key, sync_legacy_snapshot
+from tenancy.config import list_tenant_keys, upsert_tenant_key, delete_tenant_key, sync_legacy_snapshot, validate_tenant_id
 
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
@@ -92,7 +92,10 @@ def upsert_key(
 ) -> Dict[str, str]:
     if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
-    return _masked(upsert_tenant_key(req.api_key, req.tenant_id, db=db))
+    try:
+        return _masked(upsert_tenant_key(req.api_key, req.tenant_id, db=db))
+    except ValueError as exc:  # #3044: tenant_id is a path component
+        raise HTTPException(status_code=422, detail={"error": str(exc), "code": "invalid_tenant_id"})
 
 
 @router.delete("/keys/{key}")
@@ -182,7 +185,10 @@ def create_tenant(
     tenant_id = (req.tenant_id or "").strip()
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id is required")
-    tenant_id = tenant_id.lower()
+    try:
+        tenant_id = validate_tenant_id(tenant_id)  # #3044
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": str(exc), "code": "invalid_tenant_id"})
 
     existing_tenant = db.query(Tenant).filter(Tenant.id == tenant_id).one_or_none()
     if existing_tenant:
@@ -224,6 +230,10 @@ def delete_tenant(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TenantDeleteResponse:
+    try:
+        tenant_id = validate_tenant_id(tenant_id)  # #3044: never rmtree "../"
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": str(exc), "code": "invalid_tenant_id"})
     if not is_privileged_admin(current_user, db):  # #2911
         raise HTTPException(status_code=403, detail="Admin access required")
 
