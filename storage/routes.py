@@ -404,9 +404,9 @@ def _resolve_storage_object_path(obj: Any, refresh: bool = False) -> Path:
 
     # Fallback: reference_path (e.g., SMB mount)
     if (not src_path or not src_path.exists()) and getattr(obj, 'reference_path', None):
-        ref = Path(obj.reference_path)
-        if ref.exists():
-            src_path = ref
+        real = _reference_path_at_read(obj)
+        if real is not None:
+            src_path = real
 
     if not src_path or not src_path.exists():
         raise HTTPException(status_code=404, detail="File not accessible")
@@ -2643,6 +2643,42 @@ def _reference_roots(tenant: Optional[str] = None) -> list:
         if sep and name.strip() == tenant:
             mine.append(path)
     return _resolve_roots(mine)
+
+
+def _read_roots_for(obj) -> list:
+    """Roots a stored reference may resolve into when it is READ: the operator
+    roots, the roots of the object's tenant and the OpenCloud roots (#2810)."""
+    roots = _reference_roots() + _reference_roots(getattr(obj, "tenant_id", None) or "")
+    try:
+        from storage import opencloud as _oc
+        roots += [_oc.views_root(), _oc.projects_root()]
+    except Exception:
+        pass
+    return roots
+
+
+def _reference_path_at_read(obj) -> Optional[Path]:
+    """The real file behind obj.reference_path, or None (#3043, Befund 116).
+
+    The roots were checked only at upload. A registered file later replaced by
+    a symlink (the roots include writable sync folders) made /media serve any
+    file www-data can read: storage.db, .env, other tenants' media. Resolve
+    now, require a regular file inside an allowed root, and hand back the
+    RESOLVED path so the response opens the checked file, not the link."""
+    try:
+        real = Path(obj.reference_path).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    try:
+        if not real.is_file():
+            return None
+    except OSError:
+        return None
+    for root in _read_roots_for(obj):
+        if real == root or root in real.parents:
+            return real
+    print(f"⚠️ reference_path of object {getattr(obj, 'id', '?')} resolves outside the allowed roots — refused")
+    return None
 
 
 def _check_reference_upload(storage_mode: Optional[str], reference_path: Optional[str],
