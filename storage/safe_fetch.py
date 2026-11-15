@@ -50,7 +50,8 @@ def _extra_allowed_hosts() -> set:
 # a fetch reach this host and its siblings through their public IP (nginx
 # vhosts, services bound to 0.0.0.0). These are refused like loopback.
 _DEFAULT_OWN_IPS = ("188.65.73.164,192.46.232.130,62.225.187.68,62.225.187.66,"
-                    "172.104.235.73,217.149.160.166")
+                    "172.104.235.73,217.149.160.166,"
+                    "2a01:7e01::f03c:94ff:feb3:d807")  # arkturian IPv6 (same list as api-ai, #3033)
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 _SIXTOFOUR = ipaddress.ip_network("2002::/16")
 

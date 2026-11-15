@@ -29,7 +29,8 @@ def _fake_dns(monkeypatch, mapping):
 
 
 @pytest.mark.parametrize("ip", ["188.65.73.164", "192.46.232.130", "62.225.187.68",
-                                "::ffff:188.65.73.164", "64:ff9b::bc41:49a4", "2002:bc41:49a4::1"])
+                                "::ffff:188.65.73.164", "64:ff9b::bc41:49a4", "2002:bc41:49a4::1",
+                                "2a01:7e01::f03c:94ff:feb3:d807"])
 def test_own_node_addresses_blocked(monkeypatch, ip):
     _fake_dns(monkeypatch, {"own.example": [ip]})
     with pytest.raises(SF.OutboundBlocked):
