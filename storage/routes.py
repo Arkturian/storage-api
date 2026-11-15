@@ -2711,6 +2711,16 @@ async def upload_file(
     tenant_id: Optional[str] = Depends(get_tenant_id),
 ):
     _check_reference_upload(storage_mode, reference_path, current_user, db)
+    # #3032 (Befund 107): external_uri was stored unchecked and later fetched
+    # by /data-uri with a plain client — a full-response SSRF. Refuse URLs that
+    # are not http(s) or that resolve to a non-public or own address now; the
+    # connect-time guard in safe_fetch still applies on every later fetch.
+    if external_uri:
+        from storage.safe_fetch import OutboundBlocked, check_url_resolvable
+        try:
+            check_url_resolvable(external_uri)
+        except OutboundBlocked as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc), "code": "outbound_blocked"})
     grant_scope = _check_upload_scope(grant_scope)
     if not (reference_id and hls_result):
         _reject_scope_for_foreign_owner(grant_scope, owner_email, current_user)
@@ -7394,6 +7404,22 @@ def get_public_object(
 
 
 
+_DATA_URI_HARD_CAP = 10 * 1024 * 1024
+_RASTER_MIME = {"PNG": "image/png", "JPEG": "image/jpeg", "GIF": "image/gif", "WEBP": "image/webp"}
+
+
+def _raster_mime_or_none(data: bytes) -> Optional[str]:
+    """MIME of a raster image PIL can actually parse, else None (#3032)."""
+    try:
+        from PIL import Image
+        with Image.open(BytesIO(data)) as im:
+            fmt = (im.format or "").upper()
+            im.verify()
+        return _RASTER_MIME.get(fmt)
+    except Exception:
+        return None
+
+
 @router.get("/objects/{object_id}/data-uri")
 async def get_object_data_uri(
     object_id: int,
@@ -7451,35 +7477,42 @@ async def get_object_data_uri(
             meta = json.loads(meta_file.read_text())
             mime_type = meta.get("mime_type", mime_type)
     
-    # Fetch from external URI if not cached
+    # #3032 (Befund 107): this fetched obj.external_uri with a plain client
+    # and returned whatever came back, base64, to anyone — a full-response
+    # SSRF onto loopback and the LAN. Now: the guarded client (public, non-own
+    # addresses, ports 80/443, every redirect hop), a hard size cap while
+    # streaming, and only a real raster image leaves this route.
+    max_size = max(1, min(int(max_size or 0), _DATA_URI_HARD_CAP))
     if not image_data:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(obj.external_uri)
-            if not response.is_success:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Failed to fetch external image: HTTP {response.status_code}"
-                )
-            
-            image_data = response.content
-            
-            # Detect MIME type from content
-            if image_data.startswith(b'\x89PNG'):
-                mime_type = "image/png"
-            elif image_data.startswith(b'\xff\xd8\xff'):
-                mime_type = "image/jpeg"
-            elif image_data.startswith(b'GIF89a') or image_data.startswith(b'GIF87a'):
-                mime_type = "image/gif"
-            elif image_data.startswith(b'WEBP', 8):
-                mime_type = "image/webp"
-    
-    # Check size limit
+        from storage.safe_fetch import OutboundBlocked, safe_async_client
+        try:
+            async with safe_async_client(timeout=30.0) as client:
+                async with client.stream("GET", obj.external_uri) as response:
+                    if not response.is_success:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Failed to fetch external image: HTTP {response.status_code}",
+                        )
+                    buf = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        buf.extend(chunk)
+                        if len(buf) > max_size:
+                            raise HTTPException(status_code=413, detail=f"Image too large (> {max_size} bytes)")
+                    image_data = bytes(buf)
+        except OutboundBlocked as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc), "code": "outbound_blocked"})
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Failed to fetch external image")
+
     if len(image_data) > max_size:
         raise HTTPException(
             status_code=413,
             detail=f"Image too large ({len(image_data)} bytes > {max_size} bytes)"
         )
-    
+    mime_type = _raster_mime_or_none(image_data)
+    if mime_type is None:
+        raise HTTPException(status_code=415, detail={"error": "not a raster image", "code": "not_an_image"})
+
     # Encode as Base64
     base64_data = base64.b64encode(image_data).decode('ascii')
     data_uri = f"data:{mime_type};base64,{base64_data}"

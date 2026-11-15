@@ -498,7 +498,8 @@ class AsyncPipelineManager:
         external_uri = getattr(storage_obj, "external_uri", None)
         if external_uri:
             try:
-                async with httpx.AsyncClient(timeout=20.0) as client:
+                from storage.safe_fetch import safe_async_client  # #3032
+                async with safe_async_client(timeout=20.0) as client:
                     resp = await client.get(external_uri)
                     resp.raise_for_status()
                     with Image.open(BytesIO(resp.content)) as img:

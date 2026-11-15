@@ -80,7 +80,8 @@ async def verify_image_uri(uri: str, timeout: int = 10) -> Tuple[bool, Optional[
         return False, None
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        from storage.safe_fetch import safe_async_client  # #3032: guarded, every redirect hop
+        async with safe_async_client() as client:
             # Use HEAD request to avoid downloading full image
             response = await client.head(uri, timeout=timeout)
 

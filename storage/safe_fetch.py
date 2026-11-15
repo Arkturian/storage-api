@@ -19,6 +19,7 @@ did not originate in this service's own configuration.
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import os
 import socket
@@ -45,9 +46,58 @@ def _extra_allowed_hosts() -> set:
     return {h.strip().lower() for h in raw.split(",") if h.strip()}
 
 
+# Befund 108: our own nodes have PUBLIC addresses, so "globally routable" let
+# a fetch reach this host and its siblings through their public IP (nginx
+# vhosts, services bound to 0.0.0.0). These are refused like loopback.
+_DEFAULT_OWN_IPS = ("188.65.73.164,192.46.232.130,62.225.187.68,62.225.187.66,"
+                    "172.104.235.73,217.149.160.166")
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_SIXTOFOUR = ipaddress.ip_network("2002::/16")
+
+
+def _own_ips() -> frozenset:
+    return _own_ips_for(os.getenv("STORAGE_OUTBOUND_DENY_IPS", _DEFAULT_OWN_IPS))
+
+
+@functools.lru_cache(maxsize=4)
+def _own_ips_for(raw: str) -> frozenset:
+    out = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            try:
+                out.add(ipaddress.ip_address(part))
+            except ValueError:
+                pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            out.add(ipaddress.ip_address(info[4][0].split("%")[0]))
+    except (OSError, ValueError):
+        pass
+    return frozenset(out)
+
+
+def _allowed_ports() -> set:
+    raw = os.getenv("STORAGE_OUTBOUND_PORTS", "80,443")
+    return {int(p) for p in raw.split(",") if p.strip().isdigit()}
+
+
+def _as_v4(ip: ipaddress._BaseAddress) -> ipaddress._BaseAddress:
+    """IPv4 hidden in an IPv6 form (mapped, NAT64, 6to4) is judged as IPv4."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return ip.ipv4_mapped
+        if ip in _NAT64:
+            return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        if ip in _SIXTOFOUR and ip.sixtofour is not None:
+            return ip.sixtofour
+    return ip
+
+
 def _is_public(ip: ipaddress._BaseAddress) -> bool:
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    ip = _as_v4(ip)
+    if ip in _own_ips():
+        return False
     return bool(ip.is_global) and not ip.is_multicast and not ip.is_reserved
 
 
@@ -71,6 +121,8 @@ def resolve_public(host: str, port: int) -> List[str]:
     host = (host or "").strip("[]")
     if host.lower() in _extra_allowed_hosts():
         return [host]
+    if port is not None and int(port) not in _allowed_ports():
+        raise OutboundBlocked("destination port is not allowed")
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
@@ -159,3 +211,14 @@ def safe_client(**kwargs) -> httpx.Client:
     kwargs.setdefault("follow_redirects", True)
     kwargs.setdefault("max_redirects", 5)
     return httpx.Client(transport=transport, trust_env=False, **kwargs)
+
+
+def check_url_resolvable(url: str) -> str:
+    """check_url plus the address and port check, for accepting a URL that is
+    stored now and fetched later (external_uri). The connect-time check still
+    runs on every fetch, so a later DNS change cannot slip through."""
+    check_url(url)
+    parts = urlsplit(str(url))
+    port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+    resolve_public(parts.hostname, port)
+    return str(url)
