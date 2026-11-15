@@ -179,3 +179,39 @@ def test_admin_key_gate_follows_switch(monkeypatch):
         A.require_admin_key("Inetpass1")
     monkeypatch.setattr(A.settings, "API_KEY", "real-secret")
     assert A.require_admin_key("real-secret") == "master"
+
+
+# ── Befund 137 (#3072): Adresse nicht aus dem linken X-Forwarded-For ─────────
+def _tally_lauf(monkeypatch, headers, peer):
+    import asyncio
+
+    async def innen(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = T.DefaultMasterTally(innen)
+    monkeypatch.setattr(mw, "_active", lambda: True)
+    monkeypatch.setattr(mw, "_flush", lambda force=False: None)
+    monkeypatch.delenv("TRUSTED_PROXY_IPS", raising=False)
+    scope = {"type": "http", "method": "GET", "path": "/plain", "client": (peer, 1234),
+             "headers": [(b"x-api-key", T.DEFAULT_LITERAL.encode())] + [(k.encode(), v.encode()) for k, v in headers]}
+
+    async def empfangen():
+        return {"type": "http.request", "body": b""}
+
+    async def senden(_):
+        return None
+    asyncio.run(mw(scope, empfangen, senden))
+    return [b[1] for b in mw._counts]
+
+
+def test_tally_nimmt_den_vom_proxy_angehaengten_eintrag(monkeypatch):
+    assert _tally_lauf(monkeypatch, [("x-forwarded-for", "198.51.100.9, 203.0.113.7")], "127.0.0.1") == ["203.0.113.7"]
+
+
+def test_tally_direkte_verbindung_ignoriert_xff(monkeypatch):
+    assert _tally_lauf(monkeypatch, [("x-forwarded-for", "198.51.100.9")], "203.0.113.7") == ["203.0.113.7"]
+
+
+def test_tally_unsinn_und_x_real_ip(monkeypatch):
+    assert _tally_lauf(monkeypatch, [("x-forwarded-for", "a;b"), ("x-real-ip", "203.0.113.7")], "127.0.0.1") == ["203.0.113.7"]

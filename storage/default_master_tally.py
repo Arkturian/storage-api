@@ -5,7 +5,7 @@ that key loses its operator rights (or is rotated away), we need to know which
 callers still send it, so nothing in the field breaks unannounced.
 
 The middleware never records the key, a body or a query string. Per request
-that presents the default it counts (peer address, X-Forwarded-For first hop,
+that presents the default it counts (peer address, client address behind nginx,
 User-Agent, method, path with numeric ids collapsed) in memory and appends one
 aggregated JSON line per bucket every FLUSH_SECONDS to TALLY_PATH. Read it with
 scripts/default_master_report.py.
@@ -82,7 +82,7 @@ class DefaultMasterTally:
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http" and self._active():
             key = None
-            ua = xff = ""
+            ua = xff_roh = real_roh = ""
             for k, v in scope.get("headers") or []:
                 lk = k.lower()
                 if lk == b"x-api-key":
@@ -90,9 +90,16 @@ class DefaultMasterTally:
                 elif lk == b"user-agent":
                     ua = v.decode("latin-1")[:120]
                 elif lk == b"x-forwarded-for":
-                    xff = v.decode("latin-1").split(",")[0].strip()[:64]
+                    xff_roh = v.decode("latin-1")
+                elif lk == b"x-real-ip":
+                    real_roh = v.decode("latin-1")
             if key is not None and key.strip() == DEFAULT_LITERAL.encode():
                 peer = (scope.get("client") or ("", 0))[0]
+                # Befund 137 (#3072): nicht XFF[0] (vom Client gesetzt), sondern der
+                # Eintrag, den ein vertrauter Proxy angehaengt hat. Feldname bleibt
+                # "xff" fuer scripts/default_master_report.py.
+                from .client_ip import client_ip as _client_ip
+                xff = _client_ip(xff_roh, real_roh, peer)[:64]
                 bucket = (peer, xff, ua, scope.get("method", ""), _norm_path(scope.get("path", "")))
                 self.note(bucket)
                 token = _current.set(bucket)
