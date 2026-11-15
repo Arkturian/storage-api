@@ -243,6 +243,11 @@ async def storage_media_head_headers(request: Request, call_next):
                 db.close()
             if not obj:
                 return Response(status_code=404, headers=_apply_cors_for_head({}, request))
+            # #3029: tombstoned or expired is gone, as on GET — HEAD used to
+            # confirm existence, size and type of both.
+            from storage.routes import _ist_abgelaufen as _expired
+            if getattr(obj, "tombstoned_at", None) is not None or _expired(obj):
+                return Response(status_code=404, headers=_apply_cors_for_head({}, request))
 
             # Safety quarantine — mirror /storage/media GET behavior.
             # We don't have a current_user in middleware (auth happens in
@@ -407,7 +412,10 @@ async def storage_media_head_headers(request: Request, call_next):
                 headers["X-Mime-Type"] = obj.mime_type
             if obj.transcoding_status:
                 headers["X-Transcoding-Status"] = obj.transcoding_status
-            if obj.hls_url and obj.transcoding_status == "completed":
+            # #3029: no permanent HLS capability on a signed read of a private object.
+            if obj.hls_url and obj.transcoding_status == "completed" and not (
+                _head_signed and (not obj.is_public or _md_priv.get("private_media"))
+            ):
                 headers["X-HLS-URL"] = obj.hls_url
             if obj.file_size_bytes:
                 headers["Content-Length"] = str(obj.file_size_bytes)

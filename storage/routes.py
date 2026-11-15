@@ -1139,7 +1139,7 @@ async def find_similar_objects(
                 StorageObject.is_public.is_(True),
             ))
 
-        rows = base_q.all()
+        rows = [row for row in base_q.all() if _row_visible(row[0], current_user, db)]
 
         # Create a map for quick lookup (rows are tuples of (StorageObject, owner_email))
         objects_map = {row[0].id: row[0] for row in rows}
@@ -1341,7 +1341,7 @@ async def kg_text_search(
         for so, owner_email in rows:
             # Access control: allow owner, public, or admin
             try:
-                if not (getattr(so, "is_public", False) or so.owner_user_id == current_user.id or _is_privileged_admin(current_user, db)):
+                if not _row_visible(so, current_user, db):
                     continue
             except Exception:
                 continue  # fail closed (#2282): an access check that throws must not admit the row
@@ -1474,7 +1474,7 @@ async def kg_vibe_search(
         for so, owner_email in rows:
             # Access control
             try:
-                if not (getattr(so, "is_public", False) or so.owner_user_id == current_user.id or _is_privileged_admin(current_user, db)):
+                if not _row_visible(so, current_user, db):
                     continue
             except Exception:
                 continue  # fail closed (#2282): an access check that throws must not admit the row
@@ -3549,7 +3549,7 @@ def get_asset_variant_references(
             hls_dir_path = path.parent / basename
             master = hls_dir_path / "master.m3u8"
             if master.exists():
-                hls_url = build_hls_url(tenant_id, basename)
+                hls_url = build_hls_url(obj.tenant_id or tenant_id, basename)
         except Exception:
             pass
 
@@ -3703,7 +3703,7 @@ def get_asset_variant_references_batch(
             hls_dir_path = path.parent / basename
             master = hls_dir_path / "master.m3u8"
             if master.exists():
-                hls_url = build_hls_url(tenant_id, basename)
+                hls_url = build_hls_url(obj.tenant_id or tenant_id, basename)
         except Exception:
             pass
 
@@ -3983,6 +3983,21 @@ def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] =
     """
     if obj is None:
         return
+    _check_presence_and_privacy(obj, current_user, db, signed=signed)
+    # Owner / admin bypass
+    if current_user is not None:
+        if _is_privileged_admin(current_user, db):
+            return
+        if getattr(obj, "owner_user_id", None) == current_user.id:
+            return
+    _check_safety_verdict(obj)
+
+
+def _check_presence_and_privacy(obj, current_user: Optional[User], db: Optional[Session] = None,
+                                signed: bool = False) -> None:
+    """Tombstone, expiry and private_media — the part of the gate every read
+    path needs, not only the byte routes (#3029, Befund 104: /objects, HEAD,
+    /public and the KG searches checked is_public alone)."""
     # Tombstoned (pending cascade-delete) → treated as gone for ALL callers. The
     # bytes survive so the saga can untombstone (compensate), but no serving path
     # delivers it. Admin management still works via /admin/storage/{id}/* which
@@ -4033,13 +4048,29 @@ def _check_quarantine(obj, current_user: Optional[User], db: Optional[Session] =
                 status_code=403,
                 detail={"error": "This object is private", "code": "private_media"},
             )
-    # Owner / admin bypass
-    if current_user is not None:
-        if _is_privileged_admin(current_user, db):
-            return
-        if getattr(obj, "owner_user_id", None) == current_user.id:
-            return
 
+
+def _row_visible(obj, current_user: Optional[User], db: Optional[Session] = None) -> bool:
+    """May this caller see this row in a listing or search result?
+    Owner, public or operator — and never past tombstone, expiry or
+    private_media (#3029)."""
+    if obj is None:
+        return False
+    try:
+        _check_presence_and_privacy(obj, current_user, db)
+    except HTTPException:
+        return False
+    if getattr(obj, "is_public", False):
+        return True
+    if current_user is None:
+        return False
+    try:
+        return obj.owner_user_id == current_user.id or _is_privileged_admin(current_user, db)
+    except Exception:
+        return False  # fail closed (#2282)
+
+
+def _check_safety_verdict(obj) -> None:
     danger = obj.ai_danger_potential or 0
     if obj.ai_safety_rating == "unsafe" and danger >= QUARANTINE_DANGER_THRESHOLD:
         raise HTTPException(
@@ -4410,7 +4441,13 @@ def get_media_variant(
         _media_extra_headers["X-Mime-Type"] = obj.mime_type
     if obj.transcoding_status:
         _media_extra_headers["X-Transcoding-Status"] = obj.transcoding_status
-    if obj.hls_url and obj.transcoding_status == "completed":
+    # A signed link is short-lived; the HLS path is a permanent, unsigned
+    # capability. Handing it out on a signed read of a private object turned
+    # a 5-minute link into lasting access (#3029). Until #3006 signs HLS, the
+    # header is only for public objects or callers that have their own right.
+    _hls_private = (not obj.is_public) or bool((obj.metadata_json or {}).get("private_media")
+                                               if isinstance(obj.metadata_json, dict) else False)
+    if obj.hls_url and obj.transcoding_status == "completed" and not (_signed and _hls_private):
         _media_extra_headers["X-HLS-URL"] = obj.hls_url
 
 
@@ -5760,10 +5797,11 @@ def get_object_metadata(
             raise HTTPException(status_code=401, detail="Authentication required")
         if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
             raise HTTPException(status_code=403, detail="Forbidden")
-    # Confidential objects never leak metadata to anonymous callers either.
-    _md = obj.metadata_json if isinstance(obj.metadata_json, dict) else {}
-    if _md.get("private_media") and current_user is None:
-        raise HTTPException(status_code=403, detail={"error": "This object is private", "code": "private_media"})
+    # Confidential, tombstoned or expired objects: same answer as on the byte
+    # routes. Until #3029 only anonymous callers were held back from
+    # private_media, so any tenant key read OCR, transcripts and hls_url of
+    # objects that were is_public=1 and private_media=true.
+    _check_presence_and_privacy(obj, current_user, db)
 
     response_obj = StorageObjectResponse.from_orm(obj)
 
@@ -5801,7 +5839,7 @@ def get_object_metadata(
 
             master = hls_dir_path / "master.m3u8"
             if master.exists():
-                response_obj.hls_url = build_hls_url(tenant_id, basename)
+                response_obj.hls_url = build_hls_url(obj.tenant_id or tenant_id, basename)
                 response_obj.transcoding_status = "completed"  # Set status to completed when HLS exists
                 size_file = hls_dir_path / "hls_size.txt"
                 if size_file.exists():
@@ -6046,7 +6084,7 @@ def list_objects(
 
                 master = hls_dir_path / "master.m3u8"
                 if master.exists():
-                    response_obj.hls_url = build_hls_url(tenant_id, basename)
+                    response_obj.hls_url = build_hls_url(storage_obj.tenant_id or tenant_id, basename)
                     response_obj.transcoding_status = "completed"  # Set status to completed when HLS exists
                     size_file = hls_dir_path / "hls_size.txt"
                     if size_file.exists():
@@ -7288,7 +7326,7 @@ def get_public_object(
         StorageObject.is_public == True  # Only public objects
     ).first()
     _md = obj.metadata_json if obj is not None and isinstance(obj.metadata_json, dict) else {}
-    if not obj or _md.get("private_media") or getattr(obj, "tombstoned_at", None) is not None:
+    if not obj or _md.get("private_media") or getattr(obj, "tombstoned_at", None) is not None or _ist_abgelaufen(obj):
         raise HTTPException(status_code=404, detail="Public object not found")
     
     response_obj = StorageObjectResponse.from_orm(obj)
