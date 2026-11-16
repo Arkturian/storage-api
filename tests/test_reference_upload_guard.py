@@ -117,3 +117,18 @@ def test_route_weist_ab_bevor_gelesen_wird(roots, monkeypatch, tmp_path):
         main.app.dependency_overrides.clear()
     assert r.status_code == 403
     assert r.json()["detail"]["code"] == "reference_forbidden"
+
+
+@pytest.mark.parametrize("label", ["1 Werke/3 Dakinis und Yoginis/4 Dakinis .heic", "../../geheim/storage.db"])
+def test_copy_mit_relativem_etikett_erlaubt(roots, monkeypatch, label):
+    # annasacher sync-storage.cjs: copy mode, reference_path = relPath as a label
+    _admin(monkeypatch, False)
+    _tenant(monkeypatch, "annasacher")
+    R._check_reference_upload("copy", label, USER, object())
+
+
+def test_reference_modus_relativ_weiter_verboten(roots, monkeypatch):
+    _admin(monkeypatch, False)
+    _tenant(monkeypatch, "annasacher")
+    assert _code(lambda: R._check_reference_upload("reference", "bild.jpg", USER, object())) \
+        == "reference_path_forbidden"

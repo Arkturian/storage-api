@@ -78,3 +78,10 @@ def test_opencloud_views_allowed(roots):
 def test_resolver_uses_read_check():
     src = (Path(__file__).resolve().parent.parent / "storage" / "routes.py").read_text()
     assert "real = _reference_path_at_read(obj)" in src
+
+
+@pytest.mark.parametrize("label", ["a.jpg", "../secret/storage.db", ""])
+def test_relative_label_never_read(roots, monkeypatch, label):
+    (roots.allowed / "a.jpg").write_bytes(b"x")
+    monkeypatch.chdir(roots.allowed)          # even with cwd inside a root
+    assert R._reference_path_at_read(_obj(label)) is None

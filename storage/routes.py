@@ -2665,6 +2665,10 @@ def _reference_path_at_read(obj) -> Optional[Path]:
     file www-data can read: storage.db, .env, other tenants' media. Resolve
     now, require a regular file inside an allowed root, and hand back the
     RESOLVED path so the response opens the checked file, not the link."""
+    # A relative reference_path is only a label (copy-mode sync scripts key
+    # their manifest by it); resolving it would depend on the service's cwd.
+    if not obj.reference_path or not Path(obj.reference_path).is_absolute():
+        return None
     try:
         real = Path(obj.reference_path).resolve(strict=True)
     except (OSError, RuntimeError):
@@ -2685,6 +2689,11 @@ def _check_reference_upload(storage_mode: Optional[str], reference_path: Optiona
                             current_user, db) -> None:
     """403 unless the path lies under a root this identity may use."""
     if storage_mode != "reference" and not reference_path:
+        return
+    # copy/external uploads may carry a RELATIVE reference_path as a mere
+    # label (annasacher sync-storage.cjs). It is never read as a file:
+    # _reference_path_at_read refuses relative paths (#3043 follow-up).
+    if storage_mode != "reference" and not Path(reference_path).is_absolute():
         return
     if _is_privileged_admin(current_user, db):
         roots = _reference_roots()
