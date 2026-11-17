@@ -48,7 +48,9 @@ import asyncio
 
 # API configuration
 from config import settings as _settings
-INTERNAL_API_KEY = os.getenv("AI_INTERNAL_API_KEY") or _settings.API_KEY  # no literal (#2911)
+# #1960: outbound only, never the master. api-ai checks no key on these
+# routes (AiApi, 17.11.2026); unset sends an empty header.
+INTERNAL_API_KEY = os.getenv("AI_INTERNAL_API_KEY", "")
 # Make AI API base configurable to avoid hardcoding wrong ports on prod
 API_BASE_URL = os.getenv("AI_API_BASE_URL", "http://127.0.0.1:8000")
 # Public storage base used to hand image URLs to the (CLI-based) AI backends,

@@ -1531,7 +1531,7 @@ async def _process_tts_request_from_storage(storage_obj, tts_request):
                 # Google API/SDK. Reuses the same /ai/chatgpt path as the safety
                 # pipeline (subscription-backed, no per-call billing).
                 _ai_api_base = os.getenv("AI_API_BASE_URL", "http://127.0.0.1:8000")
-                _ai_api_key = os.getenv("AI_INTERNAL_API_KEY") or settings.API_KEY  # no literal (#2911)
+                _ai_api_key = os.getenv("AI_INTERNAL_API_KEY", "")  # #1960: never the master
                 image_prompt_request = (
                     "Based on the following dialog, create a short, visually descriptive prompt for a text-to-image AI. "
                     "The prompt should capture the essence and mood of the conversation in a single scene. "

@@ -70,8 +70,9 @@ def verify_api_key(api_key: str, db: Session) -> Optional[User]:
     if not api_key:
         return None
 
-    # Check if it's the master API key (existing system)
-    if api_key == settings.API_KEY:
+    # Check if it's the master API key (existing system). An unset master
+    # (#1960 step 5) authenticates nobody.
+    if settings.API_KEY and api_key == settings.API_KEY:
         # Ensure a persistent 'system' admin user exists to satisfy FK constraints
         system_email = "system@api"
         user = db.query(User).filter(User.email == system_email).first()

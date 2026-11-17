@@ -80,9 +80,10 @@ class MacTranscodingClient:
                 "file_size_bytes": file_size,
                 "original_filename": filename,
                 "storage_object_id": reference_id,
-                "download_headers": {
-                    "X-API-KEY": settings.API_KEY  # Mac will use this to authenticate download
-                }
+                # #1960: the master never leaves storage-api. This client is
+                # unused today (only cancel_job is called); a revived path
+                # needs a signed /storage/sign URL instead.
+                "download_headers": {}
             }
             
             print(f"📤 Submitting transcoding job to Mac API: {filename} ({file_size} bytes)")

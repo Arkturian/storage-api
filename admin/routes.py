@@ -29,10 +29,9 @@ def _admin_keys() -> dict:
             name, key = pair.split(":", 1)
             if key.strip():
                 keys[key.strip()] = name.strip()
-    # #2911: no literal fallback. Unset AI_INTERNAL_API_KEY follows the master
-    # key from settings (same value as before on hosts that never set it, and a
-    # rotation of API_KEY now carries over instead of leaving the old literal).
-    master = os.getenv("AI_INTERNAL_API_KEY") or settings.API_KEY
+    # #1960: the admin master is the master key itself. AI_INTERNAL_API_KEY is
+    # an outbound credential for api-ai/knowledge and opens nothing here.
+    master = settings.API_KEY
     # AP 2.6 / #3027: the built-in default is public; once the switch is on it
     # opens no admin route (same switch as auth.is_privileged_admin).
     from auth import _BUILTIN_DEFAULT_MASTER
@@ -461,7 +460,8 @@ def blast_radius(
     radius = {"asset_id": asset_id, "local": local, "downstream": {}}
     if downstream:
         import httpx
-        key = os.getenv("AI_INTERNAL_API_KEY") or settings.API_KEY
+        # #1960: never send the master to another service.
+        key = os.getenv("AI_INTERNAL_API_KEY") or ""
         # ARTrack gets its own outbound key (Issue #2385): after the ARTrack
         # master rotation the shared value no longer authenticates there.
         # Same variable as _notify_artrack_storage_deleted in storage/routes.py.
