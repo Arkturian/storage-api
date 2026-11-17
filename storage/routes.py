@@ -2779,6 +2779,32 @@ def _key_may_attach_hls(api_key: Optional[str], db) -> bool:
         return False
 
 
+def _key_may_set_owner(api_key: Optional[str], db) -> bool:
+    """#1960: an active tenant key row with may_set_owner=1 may pass
+    owner_email on upload. Nothing else."""
+    if not api_key or db is None:
+        return False
+    try:
+        from models import TenantAPIKey
+        row = (db.query(TenantAPIKey.may_set_owner)
+               .filter(TenantAPIKey.api_key == api_key, TenantAPIKey.is_active.is_(True)).first())
+        return bool(row and row[0])
+    except Exception:
+        return False
+
+
+def _may_set_owner_email(current_user, api_key: Optional[str], db) -> bool:
+    """#1960: owner_email used to need only trust_level admin, which every key
+    acting as system@api inherits (gateway, cloud-api). Now: a real operator,
+    the master path itself (the literal until step 3), or a key with
+    may_set_owner."""
+    if current_user is None or current_user.trust_level != "admin":
+        return False
+    if getattr(current_user, "_storage_auth_via", None) == "master":
+        return True
+    return _is_privileged_admin(current_user, db) or _key_may_set_owner(api_key, db)
+
+
 def _refuse_encrypted(obj) -> None:
     """Analysis, embeddings, data-URIs, image replacement: never for ciphertext."""
     if obj is not None and getattr(obj, "encrypted", False):
@@ -3005,7 +3031,7 @@ async def upload_file(
             target_owner_id = current_user.id
 
         if owner_email and not (reference_id and hls_result):
-            if current_user.trust_level != "admin":
+            if not _may_set_owner_email(current_user, api_key_header, db):
                 raise HTTPException(status_code=403, detail="Only admin may set owner_email")
             owner = db.query(User).filter(User.email == owner_email).first()
             if not owner:

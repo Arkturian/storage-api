@@ -184,3 +184,48 @@ def test_hls_attach_right_is_narrow(db, monkeypatch):
     assert "not found" not in passed.text.lower(), passed.text
     s2, u = _who(db, TRANSCODER)
     assert auth.is_privileged_admin(u, s2) is False
+
+
+AIAPI = "ai-key-0123456789abcdef0123456789abcd"
+
+
+@pytest.mark.parametrize("key,allowed", [(GATEWAY, False), (CLOUDAPI, False), ("random-users-key", False),
+                                         (AIAPI, True), (MASTER, True)])
+def test_owner_email_needs_operator_or_may_set_owner(db, monkeypatch, key, allowed):
+    """owner_email used to need only trust_level admin, which every key acting
+    as system@api inherits. Now only the master or a may_set_owner key."""
+    _rotate(monkeypatch)
+    from database import get_db
+    from storage import routes as R
+    s = db()
+    s.add(TenantAPIKey(api_key=AIAPI, tenant_id="arkturian", label="api-ai", is_active=True,
+                       acts_as_email="system@api", may_set_owner=True))
+    s.commit(); s.close()
+
+    def _db():
+        d = db()
+        try:
+            yield d
+        finally:
+            d.close()
+    app = FastAPI()
+    app.include_router(R.router, prefix="/storage")
+    app.dependency_overrides[get_db] = _db
+    app.dependency_overrides[R.get_tenant_id] = lambda: "arkturian"
+    r = TestClient(app).post("/storage/upload", headers={"X-API-KEY": key},
+                             files={"file": ("a.txt", b"x", "text/plain")},
+                             data={"owner_email": "someone-else@x", "ai_mode": "none"})
+    if allowed:
+        assert "Only admin may set owner_email" not in r.text, r.text
+    else:
+        assert r.status_code in (403, 500) and "Only admin may set owner_email" in r.text, r.text
+
+
+def test_literal_master_keeps_owner_email_until_step3(db, monkeypatch):
+    """Before rotation the literal is the master path: api-ai keeps working."""
+    _rotate(monkeypatch, LITERAL)
+    from storage import routes as R
+    s, u = _who(db, LITERAL)
+    assert R._may_set_owner_email(u, LITERAL, s) is True
+    s2, g = _who(db, GATEWAY)
+    assert R._may_set_owner_email(g, GATEWAY, s2) is False

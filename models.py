@@ -50,6 +50,9 @@ class TenantAPIKey(Base):
     # #1960: the one right transcoding needs — attach an HLS result to a video
     # it does not own. Nothing else (no operator, no admin routes).
     may_attach_hls = Column(Boolean, default=False, nullable=True)
+    # #1960: upload on behalf of another owner (owner_email), e.g. api-ai's
+    # images for their requester. Nothing else.
+    may_set_owner = Column(Boolean, default=False, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
 
