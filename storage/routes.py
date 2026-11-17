@@ -2765,6 +2765,20 @@ def _check_encrypted_upload(storage_mode, reference_path, external_uri, hls_resu
             "error": "encrypted uploads need the file bytes", "code": "encrypted_needs_bytes"})
 
 
+def _key_may_attach_hls(api_key: Optional[str], db) -> bool:
+    """#1960: transcoding's own key may attach HLS results to any video, and
+    nothing more. An active tenant key row with may_attach_hls=1."""
+    if not api_key or db is None:
+        return False
+    try:
+        from models import TenantAPIKey
+        row = (db.query(TenantAPIKey.may_attach_hls)
+               .filter(TenantAPIKey.api_key == api_key, TenantAPIKey.is_active.is_(True)).first())
+        return bool(row and row[0])
+    except Exception:
+        return False
+
+
 def _refuse_encrypted(obj) -> None:
     """Analysis, embeddings, data-URIs, image replacement: never for ciphertext."""
     if obj is not None and getattr(obj, "encrypted", False):
@@ -2972,6 +2986,7 @@ async def upload_file(
             if not (
                 getattr(current_user, "id", None) == original_video.owner_user_id
                 or _is_privileged_admin(current_user, db)
+                or _key_may_attach_hls(api_key_header, db)
             ):
                 raise HTTPException(status_code=404, detail=f"Original video {reference_id} not found")
 

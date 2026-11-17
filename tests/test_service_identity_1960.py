@@ -140,3 +140,47 @@ def test_gateway_keeps_owner_access_over_the_route(db, monkeypatch, tmp_path):
     assert c.get(f"/storage/objects/{ids[1]}", headers=h).status_code in (403, 404)
     hm = {"X-API-KEY": MASTER}
     assert c.get(f"/storage/objects/{ids[1]}", headers=hm).status_code == 200
+
+
+TRANSCODER = "tc-key-0123456789abcdef0123456789abcd"
+
+
+def test_hls_attach_right_is_narrow(db, monkeypatch):
+    """transcoding's key may attach an HLS result to a foreign video (the
+    owner guard of #2915 lets it through) and is still no operator."""
+    _rotate(monkeypatch)
+    from database import get_db
+    from storage import routes as R
+    s = db()
+    s.add(TenantAPIKey(api_key=TRANSCODER, tenant_id="arkturian", label="transcoding", is_active=True,
+                       acts_as_email="system@api", may_attach_hls=True))
+    human = User(email="video-owner@x", display_name="v", password_hash="", api_key="kv", trust_level="user", device_ids=[])
+    s.add(human); s.commit()
+    video = StorageObject(object_key="u9_v.mp4", tenant_id="arkturian", owner_user_id=human.id, is_public=False,
+                          original_filename="v.mp4", mime_type="video/mp4", file_size_bytes=1)
+    s.add(video); s.commit()
+    vid = video.id
+    s.close()
+
+    def _db():
+        d = db()
+        try:
+            yield d
+        finally:
+            d.close()
+    app = FastAPI()
+    app.include_router(R.router, prefix="/storage")
+    app.dependency_overrides[get_db] = _db
+    app.dependency_overrides[R.get_tenant_id] = lambda: "arkturian"
+    c = TestClient(app)
+
+    def attach(key):
+        return c.post("/storage/upload", headers={"X-API-KEY": key},
+                      files={"file": ("hls.zip", b"PK\x05\x06" + b"\x00" * 18, "application/zip")},
+                      data={"reference_id": str(vid), "hls_result": "true"})
+    refused = attach(GATEWAY)
+    assert refused.status_code in (404, 500) and "not found" in refused.text.lower()
+    passed = attach(TRANSCODER)
+    assert "not found" not in passed.text.lower(), passed.text
+    s2, u = _who(db, TRANSCODER)
+    assert auth.is_privileged_admin(u, s2) is False

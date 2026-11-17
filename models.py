@@ -47,6 +47,9 @@ class TenantAPIKey(Base):
     # their uploads stays intact — but never as an operator. Only the real
     # master (settings.API_KEY) makes system@api an operator. Set by ops only.
     acts_as_email = Column(String(255), nullable=True)
+    # #1960: the one right transcoding needs — attach an HLS result to a video
+    # it does not own. Nothing else (no operator, no admin routes).
+    may_attach_hls = Column(Boolean, default=False, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
 
