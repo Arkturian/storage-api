@@ -41,6 +41,17 @@ app = FastAPI(
     description="Media storage and AI analysis service with multi-tenancy support"
 )
 
+
+# #3230: any code path that touches an encrypted object's plaintext fails
+# closed with a clear code instead of a 500 (or worse, processing ciphertext).
+from storage.encryption import EncryptionError as _EncryptionError  # noqa: E402
+
+
+@app.exception_handler(_EncryptionError)
+async def _encryption_error_handler(request: Request, exc: _EncryptionError):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=exc.status, content={"detail": {"error": str(exc), "code": exc.code}})
+
 # Database lifecycle events
 @app.on_event("startup")
 async def startup():

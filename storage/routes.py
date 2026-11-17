@@ -1639,6 +1639,7 @@ async def regenerate_embedding(
 
     if not storage_obj:
         raise HTTPException(status_code=404, detail="Storage object not found")
+    _refuse_encrypted(storage_obj)
 
     # Access control - only owner or admin
     if storage_obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
@@ -2764,6 +2765,13 @@ def _check_encrypted_upload(storage_mode, reference_path, external_uri, hls_resu
             "error": "encrypted uploads need the file bytes", "code": "encrypted_needs_bytes"})
 
 
+def _refuse_encrypted(obj) -> None:
+    """Analysis, embeddings, data-URIs, image replacement: never for ciphertext."""
+    if obj is not None and getattr(obj, "encrypted", False):
+        raise HTTPException(status_code=409, detail={
+            "error": "not available for encrypted objects", "code": "encrypted_object"})
+
+
 def _require_encryption_ready() -> None:
     from storage.encryption import load_config
     if not load_config().ready:
@@ -3595,6 +3603,7 @@ async def analyze_existing_object(
     ).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Not found")
+    _refuse_encrypted(obj)
     if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -6186,6 +6195,23 @@ def get_object_metadata(
         except Exception:
             pass
 
+    if getattr(obj, "encrypted", False):
+        response_obj.thumbnail_url = None
+        response_obj.webview_url = None
+        response_obj.share_url = None
+        response_obj.hls_url = None
+        # The real name only for the owner itself — never for the public
+        # default master (the MCP gateway's identity) and never for operators.
+        if current_user is not None and obj.owner_user_id == current_user.id \
+                and not _is_public_default_master(current_user):
+            from storage import encrypted_io as _eio
+            from storage.encryption import EncryptionError, unwrap_dek
+            try:
+                _dek, _ = unwrap_dek(obj)
+                response_obj.original_filename = _eio.real_filename(obj, _dek) or response_obj.original_filename
+            except EncryptionError:
+                pass  # metadata stays readable while the KMS is down; the name waits
+
     if current_user is None:
         _strip_owner_for_anonymous(response_obj)
     return response_obj
@@ -6871,6 +6897,7 @@ async def replace_object_image(
     privileged = _is_privileged_admin(current_user, db) and not _is_public_default_master(current_user)
     if not obj or (not privileged and (obj.tenant_id != tenant_id or obj.owner_user_id != current_user.id)):
         raise HTTPException(status_code=404, detail="Not found")
+    _refuse_encrypted(obj)
     data = await file.read()
     is_image = (
         data[:3] == b"\xff\xd8\xff"            # JPEG
@@ -6939,6 +6966,19 @@ async def update_object_metadata(
         update_data["metadata_json"] = _new_md
 
     # Check if ai_context_metadata is being updated
+    # #3230: encrypted stays private for good; the stored name is a placeholder.
+    if getattr(obj, "encrypted", False):
+        if update_data.get("is_public"):
+            raise HTTPException(status_code=409, detail={
+                "error": "encrypted objects cannot be made public", "code": "encrypted_one_way"})
+        for _f in ("original_filename", "ai_context_metadata"):
+            if _f in update_data:
+                raise HTTPException(status_code=409, detail={
+                    "error": f"{_f} cannot be changed on an encrypted object", "code": "encrypted_one_way"})
+        if "metadata_json" in update_data:
+            _md = update_data["metadata_json"]
+            if isinstance(_md, dict):
+                _md["private_media"] = True
     ai_metadata_updated = "ai_context_metadata" in update_data
 
     # Track is_public flip from False/None → True. If safety analysis wasn't
@@ -7013,6 +7053,7 @@ async def create_embedding_for_object(
     ).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Not found")
+    _refuse_encrypted(obj)
     if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -7175,6 +7216,16 @@ async def replace_file(
         raise HTTPException(status_code=404, detail="Not found or forbidden")
 
     data = await file.read()
+    if getattr(obj, "encrypted", False):
+        # #3230: owner only (no operator), fresh DEK, name kept, no analysis.
+        if obj.owner_user_id != current_user.id or _is_public_default_master(current_user):
+            raise HTTPException(status_code=404, detail="Not found or forbidden")
+        from storage.encryption import EncryptionError
+        try:
+            updated_obj = await update_file_and_record(db, storage_obj=obj, data=data)
+        except EncryptionError as exc:
+            raise _encryption_http_error(exc)
+        return _hydrate_encrypted_response(StorageObjectResponse.from_orm(updated_obj), updated_obj, request)
     updated_obj = await update_file_and_record(db, storage_obj=obj, data=data)
     updated_obj.original_filename = file.filename or updated_obj.original_filename
 
@@ -7330,6 +7381,7 @@ async def analyze_async(
 
     if not storage_obj:
         raise HTTPException(status_code=404, detail="Storage object not found")
+    _refuse_encrypted(storage_obj)
 
     # Check permissions
     if storage_obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
@@ -7718,6 +7770,7 @@ async def get_object_data_uri(
 
     if not obj:
         raise HTTPException(status_code=404, detail="Public object not found")
+    _refuse_encrypted(obj)
 
     # Anonymous-only endpoint (no auth) → strict policy: even pending pubs blocked
     _check_quarantine(obj, current_user=None)
@@ -8038,6 +8091,10 @@ def create_media_grant(
     db.add(MediaGrant(object_id=obj.id, scope=scope, granted_by_user_id=current_user.id, granted_via=via))
     db.commit()
     print(f"🔗 grant object={obj.id} scope={scope} by_user={current_user.id} via={via}", flush=True)
+    if getattr(obj, "encrypted", False):
+        from storage.encrypted_io import emit_event
+        emit_event("encrypted_share", {"object_id": obj.id, "owner_user_id": obj.owner_user_id,
+                                       "tenant_id": obj.tenant_id, "scope": scope, "by_user_id": current_user.id})
     return {"object_id": obj.id, "scope": scope, "created": True}
 
 

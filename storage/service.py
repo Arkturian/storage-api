@@ -1595,6 +1595,12 @@ async def enqueue_ai_safety_and_transcoding(storage_obj, db=None, skip_ai_safety
     logger.error(f"   skip_ai_safety: {skip_ai_safety}")
     logger.error(f"   ai_mode: {ai_mode}")
 
+    # #3230: nothing derived from an encrypted object, ever — no safety check,
+    # no vision, no transcoding, no embedding. Fail closed before any branch.
+    if getattr(storage_obj, "encrypted", False):
+        logger.error(f"⏭️  encrypted object {storage_obj.id}: no AI, no transcoding")
+        return
+
     # Convert legacy skip_ai_safety to ai_mode
     if skip_ai_safety:
         ai_mode = "none"

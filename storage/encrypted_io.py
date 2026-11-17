@@ -1,6 +1,8 @@
 """Serving and auditing encrypted objects (#3230). Route glue lives in routes.py."""
 from __future__ import annotations
 
+import json
+import os
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
@@ -75,6 +77,22 @@ def principal_of(current_user, signed: bool, kid: Optional[str]) -> str:
     return email + (f"|{scope}" if scope else "")
 
 
+def emit_event(kind: str, payload: dict) -> None:
+    """storage.encrypted_read / storage.encrypted_share on the bus, so Cloud and
+    Comm can tell the owner. Optional (STORAGE_EVENTS_REDIS_URL) and never
+    blocks or breaks a request. Payload carries ids only, never a name."""
+    url = os.getenv("STORAGE_EVENTS_REDIS_URL", "").strip()
+    if not url:
+        return
+    try:
+        import redis
+        r = redis.Redis.from_url(url, socket_timeout=1, socket_connect_timeout=1)
+        r.publish(f"swfme.webhook.storage.{kind}", json.dumps({"event": f"storage.{kind}", **payload,
+                                                              "ts": datetime.utcnow().isoformat() + "Z"}))
+    except Exception:
+        pass
+
+
 def log_decrypt(db, obj, principal: str, via: str, ip: Optional[str], rng: Optional[Tuple[int, int]]) -> None:
     """One row per (object, principal, via) and 5-minute window; a video
     player's burst of Range requests becomes a single line."""
@@ -94,6 +112,10 @@ def log_decrypt(db, obj, principal: str, via: str, ip: Optional[str], rng: Optio
     else:
         db.add(StorageDecryptLog(object_id=obj.id, principal=principal, via=via, ip=ip,
                                  first_at=now, last_at=now, requests=1, range_min=lo, range_max=hi))
+        db.commit()
+        emit_event("encrypted_read", {"object_id": obj.id, "owner_user_id": obj.owner_user_id,
+                                      "tenant_id": obj.tenant_id, "principal": principal, "via": via})
+        return
     db.commit()
 
 

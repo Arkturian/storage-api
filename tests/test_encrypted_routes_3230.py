@@ -245,3 +245,77 @@ def test_delete_removes_ciphertext(env):
     assert path.exists()
     assert env.gs.delete(obj.object_key, "arkturian")
     assert not path.exists()
+
+
+# --- guards (package 4) ------------------------------------------------------
+
+@pytest.mark.parametrize("body,code", [({"is_public": True}, "encrypted_one_way"),
+                                       ({"original_filename": "x.csv"}, "encrypted_one_way"),
+                                       ({"metadata_json": {"private_media": False}}, "private_media_one_way")])
+def test_patch_one_way(env, body, code):
+    oid = _upload(env)["id"]
+    r = env.c.patch(f"/storage/objects/{oid}", json=body)
+    assert r.status_code in (403, 409) and r.json()["detail"]["code"] == code
+    obj = env.s.get(StorageObject, oid)
+    env.s.refresh(obj)
+    assert obj.is_public is False and obj.metadata_json.get("private_media") is True
+
+
+def test_patch_metadata_keeps_private(env):
+    oid = _upload(env)["id"]
+    r = env.c.patch(f"/storage/objects/{oid}", json={"metadata_json": {"note": "x"}, "title": "Q4"})
+    assert r.status_code == 200, r.text
+    obj = env.s.get(StorageObject, oid); env.s.refresh(obj)
+    assert obj.metadata_json.get("private_media") is True and obj.title == "Q4"
+
+
+@pytest.mark.parametrize("method,path", [("post", "/storage/objects/{id}/analyze"), ("post", "/storage/objects/{id}/embed"),
+                                         ("post", "/storage/kg/embed/{id}"), ("post", "/storage/analyze-async/{id}"),
+                                         ("get", "/storage/objects/{id}/data-uri")])
+def test_derived_routes_refuse(env, method, path):
+    oid = _upload(env)["id"]
+    r = getattr(env.c, method)(path.format(id=oid), headers={"X-API-KEY": "ko"})
+    assert r.status_code in (404, 409), (r.status_code, r.text)
+    assert b"Martina" not in r.content
+
+
+def test_get_object_name_only_for_owner(env):
+    oid = _upload(env)["id"]
+    assert env.c.get(f"/storage/objects/{oid}").json()["original_filename"] == "Gehälter 2026.csv"
+    env.state["uid"] = env.master.id
+    r = env.c.get(f"/storage/objects/{oid}")
+    if r.status_code == 200:
+        assert r.json()["original_filename"] == env.E.FILENAME_PLACEHOLDER
+    env.state["uid"] = env.other.id
+    assert env.c.get(f"/storage/objects/{oid}").status_code in (403, 404)
+
+
+def test_enqueue_never_touches_encrypted(env, monkeypatch):
+    import asyncio
+    from storage import service
+    oid = _upload(env)["id"]
+    obj = env.s.get(StorageObject, oid)
+    called = []
+    monkeypatch.setattr(service, "_process_tts_request_from_storage", lambda *a, **k: called.append(1), raising=False)
+    asyncio.run(service.enqueue_ai_safety_and_transcoding(obj, db=env.s, ai_mode="full"))
+    env.s.refresh(obj)
+    assert obj.ai_safety_status == "skipped_encrypted" and obj.transcoding_status is None and not called
+
+
+def test_put_files_replaces_encrypted(env):
+    oid = _upload(env)["id"]
+    r = env.c.put(f"/storage/files/{oid}", files={"file": ("other-name.csv", b"neu", "text/csv")})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["encrypted"] is True and j["original_filename"] == env.E.FILENAME_PLACEHOLDER
+    got = env.c.get(f"/storage/media/{oid}")
+    assert got.content == b"neu" and "Geh%C3%A4lter%202026.csv" in got.headers["content-disposition"]
+
+
+def test_encrypted_read_emits_event_once_per_window(env, monkeypatch):
+    from storage import encrypted_io
+    seen = []
+    monkeypatch.setattr(encrypted_io, "emit_event", lambda kind, p: seen.append((kind, p)))
+    oid = _upload(env)["id"]
+    env.c.get(f"/storage/media/{oid}"); env.c.get(f"/storage/media/{oid}")
+    assert len(seen) == 1 and seen[0][0] == "encrypted_read" and "Geh" not in json.dumps(seen[0][1])
