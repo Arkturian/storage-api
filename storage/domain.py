@@ -191,7 +191,8 @@ async def update_file_and_record(
         # #3230: fresh DEK, same object_key; the name is carried over.
         from storage.encryption import decrypt_filename, unwrap_dek
         tenant = storage_obj.tenant_id or "arkturian"
-        old_dek, _ = unwrap_dek(storage_obj)
+        import asyncio
+        old_dek, _ = await asyncio.to_thread(unwrap_dek, storage_obj)  # KMS call off the event loop
         name = decrypt_filename(storage_obj.enc_filename, old_dek, object_key=storage_obj.object_key, tenant=tenant) \
             if storage_obj.enc_filename else ""
         upd = await generic_storage.replace_encrypted(storage_obj, data, name)

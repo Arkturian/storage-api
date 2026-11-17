@@ -1,3 +1,4 @@
+import asyncio
 import re
 import os
 import shutil
@@ -565,7 +566,8 @@ class GenericStorageService:
         if len(data) > settings.MAX_FILE_SIZE:
             raise ValueError("File too large")
         mime = mime_type if mime_type and mime_type != "application/octet-stream" else self._detect_mime_type(data, original_filename)
-        sealed = seal(data, original_filename, tenant=tenant_id)
+        # KMS round trip (up to 5 s) + AES over the whole file: off the event loop.
+        sealed = await asyncio.to_thread(seal, data, original_filename, tenant=tenant_id)
         self._write_ciphertext(self.encrypted_path_for_key(sealed.object_key, tenant_id), sealed.ciphertext)
         return {
             "object_key": sealed.object_key,
@@ -589,7 +591,8 @@ class GenericStorageService:
         if len(data) > settings.MAX_FILE_SIZE:
             raise ValueError("File too large")
         tenant = storage_obj.tenant_id or "arkturian"
-        sealed = seal(data, original_filename, tenant=tenant, object_key=storage_obj.object_key)
+        sealed = await asyncio.to_thread(seal, data, original_filename, tenant=tenant,
+                                         object_key=storage_obj.object_key)
         DEK_CACHE.drop(storage_obj.object_key)
         self._write_ciphertext(self.encrypted_path_for_key(sealed.object_key, tenant), sealed.ciphertext)
         return {
