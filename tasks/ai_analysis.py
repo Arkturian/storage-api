@@ -30,29 +30,8 @@ from knowledge_graph.pipeline import KnowledgeGraphPipeline
 logger = logging.getLogger(__name__)
 
 
-def _cleanup_scratch_dir(scratch_path: str) -> None:
-    """
-    Remove the pre-processing scratch directory after a task finishes.
-
-    Called only on the success path — on failure we keep the inputs around
-    so retries can re-use them and humans can inspect what tripped the
-    classifier. Scratch lives outside /tmp to survive the nightly tmp cleanup,
-    but it is *not* meant to grow unbounded — every successful task purges
-    its own dir. Best-effort; never raises.
-    """
-    try:
-        p = Path(scratch_path)
-        # Only delete dirs we created (under AI_SCRATCH_DIR or /tmp/ai_*),
-        # never an arbitrary path that ended up in the queue.
-        name = p.name
-        if not (name.startswith("ai_thumbs_") or name.startswith("ai_images_")):
-            return
-        if p.is_dir():
-            shutil.rmtree(p, ignore_errors=True)
-        elif p.parent.name.startswith(("ai_thumbs_", "ai_images_")):
-            shutil.rmtree(p.parent, ignore_errors=True)
-    except Exception as e:
-        logger.warning(f"   ⚠️  Failed to cleanup scratch dir {scratch_path}: {e}")
+# #3243: lives in storage.ai_status (importable without Celery/Chroma).
+from storage.ai_status import cleanup_scratch_dir as _cleanup_scratch_dir  # noqa: E402
 
 
 def _maybe_alert_unsafe(storage_obj, safety_info: dict, danger: int) -> None:
@@ -554,6 +533,10 @@ def process_text_analysis(object_id: int, file_path: str, filename: str) -> Dict
 
     # Trigger embedding generation
     generate_embedding.delay(object_id)
+
+    # #3243: an external-mode download handed over in ai_images_<id>/ is ours
+    # to remove; the object's own stored file is never touched (name check).
+    _cleanup_scratch_dir(file_path)
 
     return {
         "object_id": object_id,

@@ -476,7 +476,9 @@ async def _analyze_csv_chunked(
         if not object_id:
             return
         try:
-            status_dir = Path(f"/tmp/ai_analysis_status_{object_id}")
+            from storage.ai_status import ai_status_dir  # #3243
+            status_dir = ai_status_dir(object_id)
+            status_dir.mkdir(parents=True, exist_ok=True)
             status_file = status_dir / "progress.json"
             progress = {
                 "status": "processing",

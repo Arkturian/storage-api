@@ -1710,6 +1710,7 @@ async def enqueue_ai_safety_and_transcoding(storage_obj, db=None, skip_ai_safety
 
         # Handle external storage mode: download file temporarily for AI analysis
         temp_file_for_external = None
+        external_handed_off = False
         storage_mode = getattr(storage_obj, 'storage_mode', 'copy')
 
         if storage_mode == "external":
@@ -1733,7 +1734,12 @@ async def enqueue_ai_safety_and_transcoding(storage_obj, db=None, skip_ai_safety
                     _ext = Path(str(storage_obj.original_filename or "").replace("\\", "/").split("/")[-1]).suffix.lower()
                     if not _SAFE_EXT_RE.fullmatch(_ext or ""):
                         _ext = ""
-                    _fd, _tmp = _tempfile.mkstemp(prefix=f"external_ai_{int(storage_obj.id)}_", suffix=_ext, dir="/tmp")
+                    # #3243: into the shared scratch root, not storage-api's
+                    # private /tmp — the worker has to read it. The dir name
+                    # ai_images_<id> lets the worker's cleanup remove it.
+                    _ext_dir = _AI_SCRATCH_ROOT / f"ai_images_{int(storage_obj.id)}"
+                    _ext_dir.mkdir(parents=True, exist_ok=True)
+                    _fd, _tmp = _tempfile.mkstemp(prefix="external_", suffix=_ext, dir=str(_ext_dir))
                     os.close(_fd)
                     temp_file_for_external = Path(_tmp)
                     temp_file_for_external.write_bytes(response.content)
@@ -1937,6 +1943,8 @@ async def enqueue_ai_safety_and_transcoding(storage_obj, db=None, skip_ai_safety
             if storage_obj.mime_type == "video/webm" and _is_audio_only_webm_helper(file_path):
                 # Process as audio instead of video
                 _enqueue_ai_task(storage_obj.id, "audio", str(file_path), storage_obj.original_filename, ai_mode)
+                if temp_file_for_external is not None and file_path == temp_file_for_external:
+                    external_handed_off = True  # #3243: the worker reads and removes it
                 print(f"--- SUCCESS: Audio-only WebM queued for AI transcription: {file_path}")
             else:
                 # Regular video processing: optionally enqueue AI analysis, then handle transcoding
@@ -2031,6 +2039,8 @@ async def enqueue_ai_safety_and_transcoding(storage_obj, db=None, skip_ai_safety
             # Audio processing - queue for AI transcription and analysis
             if ai_mode != "none":
                 _enqueue_ai_task(storage_obj.id, "audio", str(file_path), storage_obj.original_filename, ai_mode)
+                if temp_file_for_external is not None and file_path == temp_file_for_external:
+                    external_handed_off = True  # #3243: the worker reads and removes it
                 print(f"--- SUCCESS: Audio queued for AI analysis: {file_path}")
             
         elif (storage_obj.mime_type and (storage_obj.mime_type.startswith("text/") or
@@ -2081,6 +2091,8 @@ async def enqueue_ai_safety_and_transcoding(storage_obj, db=None, skip_ai_safety
 
                 # Generic text analysis (fallback or non-TTS text files)
                 _enqueue_ai_task(storage_obj.id, "text", str(file_path), storage_obj.original_filename, ai_mode)
+                if temp_file_for_external is not None and file_path == temp_file_for_external:
+                    external_handed_off = True  # #3243: the worker reads and removes it
                 print(f"--- SUCCESS: Text queued for AI analysis: {file_path}")
             
     except Exception as e:
@@ -2088,7 +2100,7 @@ async def enqueue_ai_safety_and_transcoding(storage_obj, db=None, skip_ai_safety
         # Don't raise exception here - allow file upload to succeed even if AI queueing fails
     finally:
         # Cleanup temporary file for external storage mode
-        if temp_file_for_external and temp_file_for_external.exists():
+        if temp_file_for_external and temp_file_for_external.exists() and not external_handed_off:
             try:
                 temp_file_for_external.unlink()
                 print(f"🧹 Cleaned up temporary file: {temp_file_for_external}")

@@ -3716,18 +3716,10 @@ async def analyze_existing_object(
             import sys
             from knowledge_graph.pipeline import kg_pipeline
 
-            # Log to file for debugging
-            with open("/tmp/kg_pipeline_debug.log", "a") as log:
-                log.write(f"\n{'='*80}\n")
-                log.write(f"[{__import__('datetime').datetime.now()}] Triggering KG Pipeline for object {obj.id}\n")
-                log.flush()
-
+            # #3243: no more /tmp/kg_pipeline_debug.log — it held whole KG
+            # entries (content excerpts) world-readable. stderr/journal only.
             print(f"🎯 Triggering Knowledge Graph Pipeline for object {obj.id}", file=sys.stderr, flush=True)
             kg_entry = await kg_pipeline.process_storage_object(obj, db)
-
-            with open("/tmp/kg_pipeline_debug.log", "a") as log:
-                log.write(f"KG Pipeline returned: {kg_entry}\n")
-                log.flush()
 
             if kg_entry:
                 print(f"✅ Knowledge Graph Pipeline completed for object {obj.id}", file=sys.stderr, flush=True)
@@ -3736,12 +3728,6 @@ async def analyze_existing_object(
         except Exception as kg_error:
             # Don't fail the entire request if KG processing fails
             # Just log the error and continue
-            with open("/tmp/kg_pipeline_debug.log", "a") as log:
-                log.write(f"ERROR: {kg_error}\n")
-                import traceback as tb
-                tb.print_exc(file=log)
-                log.flush()
-
             print(f"❌ Knowledge Graph Pipeline failed for object {obj.id}: {kg_error}", file=sys.stderr, flush=True)
             import traceback
             traceback.print_exc()
@@ -7139,7 +7125,8 @@ async def get_processing_status(
     import json
     from pathlib import Path
 
-    status_dir = Path(f"/tmp/ai_analysis_status_{object_id}")
+    from storage.ai_status import ai_status_dir  # #3243
+    status_dir = ai_status_dir(object_id)
     status_file = status_dir / "progress.json"
     error_file = status_dir / "error.log"
 

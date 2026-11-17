@@ -386,8 +386,9 @@ async def process_job_async(job_line: str):
         log(f"Worker found job: {object_id} | {job_type} | {filename}")
         
         # Create status directory
-        status_dir = Path(f"/tmp/ai_analysis_status_{object_id}")
-        status_dir.mkdir(exist_ok=True)
+        from storage.ai_status import ai_status_dir  # #3243
+        status_dir = ai_status_dir(object_id)
+        status_dir.mkdir(parents=True, exist_ok=True)
         
         if not content_path.exists():
             raise FileNotFoundError(f"Content path not found: {content_path}")
@@ -418,7 +419,7 @@ async def process_job_async(job_line: str):
         # Write error log
         if object_id and status_dir:
             try:
-                status_dir.mkdir(exist_ok=True)
+                status_dir.mkdir(parents=True, exist_ok=True)
                 with open(status_dir / "error.log", "w") as f:
                     f.write(error_message)
             except Exception:
