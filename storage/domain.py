@@ -26,8 +26,13 @@ async def save_file_and_record(
     tenant_id: Optional[str] = None,
     mime_type: Optional[str] = None,
     ttl_hours: Optional[int] = None,
+    encrypted: bool = False,
 ) -> StorageObject:
     """Save file via GenericStorageService and create a StorageObject row.
+
+    encrypted=True (#3230): copy mode only; ciphertext on disk, wrapped keys in
+    the row, always private (is_public=0 + private_media=1, one-way), no
+    title taken from the file, no embedded metadata.
 
     Args:
         storage_mode: "copy" (default) saves file to storage, "reference" for filesystem path, "external" for web URI
@@ -37,8 +42,17 @@ async def save_file_and_record(
 
     Returns the persisted StorageObject.
     """
+    if encrypted:
+        if storage_mode != "copy" or reference_path or external_uri:
+            raise ValueError("encrypted objects support storage_mode=copy only")
+        saved = await generic_storage.save_encrypted(
+            data=data,
+            original_filename=original_filename,
+            tenant_id=tenant_id or "arkturian",
+            mime_type=mime_type,
+        )
     # External mode - file stays on external server, only metadata saved
-    if storage_mode == "external":
+    elif storage_mode == "external":
         if not external_uri:
             raise ValueError("external_uri is required when storage_mode='external'")
 
@@ -111,6 +125,10 @@ async def save_file_and_record(
         from datetime import datetime, timedelta
         expires_at = datetime.utcnow() + timedelta(hours=ttl_hours)
 
+    if encrypted:
+        is_public = False
+        metadata["private_media"] = True
+
     storage_obj = StorageObject(
         owner_user_id=owner_user_id,
         tenant_id=tenant_id or "arkturian",
@@ -143,6 +161,10 @@ async def save_file_and_record(
         ai_context_metadata=ai_context_metadata or {},
         expires_at=expires_at,
     )
+    if encrypted:
+        for _f in ("encrypted", "enc_kid", "enc_wrapped_dek", "enc_recovery_kid",
+                   "enc_wrapped_dek_recovery", "enc_filename", "plain_size"):
+            setattr(storage_obj, _f, saved[_f])
     db.add(storage_obj)
     db.commit()
     db.refresh(storage_obj)
@@ -165,6 +187,21 @@ async def update_file_and_record(
     context: Optional[str] = None,
 ) -> StorageObject:
     """Overwrite file via GenericStorageService and update StorageObject row."""
+    if getattr(storage_obj, "encrypted", False):
+        # #3230: fresh DEK, same object_key; the name is carried over.
+        from storage.encryption import decrypt_filename, unwrap_dek
+        tenant = storage_obj.tenant_id or "arkturian"
+        old_dek, _ = unwrap_dek(storage_obj)
+        name = decrypt_filename(storage_obj.enc_filename, old_dek, object_key=storage_obj.object_key, tenant=tenant) \
+            if storage_obj.enc_filename else ""
+        upd = await generic_storage.replace_encrypted(storage_obj, data, name)
+        for _f, _v in upd.items():
+            setattr(storage_obj, _f, _v)
+        if context is not None:
+            storage_obj.context = context
+        db.commit()
+        db.refresh(storage_obj)
+        return storage_obj
     updated = await generic_storage.update_file(
         storage_obj.object_key,
         data,

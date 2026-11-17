@@ -533,8 +533,98 @@ class GenericStorageService:
             **metadata,
         }
 
+    # --- Encrypted objects (#3230) ------------------------------------------
+    def encrypted_path_for_key(self, object_key: str, tenant_id: str = "arkturian") -> Path:
+        """Ciphertext location. Own tree media-enc/ (0700 storageapi in prod), so a
+        release without the feature finds nothing there instead of serving
+        ciphertext as if it were the file."""
+        from storage.encryption import ENCRYPTED_DIRNAME
+        base = self.upload_root / ENCRYPTED_DIRNAME
+        return self._confined(self._tenant_subdir(base, tenant_id), object_key)
+
+    def _write_ciphertext(self, path: Path, ciphertext: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_name(f".{path.name}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(ciphertext)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    async def save_encrypted(self, *, data: bytes, original_filename: str, tenant_id: str = "arkturian",
+                             mime_type: Optional[str] = None) -> dict:
+        """Encrypt in RAM and write only ciphertext. No metadata extraction, no
+        audio reconciliation, no thumbnails — nothing that reads the plaintext
+        from disk. MIME comes from the magic bytes in memory."""
+        from storage.encryption import FILENAME_PLACEHOLDER, seal
+        if len(data) > settings.MAX_FILE_SIZE:
+            raise ValueError("File too large")
+        mime = mime_type if mime_type and mime_type != "application/octet-stream" else self._detect_mime_type(data, original_filename)
+        sealed = seal(data, original_filename, tenant=tenant_id)
+        self._write_ciphertext(self.encrypted_path_for_key(sealed.object_key, tenant_id), sealed.ciphertext)
+        return {
+            "object_key": sealed.object_key,
+            "original_filename": FILENAME_PLACEHOLDER,
+            "file_size_bytes": sealed.plain_size,
+            "mime_type": mime,
+            # checksum of the CIPHERTEXT: it is exposed via the API and in ?v=
+            "checksum": self._checksum(sealed.ciphertext),
+            "encrypted": True,
+            "enc_kid": sealed.enc_kid,
+            "enc_wrapped_dek": sealed.enc_wrapped_dek,
+            "enc_recovery_kid": sealed.enc_recovery_kid,
+            "enc_wrapped_dek_recovery": sealed.enc_wrapped_dek_recovery,
+            "enc_filename": sealed.enc_filename,
+            "plain_size": sealed.plain_size,
+        }
+
+    async def replace_encrypted(self, storage_obj, data: bytes, original_filename: str) -> dict:
+        """New bytes for an encrypted object: always a FRESH DEK, same object_key."""
+        from storage.encryption import DEK_CACHE, FILENAME_PLACEHOLDER, seal
+        if len(data) > settings.MAX_FILE_SIZE:
+            raise ValueError("File too large")
+        tenant = storage_obj.tenant_id or "arkturian"
+        sealed = seal(data, original_filename, tenant=tenant, object_key=storage_obj.object_key)
+        DEK_CACHE.drop(storage_obj.object_key)
+        self._write_ciphertext(self.encrypted_path_for_key(sealed.object_key, tenant), sealed.ciphertext)
+        return {
+            "original_filename": FILENAME_PLACEHOLDER,
+            "file_size_bytes": sealed.plain_size,
+            "mime_type": self._detect_mime_type(data, original_filename),
+            "checksum": self._checksum(sealed.ciphertext),
+            "enc_kid": sealed.enc_kid,
+            "enc_wrapped_dek": sealed.enc_wrapped_dek,
+            "enc_recovery_kid": sealed.enc_recovery_kid,
+            "enc_wrapped_dek_recovery": sealed.enc_wrapped_dek_recovery,
+            "enc_filename": sealed.enc_filename,
+            "plain_size": sealed.plain_size,
+        }
+
+    def delete_encrypted(self, object_key: str, tenant_id: str = "arkturian") -> bool:
+        from storage.encryption import DEK_CACHE
+        DEK_CACHE.drop(object_key)
+        try:
+            self.encrypted_path_for_key(object_key, tenant_id).unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except Exception:
+            return False
+
     def absolute_path_for_key(self, object_key: str, tenant_id: str = "arkturian") -> Path:
-        """Get absolute path for object_key, supporting both old (flat) and new (tenant-based) structure."""
+        """Get absolute path for object_key, supporting both old (flat) and new (tenant-based) structure.
+
+        Encrypted objects (#3230) never resolve to a plaintext path: every
+        internal reader (thumbnails, AI, transcoding, KG, data-uri, ...) goes
+        through here and fails closed instead of handing out ciphertext."""
+        from storage.encryption import EncryptedObjectError
+        if str(object_key or "").startswith("enc_"):
+            raise EncryptedObjectError("encrypted object has no plaintext path")
         # Try tenant-based path first (new structure)
         tenant_path = self.media_dir / tenant_id / object_key
         if tenant_path.exists():
@@ -588,6 +678,8 @@ class GenericStorageService:
             shutil.rmtree(hls_dir, ignore_errors=True)
 
     def delete(self, object_key: str, tenant_id: str = "arkturian") -> bool:
+        if str(object_key or "").startswith("enc_"):
+            return self.delete_encrypted(object_key, tenant_id)
         try:
             path = self.absolute_path_for_key(object_key, tenant_id)
             self._delete_physical_assets(path, tenant_id)

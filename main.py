@@ -281,6 +281,31 @@ async def storage_media_head_headers(request: Request, call_next):
             if not obj.is_public and not _head_signed:
                 return Response(status_code=403, headers=_apply_cors_for_head({}, request))
 
+            # #3230: an encrypted object answers HEAD only for a valid, short
+            # signed link, with the plaintext size and no derived variants. The
+            # name stays out of HEAD (it would cost a KMS call per probe).
+            if getattr(obj, "encrypted", False):
+                from fastapi import HTTPException as _HE
+                from storage import encrypted_io as _eio
+                if request.scope.get("storage_named_alias"):
+                    return Response(status_code=409, headers=_apply_cors_for_head({}, request))
+                try:
+                    _eio.check_signed_ttl(_exp if _head_signed else None)
+                    _eio.reject_transforms(request.query_params.get("variant"),
+                                           {k: request.query_params.get(k) for k in _eio.TRANSFORM_PARAMS})
+                except _HE as _he:
+                    return Response(status_code=_he.status_code, headers=_apply_cors_for_head({}, request))
+                _enc_headers = _apply_cors_for_head({
+                    "Content-Type": obj.mime_type or "application/octet-stream",
+                    "Content-Length": str(int(obj.plain_size or 0)),
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "private, no-store",
+                    "ETag": _eio.etag_for(obj),
+                    "X-Encrypted": "1",
+                    "Content-Disposition": storage_routes.content_disposition("inline", f"objekt-{object_id}", object_id),
+                }, request)
+                return Response(status_code=200, headers=_enc_headers)
+
             danger = obj.ai_danger_potential or 0
             threshold = int(os.getenv("QUARANTINE_DANGER_THRESHOLD", "7"))
             is_unsafe_blocked = (obj.ai_safety_rating == "unsafe" and danger >= threshold)
@@ -483,6 +508,7 @@ class _MediaFilenameAlias:
                 scope = dict(scope)
                 scope["path"] = m.group(1)
                 scope["raw_path"] = m.group(1).encode()
+                scope["storage_named_alias"] = True  # #3230: encrypted objects refuse named URLs
         await self.app(scope, receive, send)
 
 

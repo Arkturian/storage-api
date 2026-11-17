@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, Column, Integer, String, Boolean, Float, Text, DateTime, ForeignKey, JSON, Index, UniqueConstraint
+from sqlalchemy import BigInteger, Column, LargeBinary, Integer, String, Boolean, Float, Text, DateTime, ForeignKey, JSON, Index, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -183,6 +183,33 @@ class StorageObject(Base):
     # final hard-delete. NULL = live.
     tombstoned_at = Column(DateTime, nullable=True, index=True)
 
+    # Encrypted objects (#3230, Content post 6192). Only wrapped keys live
+    # here; the plaintext DEK exists only in RAM. original_filename carries a
+    # placeholder, the real name is enc_filename (HKDF subkey of the DEK).
+    encrypted = Column(Boolean, default=False, nullable=False, server_default="0")
+    enc_kid = Column(String, nullable=True)
+    enc_wrapped_dek = Column(LargeBinary, nullable=True)
+    enc_recovery_kid = Column(String, nullable=True)
+    enc_wrapped_dek_recovery = Column(LargeBinary, nullable=True)
+    enc_filename = Column(Text, nullable=True)
+    plain_size = Column(BigInteger, nullable=True)
+
+
+class StorageDecryptLog(Base):
+    """One row per (object, principal, route) and 5-minute window (#3230)."""
+    __tablename__ = "storage_decrypt_log"
+
+    id = Column(Integer, primary_key=True)
+    object_id = Column(Integer, index=True, nullable=False)
+    principal = Column(String, nullable=False)
+    via = Column(String, nullable=False)
+    ip = Column(String, nullable=True)
+    first_at = Column(DateTime, default=datetime.utcnow, index=True)
+    last_at = Column(DateTime, default=datetime.utcnow)
+    requests = Column(Integer, default=1)
+    range_min = Column(BigInteger, nullable=True)
+    range_max = Column(BigInteger, nullable=True)
+
 
 class AsyncTask(Base):
     __tablename__ = "async_tasks"
@@ -256,6 +283,7 @@ class StorageObjectResponse(BaseModel):
     ai_context_metadata: Optional[Dict[str, Any]] = None
     tenant_id: str = "arkturian"
     owner_email: Optional[str] = None  # Populated from join in search queries
+    encrypted: bool = False  # #3230; wrapped keys are never part of a response
     expires_at: Optional[datetime] = None  # TTL: NULL = never expires, future datetime = scheduled purge
 
     class Config:

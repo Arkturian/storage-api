@@ -188,6 +188,14 @@ async def connect_db():
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_storage_objects_opencloud_file_id "
                                   "ON storage_objects (opencloud_file_id)"))
 
+                # Encrypted objects (#3230)
+                for _col, _ddl in (("encrypted", "BOOLEAN NOT NULL DEFAULT 0"), ("enc_kid", "VARCHAR"),
+                                   ("enc_wrapped_dek", "BLOB"), ("enc_recovery_kid", "VARCHAR"),
+                                   ("enc_wrapped_dek_recovery", "BLOB"), ("enc_filename", "TEXT"),
+                                   ("plain_size", "BIGINT")):
+                    if _col not in scols:
+                        conn.execute(text(f"ALTER TABLE storage_objects ADD COLUMN {_col} {_ddl}"))
+
                 conn.commit()
     except Exception as e:
         print(f"Warning: Database migration failed: {e}")

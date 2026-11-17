@@ -2244,7 +2244,9 @@ def ensure_principal(
 @router.post("/upload-ticket")
 def create_upload_ticket(
     request: Request,
-    filename: str = Query(..., description="Name the stored object should carry, e.g. 'photo.jpg'"),
+    filename: Optional[str] = Query(None, description="Name the stored object should carry, e.g. 'photo.jpg'. For encrypted=true send it as X-Filename header instead (never in the URL)."),
+    encrypted: bool = Query(False, description="#3230: store ciphertext only; implies private, no AI"),
+    x_filename: Optional[str] = Header(None, alias="X-Filename"),
     context: Optional[str] = Query(None),
     collection_id: Optional[str] = Query(None),
     is_public: bool = Query(False),
@@ -2265,12 +2267,16 @@ def create_upload_ticket(
     import secrets as _secrets
 
     grant_scope = _check_upload_scope(grant_scope)
+    filename = _resolve_upload_filename(filename, x_filename, encrypted)
+    if encrypted:
+        _require_encryption_ready()
     _purge_expired_tickets()
     token = _secrets.token_urlsafe(32)
     _UPLOAD_TICKETS[token] = {
         "owner_user_id": current_user.id,
         "tenant_id": tenant_id,
         "filename": filename,
+        "encrypted": bool(encrypted),
         "context": context,
         "collection_id": collection_id,
         "is_public": bool(is_public),
@@ -2305,6 +2311,14 @@ async def consume_upload_ticket(
     data = await request.body()
     if not data:
         raise HTTPException(status_code=400, detail={"error": "empty body — PUT the raw file bytes", "code": "empty_upload"})
+
+    if ticket.get("encrypted"):
+        from types import SimpleNamespace as _NS
+        return await _store_encrypted_upload(
+            request, db, db.get(User, ticket["owner_user_id"]) or _NS(id=ticket["owner_user_id"]),
+            ticket["tenant_id"], data=data, filename=ticket["filename"], content_type=None,
+            context=ticket["context"], collection_id=ticket["collection_id"], link_id=None,
+            ttl_hours=ticket["ttl_hours"], grant_scope=ticket.get("grant_scope"))
 
     # Trust the BYTES, not the name. A ticket client states the filename up
     # front and often guesses wrong — a phone photo announced as "photo.jpg"
@@ -2482,7 +2496,9 @@ async def upload_chunk(
     upload_id: str = Query(..., description="Client-chosen id grouping the chunks of ONE file"),
     index: int = Query(..., ge=0, description="0-based index of this chunk"),
     total_chunks: int = Query(..., ge=1, description="How many chunks the file has in total"),
-    filename: str = Query(..., description="Name the finished object should carry"),
+    filename: Optional[str] = Query(None, description="Name the finished object should carry. For encrypted=true send it as X-Filename header instead (never in the URL)."),
+    encrypted: bool = Query(False, description="#3230: store ciphertext only; implies private, no AI"),
+    x_filename: Optional[str] = Header(None, alias="X-Filename"),
     sha256: Optional[str] = Query(None, description="Optional sha256 of the RAW file — verified after reassembly"),
     context: Optional[str] = Query(None),
     collection_id: Optional[str] = Query(None),
@@ -2502,6 +2518,9 @@ async def upload_chunk(
     Returns {received, missing} while incomplete, and the storage object once done.
     """
     grant_scope = _check_upload_scope(grant_scope)
+    filename = _resolve_upload_filename(filename, x_filename, encrypted)
+    if encrypted:
+        _require_encryption_ready()
     import base64 as _b64
 
     _purge_expired_chunk_sessions()
@@ -2522,6 +2541,7 @@ async def upload_chunk(
         "private": bool(private),
         "ai_mode": ai_mode,
         "ttl_hours": ttl_hours,
+        "encrypted": bool(encrypted),
         "total_chunks": total_chunks,
         "parts": {},
         "expires_at": time.time() + _CHUNK_SESSION_TTL,
@@ -2570,6 +2590,12 @@ async def upload_chunk(
         pass
 
     _assert_upload_plausible(data, sess["filename"], _sniffed)
+
+    if sess.get("encrypted"):
+        return await _store_encrypted_upload(
+            request, db, current_user, sess["tenant_id"], data=data, filename=sess["filename"],
+            content_type=_sniffed, context=sess["context"], collection_id=sess["collection_id"],
+            link_id=None, ttl_hours=sess["ttl_hours"], grant_scope=grant_scope)
 
     saved_obj = await save_file_and_record(
         db,
@@ -2720,6 +2746,101 @@ def _check_reference_upload(storage_mode: Optional[str], reference_path: Optiona
             "error": "reference_path is outside the allowed roots", "code": "reference_path_forbidden"})
 
 
+# --- Encrypted uploads (#3230, Content post 6192) ---------------------------
+def _check_encrypted_upload(storage_mode, reference_path, external_uri, hls_result, reference_id,
+                            owner_email, file) -> None:
+    if storage_mode != "copy" or reference_path or external_uri:
+        raise HTTPException(status_code=400, detail={
+            "error": "encrypted objects support storage_mode=copy only", "code": "encrypted_copy_only"})
+    if hls_result or reference_id:
+        raise HTTPException(status_code=400, detail={
+            "error": "HLS results cannot be encrypted", "code": "encrypted_no_hls"})
+    if owner_email:
+        raise HTTPException(status_code=400, detail={
+            "error": "encrypted uploads belong to the caller; owner_email is not supported",
+            "code": "encrypted_owner_email_unsupported"})
+    if file is None:
+        raise HTTPException(status_code=400, detail={
+            "error": "encrypted uploads need the file bytes", "code": "encrypted_needs_bytes"})
+
+
+def _require_encryption_ready() -> None:
+    from storage.encryption import load_config
+    if not load_config().ready:
+        raise HTTPException(status_code=503, detail={
+            "error": "encryption is not configured on this instance", "code": "encryption_key_unavailable"})
+
+
+def _resolve_upload_filename(filename: Optional[str], x_filename: Optional[str], encrypted: bool) -> str:
+    """Encrypted uploads take the name only from the X-Filename header
+    (percent-encoded UTF-8), so it never lands in access logs via the URL."""
+    from urllib.parse import unquote
+    if encrypted:
+        if filename:
+            raise HTTPException(status_code=400, detail={
+                "error": "for encrypted uploads send the filename as X-Filename header, not in the URL",
+                "code": "encrypted_filename_in_query"})
+        return unquote(x_filename or "")
+    name = filename or (unquote(x_filename) if x_filename else None)
+    if not name:
+        raise HTTPException(status_code=422, detail={"error": "filename is required", "code": "filename_required"})
+    return name
+
+
+def _encryption_http_error(exc):
+    from storage.encryption import EncryptionError
+    if isinstance(exc, EncryptionError):
+        return HTTPException(status_code=exc.status, detail={"error": str(exc), "code": exc.code})
+    return HTTPException(status_code=500, detail={"error": "encryption failed", "code": "encryption_error"})
+
+
+def _hydrate_encrypted_response(resp, obj, request):
+    _hydrate_storage_urls(resp, obj, request)
+    resp.thumbnail_url = None
+    resp.webview_url = None
+    resp.share_url = None
+    resp.encrypted = True
+    return resp
+
+
+async def _store_encrypted_upload(request, db, current_user, tenant_id, *, data: bytes, filename: str,
+                                  content_type, context, collection_id, link_id, ttl_hours, grant_scope):
+    """The whole encrypted upload path. Deliberately separate from the general
+    upload flow: no reuse_existing (it would be an oracle for existing names),
+    no AI, no transcoding, no focal point, no title from the file name."""
+    from storage.encryption import EncryptionError, load_config
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant ID required")
+    if not load_config().ready:
+        raise HTTPException(status_code=503, detail={
+            "error": "encryption is not configured on this instance", "code": "encryption_key_unavailable"})
+    try:
+        saved_obj = await save_file_and_record(
+            db,
+            owner_user_id=current_user.id,
+            data=data,
+            original_filename=filename,
+            context=context,
+            is_public=False,
+            collection_id=collection_id,
+            link_id=link_id,
+            tenant_id=tenant_id,
+            mime_type=content_type,
+            ttl_hours=ttl_hours,
+            encrypted=True,
+        )
+    except EncryptionError as exc:
+        raise _encryption_http_error(exc)
+    saved_obj.ai_safety_status = "skipped_encrypted"
+    saved_obj.transcoding_status = None
+    db.commit()
+    resp = StorageObjectResponse.from_orm(saved_obj)
+    resp.grant_scope = _bind_on_upload(db, saved_obj, grant_scope, current_user)
+    return _hydrate_encrypted_response(resp, saved_obj, request)
+
+
 @router.post("/upload", response_model=StorageObjectResponse)
 async def upload_file(
     request: Request,
@@ -2749,12 +2870,16 @@ async def upload_file(
     grant_scope: Optional[str] = Form(None),  # Post 5250: bind the new object to this scope (media_grants) in the same request
     private: bool = Form(False),  # Issue #420: set metadata_json.private_media → /storage/media serves this object only to owner/admin (403 for everyone else). Set AT UPLOAD to avoid the window where a confidential file is enumerable before a follow-up PATCH lands.
     transcribe_audio: bool = Form(False),  # Video: demux audio + transcribe via api-ai → audio_transcript (needs an analysis ai_mode)
+    encrypted: bool = Form(False),  # #3230: store ciphertext only (KMS envelope); implies private, no AI/thumbnails/transcoding
     x_compute_focal: Optional[str] = Header(None),  # Opt-in: "true"/"1" → compute face focal point at upload (images only, AI-cost-free, default off)
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
     api_key_header: Optional[str] = Security(_APIKeyHeader(name="X-API-KEY", auto_error=False)),
     tenant_id: Optional[str] = Depends(get_tenant_id),
 ):
+    if encrypted:
+        _check_encrypted_upload(storage_mode, reference_path, external_uri, hls_result, reference_id,
+                                owner_email, file)
     _check_reference_upload(storage_mode, reference_path, current_user, db)
     # #3032 (Befund 107): external_uri was stored unchecked and later fetched
     # by /data-uri with a plain client — a full-response SSRF. Refuse URLs that
@@ -2804,14 +2929,20 @@ async def upload_file(
         file = _PathOnlyFile()  # type: ignore[assignment]
         glogger.error(f"🚀 UPLOAD_FILE [path-only]: size={len(data)}, ref={reference_path}")
     else:
-        # Normal multipart upload
-        with open("/tmp/upload_debug.log", "a") as f_log:
-            import datetime
-            f_log.write(f"{datetime.datetime.now()} - UPLOAD ENTRY: filename={file.filename}\n")
-            f_log.flush()
-        glogger.error(f"🚀🚀🚀 UPLOAD_FILE ENTRY POINT: filename={file.filename}")
+        # Normal multipart upload. (The former /tmp/upload_debug.log wrote every
+        # filename to ext4 — gone, #3230.) Encrypted uploads never log the name.
+        if encrypted:
+            glogger.error("🚀 UPLOAD_FILE ENTRY POINT: encrypted upload")
+        else:
+            glogger.error(f"🚀🚀🚀 UPLOAD_FILE ENTRY POINT: filename={file.filename}")
         data = await file.read()
-        glogger.error(f"🚀 UPLOAD_FILE: after read, size={len(data)}, context={context}")
+        glogger.error(f"🚀 UPLOAD_FILE: after read, size={len(data)}")
+
+    if encrypted:
+        return await _store_encrypted_upload(
+            request, db, current_user, tenant_id, data=data, filename=file.filename or "",
+            content_type=getattr(file, "content_type", None), context=context,
+            collection_id=collection_id, link_id=link_id, ttl_hours=ttl_hours, grant_scope=grant_scope)
 
     try:
         # Special handling for HLS results: get tenant/owner from original video
@@ -3891,6 +4022,57 @@ def get_asset_variant_references_batch(
     return {"results": results_map}
 
 
+# --- Reading encrypted objects (#3230) --------------------------------------
+def _encrypted_read_allowed(obj, current_user, db, signed: bool) -> None:
+    """Bytes of an encrypted object: owner, or a valid signed link (which is
+    only minted for a scope the object is bound to). No operator bypass, no
+    public default master — both would make 'encrypted' meaningless."""
+    from storage import grant_restrict
+    if signed:
+        return
+    if current_user is None:
+        raise HTTPException(status_code=401, detail={"error": "authentication required", "code": "auth_required"})
+    if _is_public_default_master(current_user) or getattr(obj, "owner_user_id", None) != current_user.id:
+        raise HTTPException(status_code=403, detail={"error": "This object is private", "code": "private_media"})
+    if not grant_restrict.allowed(obj, db):
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _serve_encrypted(obj, db, current_user, *, signed: bool, kid, exp, request, via: str,
+                     variant=None, range_header=None, download=False, if_none_match=None,
+                     transforms=None, head_only: bool = False):
+    from storage import encrypted_io as _eio
+    from storage.encryption import EncryptionError, unwrap_dek
+    if request is not None and request.scope.get("storage_named_alias"):
+        raise HTTPException(status_code=409, detail={
+            "error": f"encrypted objects are served only under /storage/media/{obj.id}",
+            "code": "encrypted_no_named_url"})
+    if signed:
+        _eio.check_signed_ttl(exp)
+    _encrypted_read_allowed(obj, current_user, db, signed)
+    _eio.reject_transforms(variant, transforms or {})
+    path = generic_storage.encrypted_path_for_key(obj.object_key, obj.tenant_id or "arkturian")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail={"error": "encrypted file missing", "code": "file_missing"})
+    try:
+        dek, rewrapped = unwrap_dek(obj)
+        _eio.lazy_rewrap(db, obj, rewrapped)
+        rng = _eio.parse_range(range_header, int(obj.plain_size or 0))
+        disposition = content_disposition("attachment" if download else "inline",
+                                          _eio.real_filename(obj, dek) or f"objekt-{obj.id}", obj.id)
+        ip = None
+        try:
+            ip = request.headers.get("x-real-ip") or (request.client.host if request.client else None)
+        except Exception:
+            pass
+        if not head_only:
+            _eio.log_decrypt(db, obj, _eio.principal_of(current_user, signed, kid), via, ip, rng)
+        return _eio.build_response(path=path, obj=obj, dek=dek, rng=rng, disposition=disposition,
+                                   head_only=head_only, if_none_match=if_none_match)
+    except EncryptionError as exc:
+        raise _encryption_http_error(exc)
+
+
 @router.head("/media/{object_id}")
 def head_media_variant(
     object_id: int,
@@ -3914,6 +4096,9 @@ def head_media_variant(
     # Safety gate — same policy as GET. 451 instead of 200 for blocked content.
     _check_quarantine(obj, current_user, db)
     _check_media_access(obj, current_user, db)
+    if getattr(obj, "encrypted", False):
+        return _serve_encrypted(obj, db, current_user, signed=False, kid=None, exp=None, request=None,
+                                via="head", head_only=True)
 
     # Re-use original resolver so we report actual file details.
     # For HEAD it is enough to resolve the source path without heavy processing.
@@ -4398,6 +4583,8 @@ def get_media_variant(
     kid: Optional[str] = Query(None, description="Signed link: key id"),
     sig: Optional[str] = Query(None, description="Signed link: HMAC; opens this one object until exp, nothing else"),
     if_none_match: Optional[str] = Header(None, alias="If-None-Match"),
+    range_header: Optional[str] = Header(None, alias="Range"),
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
     tenant_id: Optional[str] = Depends(get_tenant_id_optional),
@@ -4473,6 +4660,17 @@ def get_media_variant(
         if _oc.missing:
             raise HTTPException(status_code=404, detail={
                 "error": "file is missing in OpenCloud", "code": "file_missing"})
+
+    if getattr(obj, "encrypted", False):
+        return _serve_encrypted(
+            obj, db, current_user, signed=_signed, kid=kid, exp=exp, request=request, via="media",
+            variant=variant, range_header=range_header, download=download, if_none_match=if_none_match,
+            transforms=dict(display_for=display_for, width=width, height=height, aspect_ratio=aspect_ratio,
+                            format=format, quality=quality, bitrate=bitrate, sample_rate=sample_rate,
+                            channels=channels, trim=trim, margin=margin, bg_color=bg_color, decimate=decimate,
+                            texture_format=texture_format, texture_quality=texture_quality,
+                            texture_max_size=texture_max_size, mesh_compression=mesh_compression,
+                            output=output, preset=preset))
 
     media_type_current = (obj.mime_type or "application/octet-stream")
     mime = media_type_current.lower()
@@ -6315,6 +6513,10 @@ def download_file(
     
     if not obj:
         raise HTTPException(status_code=404, detail="Not found")
+    if getattr(obj, "encrypted", False):
+        # #3230: one read path for ciphertext (rights, decryption, decrypt log).
+        raise HTTPException(status_code=409, detail={
+            "error": f"encrypted object: read it via /storage/media/{object_id}", "code": "encrypted_use_media"})
 
     # Safety quarantine
     _check_quarantine(obj, current_user, db)
@@ -7931,8 +8133,14 @@ def sign_media_links(
             items.append({"id": oid, "url": url, "signed": False, "public": True}); continue
         if oid not in granted:
             items.append({"id": oid, "error": "not_granted"}); continue
-        s = _signing.sign(oid, payload.ttl, now=now)
-        items.append({"id": oid, "url": f"{url}?exp={s['exp']}&kid={s['kid']}&sig={s['sig']}", "signed": True})
+        # #3230: an encrypted object's link lives at most 5 minutes.
+        _ttl = min(payload.ttl, 300) if getattr(o, "encrypted", False) else payload.ttl
+        s = _signing.sign(oid, _ttl, now=now)
+        _item = {"id": oid, "url": f"{url}?exp={s['exp']}&kid={s['kid']}&sig={s['sig']}", "signed": True}
+        if _ttl != payload.ttl:
+            _item["ttl"] = _ttl
+            _item["encrypted"] = True
+        items.append(_item)
         signed_n += 1
     expires = datetime.fromtimestamp(int(now) + payload.ttl, tz=timezone.utc).isoformat().replace("+00:00", "Z")
     print(f"✍️ sign key={row.label or row.tenant_id} tenant={payload.tenant} scope={scope} ids={len(ids)} signed={signed_n} ttl={payload.ttl}", flush=True)
