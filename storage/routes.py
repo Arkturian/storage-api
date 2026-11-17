@@ -6430,6 +6430,11 @@ def list_objects(
         response_obj.thumbnail_url = urls["thumbnail_url"]
         response_obj.webview_url = urls["webview_url"]
         response_obj.share_url = build_share_url(storage_obj.id, storage_obj.original_filename, bool(storage_obj.is_public))
+        if getattr(storage_obj, "encrypted", False):
+            # #3230: placeholder name in lists (no KMS call per row), no derivatives.
+            response_obj.thumbnail_url = None
+            response_obj.webview_url = None
+            response_obj.share_url = None
 
         # Check for HLS files if this is a video or pre-transcoded zip
         if (storage_obj.mime_type and storage_obj.mime_type.startswith("video/")) or \

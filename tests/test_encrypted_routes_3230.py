@@ -319,3 +319,19 @@ def test_encrypted_read_emits_event_once_per_window(env, monkeypatch):
     oid = _upload(env)["id"]
     env.c.get(f"/storage/media/{oid}"); env.c.get(f"/storage/media/{oid}")
     assert len(seen) == 1 and seen[0][0] == "encrypted_read" and "Geh" not in json.dumps(seen[0][1])
+
+
+def test_list_shows_owner_placeholder_without_derivatives(env):
+    oid = _upload(env, collection_id="vertraulich")["id"]
+    r = env.c.get("/storage/list", params={"collection_id": "vertraulich", "mine": "true"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    items = body["items"] if isinstance(body, dict) else body
+    row = next(i for i in items if i["id"] == oid)
+    assert row["encrypted"] is True and row["original_filename"] == env.E.FILENAME_PLACEHOLDER
+    assert row["thumbnail_url"] is None and row["webview_url"] is None
+    env.state["uid"] = env.other.id
+    r = env.c.get("/storage/list", params={"collection_id": "vertraulich", "mine": "false"})
+    body = r.json()
+    items = body["items"] if isinstance(body, dict) else body
+    assert all(i["id"] != oid for i in items)
