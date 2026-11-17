@@ -74,7 +74,10 @@ def principal_of(current_user, signed: bool, kid: Optional[str]) -> str:
     if signed:
         return f"signed:{kid or '?'}" + (f"|{scope}" if scope else "")
     email = getattr(current_user, "email", None) or f"user:{getattr(current_user, 'id', '?')}"
-    return email + (f"|{scope}" if scope else "")
+    # #3230: name the key, not only the account — system@api is shared by many
+    # services ("system@api[service:mcp-gateway]", "...[master]").
+    via = getattr(current_user, "_storage_auth_via", None)
+    return email + (f"[{via}]" if via else "") + (f"|{scope}" if scope else "")
 
 
 def emit_event(kind: str, payload: dict) -> None:

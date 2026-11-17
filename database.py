@@ -79,6 +79,8 @@ _TENANT_KEY_COLUMNS = (
     ("acts_as_email", "VARCHAR(255)"),
     ("may_attach_hls", "BOOLEAN DEFAULT 0"),
     ("may_set_owner", "BOOLEAN DEFAULT 0"),
+    ("may_assert_scope", "BOOLEAN DEFAULT 0"),
+    ("may_sign_encrypted", "BOOLEAN DEFAULT 0"),
 )
 
 

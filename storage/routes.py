@@ -4070,8 +4070,46 @@ def _encrypted_read_allowed(obj, current_user, db, signed: bool) -> None:
         raise HTTPException(status_code=401, detail={"error": "authentication required", "code": "auth_required"})
     if _is_public_default_master(current_user) or getattr(obj, "owner_user_id", None) != current_user.id:
         raise HTTPException(status_code=403, detail={"error": "This object is private", "code": "private_media"})
+    if not _shared_owner_direct_ok(obj, current_user, db):
+        raise HTTPException(status_code=403, detail={
+            "error": "encrypted objects of a shared service account are read through a signed link",
+            "code": "encrypted_shared_owner"})
     if not grant_restrict.allowed(obj, db):
         raise HTTPException(status_code=404, detail="Not found")
+
+
+def _is_shared_identity(user_id, db) -> bool:
+    """#3230: an account several services authenticate as — system@api and
+    <tenant>@api machine accounts, or any target of a key's acts_as_email.
+    Owning an object through such an account says nothing about WHICH
+    service or agent asked. Unknown or failed lookups count as shared."""
+    if user_id is None or db is None:
+        return True
+    try:
+        from models import TenantAPIKey
+        email = (db.query(User.email).filter(User.id == user_id).scalar() or "").strip().lower()
+        if not email or email.endswith("@api"):
+            return True
+        return db.query(TenantAPIKey.api_key).filter(
+            func.lower(TenantAPIKey.acts_as_email) == email).first() is not None
+    except Exception:
+        return True
+
+
+def _shared_owner_direct_ok(obj, current_user, db) -> bool:
+    """#3230: may the owner path (bytes or real name) serve this encrypted
+    object to this caller? Always for a personal owner. For a shared service
+    account only a key flagged may_assert_scope (the MCP gateway) narrowed to
+    one agent by X-Grant-Scope-Restrict; the caller still needs that agent's
+    grant (checked by grant_restrict.allowed). Everyone else — the other
+    services acting as system@api and the master — goes through a signed link."""
+    from storage import grant_restrict
+    if not _is_shared_identity(getattr(obj, "owner_user_id", None), db):
+        return True
+    via = str(getattr(current_user, "_storage_auth_via", "") or "")
+    return (via.startswith("service:")
+            and bool(getattr(current_user, "_storage_may_assert_scope", False))
+            and bool(grant_restrict.current_scope()))
 
 
 def _serve_encrypted(obj, db, current_user, *, signed: bool, kid, exp, request, via: str,
@@ -6230,7 +6268,8 @@ def get_object_metadata(
         # The real name only for the owner itself — never for the public
         # default master (the MCP gateway's identity) and never for operators.
         if current_user is not None and obj.owner_user_id == current_user.id \
-                and not _is_public_default_master(current_user):
+                and not _is_public_default_master(current_user) \
+                and _shared_owner_direct_ok(obj, current_user, db):
             from storage import encrypted_io as _eio
             from storage.encryption import EncryptionError, unwrap_dek
             try:
@@ -8223,6 +8262,11 @@ def sign_media_links(
             items.append({"id": oid, "url": url, "signed": False, "public": True}); continue
         if oid not in granted:
             items.append({"id": oid, "error": "not_granted"}); continue
+        # #3230: only a key flagged may_sign_encrypted (cloud-api) mints links
+        # for encrypted objects; the other signing keys of the tenant could
+        # otherwise sign any agent's scope and read its encrypted files.
+        if getattr(o, "encrypted", False) and not bool(getattr(row, "may_sign_encrypted", False)):
+            items.append({"id": oid, "error": "encrypted_sign_not_allowed"}); continue
         # #3230: an encrypted object's link lives at most 5 minutes.
         _ttl = min(payload.ttl, 300) if getattr(o, "encrypted", False) else payload.ttl
         s = _signing.sign(oid, _ttl, now=now)

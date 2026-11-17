@@ -30,7 +30,9 @@ def env(tmp_path, monkeypatch):
     models.Base.metadata.create_all(eng, tables=[StorageObject.__table__, MediaGrant.__table__, TenantAPIKey.__table__])
     S = sessionmaker(bind=eng)
     s = S()
-    s.add(TenantAPIKey(api_key="k-sign", tenant_id="arkturian", label="cloud", is_active=True, sign_tenants="arkturian"))
+    s.add(TenantAPIKey(api_key="k-sign", tenant_id="arkturian", label="cloud", is_active=True, sign_tenants="arkturian",
+                       may_sign_encrypted=True))
+    s.add(TenantAPIKey(api_key="k-content", tenant_id="arkturian", label="content", is_active=True, sign_tenants="arkturian"))
     priv = {"private_media": True}
     enc = StorageObject(object_key="enc_a.bin", tenant_id="arkturian", is_public=False, metadata_json=priv, encrypted=True)
     plain = StorageObject(object_key="u1_b", tenant_id="arkturian", is_public=False, metadata_json=priv)
@@ -66,3 +68,16 @@ def test_encrypted_capped_plain_untouched(env):
     exp_plain = int(items[plain_id]["url"].split("exp=")[1].split("&")[0])
     assert items[enc_id]["ttl"] == 300 and items[enc_id]["encrypted"] is True
     assert exp_enc <= now + 301 and exp_plain >= now + 899
+
+
+def test_signing_key_without_flag_cannot_sign_encrypted(env):
+    """#3230: content-api/comm-api sign every scope of the tenant; without
+    may_sign_encrypted they get no link for an encrypted object (and still
+    for a plain one)."""
+    c, (enc_id, plain_id) = env
+    r = c.post("/storage/sign", headers={"X-API-KEY": "k-content"},
+               json={"tenant": "arkturian", "scope": SCOPE, "ids": [enc_id, plain_id], "ttl": 300})
+    assert r.status_code == 200, r.text
+    items = {i["id"]: i for i in r.json()["items"]}
+    assert items[enc_id] == {"id": enc_id, "error": "encrypted_sign_not_allowed"}
+    assert items[plain_id].get("signed") is True

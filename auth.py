@@ -62,6 +62,9 @@ def _service_identity(api_key: str, db: Session) -> Optional[User]:
         db.rollback()
     setattr(user, _AUTH_VIA, f"service:{row.label or row.tenant_id}")
     setattr(user, "_storage_privileged_admin", False)
+    # #3230: only this key may turn X-Grant-Scope-Restrict into access to an
+    # encrypted object of the shared account (the MCP gateway).
+    setattr(user, "_storage_may_assert_scope", bool(getattr(row, "may_assert_scope", False)))
     return user
 
 

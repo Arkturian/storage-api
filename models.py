@@ -53,6 +53,14 @@ class TenantAPIKey(Base):
     # #1960: upload on behalf of another owner (owner_email), e.g. api-ai's
     # images for their requester. Nothing else.
     may_set_owner = Column(Boolean, default=False, nullable=True)
+    # #3230: the MCP gateway sets X-Grant-Scope-Restrict from a verified agent
+    # JWT. Only a key with this flag may use that header to reach an encrypted
+    # object owned by a shared service account (system@api); for every other
+    # key the header still only takes visibility away. Set by ops only.
+    may_assert_scope = Column(Boolean, default=False, nullable=True)
+    # #3230: may mint signed links for encrypted objects (cloud-api's signing
+    # key). Other signing keys keep signing everything else. Set by ops only.
+    may_sign_encrypted = Column(Boolean, default=False, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
 
