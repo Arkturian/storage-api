@@ -191,12 +191,17 @@ AIAPI = "ai-key-0123456789abcdef0123456789abcd"
 
 @pytest.mark.parametrize("key,allowed", [(GATEWAY, False), (CLOUDAPI, False), ("random-users-key", False),
                                          (AIAPI, True), (MASTER, True)])
-def test_owner_email_needs_operator_or_may_set_owner(db, monkeypatch, key, allowed):
+def test_owner_email_needs_operator_or_may_set_owner(db, monkeypatch, tmp_path, key, allowed):
     """owner_email used to need only trust_level admin, which every key acting
     as system@api inherits. Now only the master or a may_set_owner key."""
     _rotate(monkeypatch)
     from database import get_db
     from storage import routes as R
+    from storage.service import generic_storage
+    monkeypatch.setattr(generic_storage, "upload_root", tmp_path)
+    for attr in ("media_dir", "thumbnails_dir", "webview_dir"):
+        (tmp_path / attr).mkdir()
+        monkeypatch.setattr(generic_storage, attr, tmp_path / attr)
     s = db()
     s.add(TenantAPIKey(api_key=AIAPI, tenant_id="arkturian", label="api-ai", is_active=True,
                        acts_as_email="system@api", may_set_owner=True))
