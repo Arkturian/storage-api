@@ -32,7 +32,7 @@ from database import get_db
 # filesystem unchanged.
 _TTS_CACHE_NAME_RE = re.compile(r"tts_[A-Za-z0-9_.-]{1,160}\.[A-Za-z0-9]{1,8}")
 _SAFE_EXT_RE = re.compile(r"(\.[a-z0-9]{1,10})?")
-from tenancy.config import api_key_for_tenant
+from tenancy.config import api_key_for_tenant  # noqa: F401  (re-export, #1960)
 
 # TTS functionality is optional
 try:
@@ -781,14 +781,10 @@ async def _fetch_media_variant_via_http(
     if quality:
         params["quality"] = quality
 
+    # #1960: no key on this self-fetch. It sent the tenant's default key (the
+    # public literal) or the master; a public variant needs neither, and a
+    # private one is not ours to fetch over HTTP.
     headers = {}
-    tenant_key = api_key_for_tenant(tenant_id)
-    if tenant_key:
-        headers["X-API-KEY"] = tenant_key
-    else:
-        default_key = getattr(settings, "API_KEY", None)
-        if default_key:
-            headers["X-API-KEY"] = default_key
 
     try:
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:

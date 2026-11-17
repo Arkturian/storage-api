@@ -76,7 +76,9 @@ class Settings:
     GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
     OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
     ANTHROPIC_API_KEY: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
-    API_KEY: str = os.getenv("API_KEY", "Inetpass1")
+    # #1960 step 5: no built-in master. Set API_KEY via EnvironmentFile;
+    # unset means no master at all.
+    API_KEY: str = os.getenv("API_KEY", "")
 
     # External APIs
     ONEAL_API_BASE: str = os.getenv("ONEAL_API_BASE", "https://oneal-api.arkturian.com")
