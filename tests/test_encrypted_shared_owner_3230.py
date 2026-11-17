@@ -171,6 +171,16 @@ def test_log_names_the_key(env):
     assert principals == [f"system@api[service:mcp-gateway]|{AGENT}"]
 
 
+def test_read_event_carries_scope(env, monkeypatch):
+    from storage import encrypted_io
+    events = []
+    monkeypatch.setattr(encrypted_io, "emit_event", lambda kind, payload: events.append((kind, payload)))
+    oid = _upload(env)
+    env.c.get(f"/storage/media/{oid}", headers={"X-Grant-Scope-Restrict": AGENT})
+    reads = [p for k, p in events if k == "encrypted_read"]
+    assert len(reads) == 1 and reads[0]["scope"] == AGENT and reads[0]["object_id"] == oid
+
+
 def test_acts_as_target_with_personal_looking_email_is_shared(env):
     """Not only *@api: any account a key acts as is shared."""
     from storage import routes as R

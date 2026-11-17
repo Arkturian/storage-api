@@ -116,10 +116,36 @@ def log_decrypt(db, obj, principal: str, via: str, ip: Optional[str], rng: Optio
         db.add(StorageDecryptLog(object_id=obj.id, principal=principal, via=via, ip=ip,
                                  first_at=now, last_at=now, requests=1, range_min=lo, range_max=hi))
         db.commit()
+        from storage import grant_restrict
         emit_event("encrypted_read", {"object_id": obj.id, "owner_user_id": obj.owner_user_id,
-                                      "tenant_id": obj.tenant_id, "principal": principal, "via": via})
+                                      "tenant_id": obj.tenant_id, "principal": principal, "via": via,
+                                      "scope": grant_restrict.current_scope()})
         return
     db.commit()
+
+
+def log_sign(db, obj, signer: str, scope: str, ttl: int) -> None:
+    """#3230: a signed link carries no identity, so the read itself only shows
+    `signed:<kid>`. Who asked is known when the link is minted: one log row
+    per (object, signer, scope) and window, plus an `encrypted_sign` event
+    (cloud-api tells the owner which agent opened the file)."""
+    from models import StorageDecryptLog
+    now = datetime.utcnow()
+    principal = f"sign:{signer}|{scope}"
+    row = (db.query(StorageDecryptLog)
+           .filter(StorageDecryptLog.object_id == obj.id, StorageDecryptLog.principal == principal,
+                   StorageDecryptLog.via == "sign", StorageDecryptLog.last_at >= now - LOG_WINDOW)
+           .order_by(StorageDecryptLog.id.desc()).first())
+    if row:
+        row.last_at = now
+        row.requests = (row.requests or 0) + 1
+        db.commit()
+        return
+    db.add(StorageDecryptLog(object_id=obj.id, principal=principal, via="sign", ip=None,
+                             first_at=now, last_at=now, requests=1, range_min=None, range_max=None))
+    db.commit()
+    emit_event("encrypted_sign", {"object_id": obj.id, "owner_user_id": obj.owner_user_id,
+                                  "tenant_id": obj.tenant_id, "scope": scope, "signer": signer, "ttl": ttl})
 
 
 def lazy_rewrap(db, obj, rewrapped: Optional[bytes]) -> None:

@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker  # noqa: E402
 import main  # noqa: E402
 import models  # noqa: E402
 from database import get_db  # noqa: E402
-from models import MediaGrant, StorageObject, TenantAPIKey  # noqa: E402
+from models import MediaGrant, StorageDecryptLog, StorageObject, TenantAPIKey  # noqa: E402
 from storage import routes as storage_routes  # noqa: E402
 
 SCOPE = "cloud-session:Martina-GPT"
@@ -27,7 +27,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("STORAGE_SIGN_ACTIVE_KID", "k1")
     models._hwm_ready.clear()
     eng = create_engine(f"sqlite:///{tmp_path/'s.db'}")
-    models.Base.metadata.create_all(eng, tables=[StorageObject.__table__, MediaGrant.__table__, TenantAPIKey.__table__])
+    models.Base.metadata.create_all(eng, tables=[StorageObject.__table__, MediaGrant.__table__, TenantAPIKey.__table__,
+                                                 StorageDecryptLog.__table__])
     S = sessionmaker(bind=eng)
     s = S()
     s.add(TenantAPIKey(api_key="k-sign", tenant_id="arkturian", label="cloud", is_active=True, sign_tenants="arkturian",
@@ -52,7 +53,9 @@ def env(tmp_path, monkeypatch):
     main.app.dependency_overrides[get_db] = _db
     main.app.dependency_overrides[storage_routes.get_current_user] = lambda: SimpleNamespace(id=1)
     try:
-        yield TestClient(main.app), ids
+        client = TestClient(main.app)
+        client.S = S
+        yield client, ids
     finally:
         main.app.dependency_overrides.clear()
 
@@ -81,3 +84,22 @@ def test_signing_key_without_flag_cannot_sign_encrypted(env):
     items = {i["id"]: i for i in r.json()["items"]}
     assert items[enc_id] == {"id": enc_id, "error": "encrypted_sign_not_allowed"}
     assert items[plain_id].get("signed") is True
+
+
+def test_signing_an_encrypted_object_is_logged_with_scope_and_signer(env, monkeypatch):
+    """#3230: the read of a signed link only knows `signed:<kid>`; who asked is
+    recorded when the link is minted, and cloud-api gets `encrypted_sign`."""
+    from storage import encrypted_io
+    events = []
+    monkeypatch.setattr(encrypted_io, "emit_event", lambda kind, payload: events.append((kind, payload)))
+    c, (enc_id, plain_id) = env
+    for _ in range(2):  # second sign in the window: same row, one event
+        r = c.post("/storage/sign", headers={"X-API-KEY": "k-sign"},
+                   json={"tenant": "arkturian", "scope": SCOPE, "ids": [enc_id, plain_id], "ttl": 300})
+        assert r.status_code == 200, r.text
+    s = c.S()
+    rows = s.query(StorageDecryptLog).all()
+    assert [(x.object_id, x.principal, x.via, x.requests) for x in rows] == [(enc_id, f"sign:cloud|{SCOPE}", "sign", 2)]
+    assert [k for k, _ in events] == ["encrypted_sign"]
+    assert events[0][1]["scope"] == SCOPE and events[0][1]["signer"] == "cloud" and events[0][1]["object_id"] == enc_id
+    s.close()

@@ -8271,6 +8271,12 @@ def sign_media_links(
         _ttl = min(payload.ttl, 300) if getattr(o, "encrypted", False) else payload.ttl
         s = _signing.sign(oid, _ttl, now=now)
         _item = {"id": oid, "url": f"{url}?exp={s['exp']}&kid={s['kid']}&sig={s['sig']}", "signed": True}
+        if getattr(o, "encrypted", False):
+            try:
+                from storage import encrypted_io as _eio
+                _eio.log_sign(db, o, row.label or row.tenant_id, scope, _ttl)
+            except Exception as _exc:  # the audit row must never cost the link
+                print(f"⚠️ encrypted sign log failed object={oid}: {type(_exc).__name__}", flush=True)
         if _ttl != payload.ttl:
             _item["ttl"] = _ttl
             _item["encrypted"] = True
