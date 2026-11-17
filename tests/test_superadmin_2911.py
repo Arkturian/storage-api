@@ -148,4 +148,8 @@ def test_machine_account_never_operator(db):
              trust_level="admin", device_ids=[])
     assert auth.is_privileged_admin(u, db) is False
     sys_user = db.query(User).filter(User.email == "system@api").one()
+    # #1960: system@api is an operator only when it came in through the master key
+    assert auth.is_privileged_admin(sys_user, db) is False
+    sys_user._storage_privileged_admin = None
+    sys_user._storage_auth_via = "master"
     assert auth.is_privileged_admin(sys_user, db) is True

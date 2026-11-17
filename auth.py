@@ -34,6 +34,37 @@ def generate_api_key() -> str:
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(32))
 
+# How the current request authenticated (#1960): "master", "service:<label>",
+# "user-key" or "tenant-key". is_privileged_admin trusts system@api only via
+# "master", so no other key of that account is ever an operator.
+_AUTH_VIA = "_storage_auth_via"
+
+
+def _service_identity(api_key: str, db: Session) -> Optional[User]:
+    try:
+        from models import TenantAPIKey
+        row = (db.query(TenantAPIKey)
+               .filter(TenantAPIKey.api_key == api_key, TenantAPIKey.is_active.is_(True),
+                       TenantAPIKey.acts_as_email.isnot(None))
+               .one_or_none())
+    except Exception:
+        return None
+    if row is None:
+        return None
+    user = db.query(User).filter(User.email == row.acts_as_email).first()
+    if user is None:
+        return None
+    try:
+        row.last_used_at = datetime.utcnow()
+        user.last_active_at = datetime.utcnow()
+        db.commit()
+    except Exception:
+        db.rollback()
+    setattr(user, _AUTH_VIA, f"service:{row.label or row.tenant_id}")
+    setattr(user, "_storage_privileged_admin", False)
+    return user
+
+
 def verify_api_key(api_key: str, db: Session) -> Optional[User]:
     """Verify API key and return user"""
     if not api_key:
@@ -60,6 +91,7 @@ def verify_api_key(api_key: str, db: Session) -> Optional[User]:
         # Update last active and return
         user.last_active_at = datetime.utcnow()
         db.commit()
+        setattr(user, _AUTH_VIA, "master")
         return user
 
     # A deactivated tenant key authenticates nobody (#2911 follow-up). Without
@@ -68,12 +100,20 @@ def verify_api_key(api_key: str, db: Session) -> Optional[User]:
     if tenant_key_state(api_key, db) is False:
         return None
 
+    # #1960 variant 3: a service key that acts as an existing account
+    # (system@api for the MCP gateway / cloud-api). Owner of what that account
+    # owns, never an operator.
+    acting = _service_identity(api_key, db)
+    if acting is not None:
+        return acting
+
     # Check user API keys
     user = db.query(User).filter(User.api_key == api_key).first()
     if user:
         # Update last active time
         user.last_active_at = datetime.utcnow()
         db.commit()
+        setattr(user, _AUTH_VIA, "user-key")
         return user
 
     # Auto-provision user accounts for API keys defined via tenant config
@@ -254,6 +294,10 @@ def is_privileged_admin(current_user, db) -> bool:
         email = str(getattr(current_user, "email", "") or "").lower()
         machine_account = email.endswith("@api") and email != "system@api"
         result = tenant_key_state(key, db) is None and not machine_account
+        # #1960: system@api is an operator only through the master key itself,
+        # never through a service key acting as it or its users.api_key.
+        if result and email == "system@api" and getattr(current_user, _AUTH_VIA, None) != "master":
+            result = False
     except Exception:
         return False
     if result and email == "system@api" and settings.API_KEY == _BUILTIN_DEFAULT_MASTER:

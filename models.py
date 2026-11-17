@@ -42,6 +42,11 @@ class TenantAPIKey(Base):
     # A key with sign_scopes may only sign: it cannot move, share, unshare or
     # look up grants, since those act on arbitrary scopes (Post 5764).
     sign_scopes = Column(String(1000), nullable=True)
+    # #1960 (variant 3): a key that authenticates AS an existing account,
+    # typically system@api for the MCP gateway or cloud-api, so ownership of
+    # their uploads stays intact — but never as an operator. Only the real
+    # master (settings.API_KEY) makes system@api an operator. Set by ops only.
+    acts_as_email = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
 

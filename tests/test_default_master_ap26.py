@@ -22,7 +22,9 @@ from storage import default_master_tally as T  # noqa: E402
 
 
 def _system_user():
-    return SimpleNamespace(email="system@api", trust_level="admin", api_key="generated-not-the-master")
+    # authenticated through the master key (auth sets this in verify_api_key, #1960)
+    return SimpleNamespace(email="system@api", trust_level="admin", api_key="generated-not-the-master",
+                           _storage_auth_via="master")
 
 
 def test_default_master_still_operator_until_switched(monkeypatch):

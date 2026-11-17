@@ -1,0 +1,142 @@
+"""#1960 variant 3: system@api is an operator only through the real master.
+Service keys that act as system@api (MCP gateway, cloud-api) keep ownership
+of its uploads but are never operators; the public literal dies at step 5."""
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from fastapi import FastAPI  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy.orm import sessionmaker  # noqa: E402
+
+import auth  # noqa: E402
+import config  # noqa: E402
+from models import Base, StorageObject, Tenant, TenantAPIKey, User  # noqa: E402
+
+LITERAL = "Inetpass1"
+MASTER = "fresh-master-0123456789abcdef0123456789"
+GATEWAY = "gw-key-0123456789abcdef0123456789abcd"
+CLOUDAPI = "ca-key-0123456789abcdef0123456789abcd"
+
+
+@pytest.fixture
+def db(tmp_path, monkeypatch):
+    eng = create_engine(f"sqlite:///{tmp_path/'t.db'}", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(eng)
+    S = sessionmaker(bind=eng)
+    s = S()
+    s.add(Tenant(id="arkturian", display_name="Arkturian"))
+    s.add(User(email="system@api", display_name="System", password_hash="", api_key="random-users-key",
+               trust_level="admin", device_ids=[]))
+    s.add_all([
+        TenantAPIKey(api_key=GATEWAY, tenant_id="arkturian", label="mcp-gateway", is_active=True,
+                     acts_as_email="system@api"),
+        TenantAPIKey(api_key=CLOUDAPI, tenant_id="arkturian", label="cloud-api", is_active=True,
+                     acts_as_email="system@api"),
+        TenantAPIKey(api_key=LITERAL, tenant_id="arkturian", label="default", is_active=True),
+    ])
+    s.commit()
+    yield S
+    s.close()
+
+
+def _rotate(monkeypatch, value=MASTER):
+    monkeypatch.setattr(config.settings, "API_KEY", value)
+    monkeypatch.setattr(auth.settings, "API_KEY", value)
+
+
+def _who(S, key):
+    s = S()
+    u = auth.verify_api_key(key, s)
+    return s, u
+
+
+def test_new_master_is_operator(db, monkeypatch):
+    _rotate(monkeypatch)
+    s, u = _who(db, MASTER)
+    assert u.email == "system@api" and auth.is_privileged_admin(u, s) is True
+
+
+@pytest.mark.parametrize("key", [GATEWAY, CLOUDAPI])
+def test_service_keys_are_system_api_but_not_operator(db, monkeypatch, key):
+    _rotate(monkeypatch)
+    s, u = _who(db, key)
+    assert u.email == "system@api"
+    assert auth.is_privileged_admin(u, s) is False
+
+
+def test_users_api_key_of_system_is_not_operator(db, monkeypatch):
+    _rotate(monkeypatch)
+    s, u = _who(db, "random-users-key")
+    assert u.email == "system@api" and auth.is_privileged_admin(u, s) is False
+
+
+def test_literal_after_step5_is_401(db, monkeypatch):
+    _rotate(monkeypatch)
+    s = db()
+    s.query(TenantAPIKey).filter(TenantAPIKey.api_key == LITERAL).update({"is_active": False})
+    s.commit()
+    assert auth.verify_api_key(LITERAL, s) is None
+
+
+def test_literal_row_left_active_is_never_operator(db, monkeypatch):
+    """Step 4 forgotten: the literal would fall back to a plain tenant key."""
+    _rotate(monkeypatch)
+    s, u = _who(db, LITERAL)
+    assert u is not None and u.email != "system@api" and auth.is_privileged_admin(u, s) is False
+
+
+def test_service_key_before_rotation_matches_today(db, monkeypatch):
+    _rotate(monkeypatch, LITERAL)
+    s, u = _who(db, GATEWAY)
+    assert u.email == "system@api" and auth.is_privileged_admin(u, s) is False
+    from storage.routes import _is_public_default_master
+    assert _is_public_default_master(u) is True  # same restrictions as the literal today
+
+
+def test_deactivated_service_key_authenticates_nobody(db, monkeypatch):
+    _rotate(monkeypatch)
+    s = db()
+    s.query(TenantAPIKey).filter(TenantAPIKey.api_key == GATEWAY).update({"is_active": False})
+    s.commit()
+    assert auth.verify_api_key(GATEWAY, s) is None
+
+
+def test_gateway_keeps_owner_access_over_the_route(db, monkeypatch, tmp_path):
+    """assets_download reads metadata as owner: a private agent upload of
+    system@api stays readable with the gateway key, and the operator-only
+    tenant listing does not."""
+    _rotate(monkeypatch)
+    from database import get_db
+    from storage import routes as R
+    s = db()
+    sys_id = s.query(User).filter(User.email == "system@api").one().id
+    other = User(email="human@x", display_name="h", password_hash="", api_key="kh", trust_level="user", device_ids=[])
+    s.add(other); s.commit()
+    mine = StorageObject(object_key="u1_a", tenant_id="arkturian", owner_user_id=sys_id, is_public=False,
+                         metadata_json={"private_media": True}, original_filename="a.pdf", mime_type="application/pdf", file_size_bytes=1)
+    foreign = StorageObject(object_key="u2_b", tenant_id="arkturian", owner_user_id=other.id, is_public=False,
+                            original_filename="b.pdf", mime_type="application/pdf", file_size_bytes=1)
+    s.add_all([mine, foreign]); s.commit()
+    ids = (mine.id, foreign.id)
+    s.close()
+
+    def _db():
+        d = db()
+        try:
+            yield d
+        finally:
+            d.close()
+    app = FastAPI()
+    app.include_router(R.router, prefix="/storage")
+    app.dependency_overrides[get_db] = _db
+    c = TestClient(app)
+    h = {"X-API-KEY": GATEWAY}
+    assert c.get(f"/storage/objects/{ids[0]}", headers=h).status_code == 200
+    assert c.get(f"/storage/objects/{ids[1]}", headers=h).status_code in (403, 404)
+    hm = {"X-API-KEY": MASTER}
+    assert c.get(f"/storage/objects/{ids[1]}", headers=hm).status_code == 200

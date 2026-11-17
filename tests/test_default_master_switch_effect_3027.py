@@ -58,8 +58,13 @@ def env(tmp_path, monkeypatch):
     app = FastAPI()
     app.include_router(R.router, prefix="/storage")
     app.dependency_overrides[get_db] = lambda: s
-    app.dependency_overrides[get_current_user_optional] = lambda: s.get(User, system.id)
-    app.dependency_overrides[get_current_user] = lambda: s.get(User, system.id)
+    def _master():  # what verify_api_key returns for the master key (#1960)
+        u = s.get(User, system.id)
+        u._storage_auth_via = "master"
+        u._storage_privileged_admin = None
+        return u
+    app.dependency_overrides[get_current_user_optional] = _master
+    app.dependency_overrides[get_current_user] = _master
     app.dependency_overrides[get_tenant_id_optional] = lambda: "arkturian"
     app.dependency_overrides[get_tenant_id] = lambda: "arkturian"
     yield SimpleNamespace(c=TestClient(app), s=s, o=objs)
