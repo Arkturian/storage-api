@@ -19,7 +19,7 @@ from pathlib import Path
 from io import BytesIO
 from datetime import datetime, timezone
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from storage.pillow_plugins import ensure_heif_support
 
 ensure_heif_support()
@@ -5534,8 +5534,19 @@ def get_media_variant(
                 save_kwargs = {"quality": q, "method": 6}
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             out.save(dest_path, format=("JPEG" if target_format in {"jpg", "jpeg"} else target_format.upper()), **save_kwargs)
+    except HTTPException:
+        raise
+    except UnidentifiedImageError:
+        # #3285: image/* by MIME type, but no decoder (AutoCAD .dwg as
+        # image/vnd.dwg, ...). The portal grid asked for webp previews and got
+        # 500 every time; the original stays available without parameters.
+        raise HTTPException(status_code=415, detail={
+            "error": "no image variants for this file type; fetch the original without parameters",
+            "code": "variant_unsupported", "mime_type": mime})
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Derivative generation failed: {e}")
+        # No server path in the answer (#3285: it used to echo the full file path).
+        print(f"⚠️ derivative generation failed object={object_id}: {type(e).__name__}: {e}", flush=True)
+        raise HTTPException(status_code=500, detail={"error": "derivative generation failed", "code": "derivative_failed"})
 
     media_type = {
         "jpg": "image/jpeg",
