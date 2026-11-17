@@ -8261,6 +8261,7 @@ def sign_media_links(
     now = time.time()
     items = []
     signed_n = 0
+    min_ttl = payload.ttl  # #3235: expires_at must not promise more than the shortest link
     for oid in ids:
         o = objs.get(oid)
         if o is None or getattr(o, "tombstoned_at", None) is not None:
@@ -8280,6 +8281,7 @@ def sign_media_links(
             items.append({"id": oid, "error": "encrypted_sign_not_allowed"}); continue
         # #3230: an encrypted object's link lives at most 5 minutes.
         _ttl = min(payload.ttl, 300) if getattr(o, "encrypted", False) else payload.ttl
+        min_ttl = min(min_ttl, _ttl)
         s = _signing.sign(oid, _ttl, now=now)
         _item = {"id": oid, "url": f"{url}?exp={s['exp']}&kid={s['kid']}&sig={s['sig']}", "signed": True}
         if getattr(o, "encrypted", False):
@@ -8295,7 +8297,7 @@ def sign_media_links(
             _item["ttl"] = _ttl
         items.append(_item)
         signed_n += 1
-    expires = datetime.fromtimestamp(int(now) + payload.ttl, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    expires = datetime.fromtimestamp(int(now) + min_ttl, tz=timezone.utc).isoformat().replace("+00:00", "Z")
     print(f"✍️ sign key={row.label or row.tenant_id} tenant={payload.tenant} scope={scope} ids={len(ids)} signed={signed_n} ttl={payload.ttl}", flush=True)
     return {"expires_at": expires, "items": items}
 

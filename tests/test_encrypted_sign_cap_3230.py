@@ -116,3 +116,19 @@ def test_encrypted_flag_set_without_capping(env, ttl):
     items = {i["id"]: i for i in r.json()["items"]}
     assert items[enc_id]["encrypted"] is True and "ttl" not in items[enc_id]
     assert "encrypted" not in items[plain_id]
+
+
+def test_expires_at_follows_the_capped_link(env):
+    """#3235: the batch expires_at said ttl=900 while the encrypted link died
+    after 300 s; it now reports the earliest expiry among the links."""
+    from datetime import datetime
+    c, (enc_id, plain_id) = env
+    now = time.time()
+    r = c.post("/storage/sign", headers={"X-API-KEY": "k-sign"},
+               json={"tenant": "arkturian", "scope": SCOPE, "ids": [enc_id, plain_id], "ttl": 900})
+    exp_at = datetime.fromisoformat(r.json()["expires_at"].replace("Z", "+00:00")).timestamp()
+    assert now + 299 <= exp_at <= now + 302
+    r = c.post("/storage/sign", headers={"X-API-KEY": "k-sign"},
+               json={"tenant": "arkturian", "scope": SCOPE, "ids": [plain_id], "ttl": 900})
+    exp_at = datetime.fromisoformat(r.json()["expires_at"].replace("Z", "+00:00")).timestamp()
+    assert exp_at >= now + 899
