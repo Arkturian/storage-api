@@ -103,3 +103,16 @@ def test_signing_an_encrypted_object_is_logged_with_scope_and_signer(env, monkey
     assert [k for k, _ in events] == ["encrypted_sign"]
     assert events[0][1]["scope"] == SCOPE and events[0][1]["signer"] == "cloud" and events[0][1]["object_id"] == enc_id
     s.close()
+
+
+@pytest.mark.parametrize("ttl", [60, 300])
+def test_encrypted_flag_set_without_capping(env, ttl):
+    """#3235 reads `encrypted` from the item; it must not depend on whether
+    the requested ttl was capped. `ttl` appears only when it was."""
+    c, (enc_id, plain_id) = env
+    r = c.post("/storage/sign", headers={"X-API-KEY": "k-sign"},
+               json={"tenant": "arkturian", "scope": SCOPE, "ids": [enc_id, plain_id], "ttl": ttl})
+    assert r.status_code == 200, r.text
+    items = {i["id"]: i for i in r.json()["items"]}
+    assert items[enc_id]["encrypted"] is True and "ttl" not in items[enc_id]
+    assert "encrypted" not in items[plain_id]

@@ -8283,6 +8283,9 @@ def sign_media_links(
         s = _signing.sign(oid, _ttl, now=now)
         _item = {"id": oid, "url": f"{url}?exp={s['exp']}&kid={s['kid']}&sig={s['sig']}", "signed": True}
         if getattr(o, "encrypted", False):
+            # Always marked: the portal (#3235) recognises encrypted files by
+            # this flag, also when the requested ttl needed no capping.
+            _item["encrypted"] = True
             try:
                 from storage import encrypted_io as _eio
                 _eio.log_sign(db, o, row.label or row.tenant_id, scope, _ttl)
@@ -8290,7 +8293,6 @@ def sign_media_links(
                 print(f"⚠️ encrypted sign log failed object={oid}: {type(_exc).__name__}", flush=True)
         if _ttl != payload.ttl:
             _item["ttl"] = _ttl
-            _item["encrypted"] = True
         items.append(_item)
         signed_n += 1
     expires = datetime.fromtimestamp(int(now) + payload.ttl, tz=timezone.utc).isoformat().replace("+00:00", "Z")
