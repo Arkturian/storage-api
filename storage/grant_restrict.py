@@ -15,14 +15,67 @@ anyone may send it, and a caller that omits it is judged exactly as before.
 from __future__ import annotations
 
 import contextvars
+import re
 from typing import Optional
 
 HEADER = b"x-grant-scope-restrict"
+# #3329: the narrowed agent's verified tenants, set by the MCP gateway from
+# the checked JWT. Believed only from a key flagged may_assert_scope and only
+# together with X-Grant-Scope-Restrict; otherwise treated as empty.
+TENANTS_HEADER = b"x-grant-scope-tenants"
 _scope: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("grant_scope_restrict", default=None)
+_tenants_raw: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("grant_scope_tenants", default=None)
+_api_key: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("grant_scope_api_key", default=None)
+_tenants_ok: contextvars.ContextVar[Optional[frozenset]] = contextvars.ContextVar("grant_scope_tenants_ok", default=None)
+_TENANT_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
+LEVELS = ("personal", "intern")
 
 
 def current_scope() -> Optional[str]:
     return _scope.get()
+
+
+def trusted_tenants(db) -> frozenset:
+    """Tenants of the narrowed agent, or empty unless every condition holds:
+    restrict header present, tenants header well-formed (<= 100 slugs), and
+    the presenting key is active and flagged may_assert_scope."""
+    if not current_scope():
+        return frozenset()
+    cached = _tenants_ok.get()
+    if cached is not None:
+        return cached
+    result = frozenset()
+    raw, key = _tenants_raw.get(), _api_key.get()
+    if raw and key and db is not None:
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if 0 < len(parts) <= 100 and all(_TENANT_RE.match(p) for p in parts):
+            try:
+                from models import TenantAPIKey
+                row = (db.query(TenantAPIKey)
+                       .filter(TenantAPIKey.api_key == key, TenantAPIKey.is_active.is_(True)).one_or_none())
+                if row is not None and bool(getattr(row, "may_assert_scope", False)):
+                    result = frozenset(parts)
+            except Exception:
+                result = frozenset()
+    _tenants_ok.set(result)
+    return result
+
+
+def level_readable(obj, db) -> bool:
+    """A level object the narrowed agent may see: intern with any verified
+    tenant, personal when the object's tenant is one of them."""
+    if obj is None or getattr(obj, "is_public", False) or getattr(obj, "encrypted", False):
+        return False
+    level = getattr(obj, "visibility_level", None)
+    if level not in LEVELS or getattr(obj, "abuse_status", None) == "hit":
+        return False
+    md = obj.metadata_json if isinstance(getattr(obj, "metadata_json", None), dict) else {}
+    if md.get("private_media"):
+        return False
+    tenants = trusted_tenants(db)
+    if not tenants:
+        return False
+    return level == "intern" or getattr(obj, "tenant_id", None) in tenants
 
 
 def plainly_public(obj) -> bool:
@@ -42,7 +95,9 @@ def allowed(obj, db) -> bool:
     if db is None:
         return False
     from models import MediaGrant
-    return db.query(MediaGrant.id).filter(MediaGrant.object_id == obj.id, MediaGrant.scope == scope).first() is not None
+    if db.query(MediaGrant.id).filter(MediaGrant.object_id == obj.id, MediaGrant.scope == scope).first() is not None:
+        return True
+    return level_readable(obj, db)
 
 
 def sql_filter(model, db):
@@ -53,11 +108,15 @@ def sql_filter(model, db):
     from sqlalchemy import and_, func, or_
     from models import MediaGrant
     granted = db.query(MediaGrant.object_id).filter(MediaGrant.scope == scope)
-    return or_(
-        and_(model.is_public.is_(True),
-             func.coalesce(func.json_extract(model.metadata_json, "$.private_media"), 0) != 1),
-        model.id.in_(granted),
-    )
+    not_pm = func.coalesce(func.json_extract(model.metadata_json, "$.private_media"), 0) != 1
+    parts = [and_(model.is_public.is_(True), not_pm), model.id.in_(granted)]
+    tenants = trusted_tenants(db)
+    if tenants:
+        level_ok = and_(model.is_public.is_(False), not_pm, model.encrypted.is_(False),
+                        or_(model.abuse_status.is_(None), model.abuse_status != "hit"))
+        parts.append(and_(level_ok, model.visibility_level == "intern"))
+        parts.append(and_(level_ok, model.visibility_level == "personal", model.tenant_id.in_(sorted(tenants))))
+    return or_(*parts)
 
 
 class GrantScopeRestrict:
@@ -70,16 +129,21 @@ class GrantScopeRestrict:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
-        value = None
+        value = tenants = api_key = None
         for k, v in scope.get("headers") or []:
-            if k.lower() == HEADER:
+            kl = k.lower()
+            if kl == HEADER:
                 value = v.decode("latin-1").strip()[:200] or None
-                break
+            elif kl == TENANTS_HEADER:
+                tenants = v.decode("latin-1").strip()[:7000] or None
+            elif kl == b"x-api-key":
+                api_key = v.decode("latin-1").strip() or None
         if value is None:
             await self.app(scope, receive, send)
             return
-        token = _scope.set(value)
+        tokens = (_scope.set(value), _tenants_raw.set(tenants), _api_key.set(api_key), _tenants_ok.set(None))
         try:
             await self.app(scope, receive, send)
         finally:
-            _scope.reset(token)
+            for var, tok in zip((_scope, _tenants_raw, _api_key, _tenants_ok), tokens):
+                var.reset(tok)

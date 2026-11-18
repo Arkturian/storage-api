@@ -6283,6 +6283,13 @@ def get_object_metadata(
     if not obj and _is_privileged_admin(current_user, db):
         obj = db.query(StorageObject).filter(StorageObject.id == object_id).first()
 
+    # #3329: an intern object of another tenant, read by a narrowed agent
+    # whose verified tenants the gateway names (X-Grant-Scope-Tenants).
+    if not obj and _grant_restrict.trusted_tenants(db):
+        cand = db.query(StorageObject).filter(StorageObject.id == object_id).first()
+        if _grant_restrict.level_readable(cand, db):
+            obj = cand
+
     if not obj:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -6290,7 +6297,8 @@ def get_object_metadata(
     if not obj.is_public:
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
-        if obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db):
+        if (obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db)
+                and not _grant_restrict.level_readable(obj, db)):  # #3329: personal/intern via the gateway
             raise HTTPException(status_code=403, detail="Forbidden")
     # Confidential, tombstoned or expired objects: same answer as on the byte
     # routes. Until #3029 only anonymous callers were held back from
