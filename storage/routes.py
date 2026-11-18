@@ -5091,11 +5091,16 @@ def get_media_variant(
             # (the cause of the post-fix "still 14.97 MB" for preset=mobile).
             "refresh": refresh,
         }
+        # #3406: since #3040 the 3D-API only converts with a key from its
+        # UPLOAD_API_KEYS. Storage's own key comes from THREED_API_KEY.
+        threed_api_key = os.getenv("THREED_API_KEY", "").strip()
+        threed_headers = {"X-API-KEY": threed_api_key} if threed_api_key else {}
         try:
             with httpx.Client(timeout=300.0) as client:
                 resp = client.post(
                     f"{threed_api_url}/optimize/glb",
                     params=params_payload,
+                    headers=threed_headers,
                     files={"file": (obj.original_filename or "model.glb", glb_bytes, "model/gltf-binary")},
                 )
         except httpx.ConnectError as exc:
