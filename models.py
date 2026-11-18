@@ -115,6 +115,22 @@ class ShareLink(Base):
     revoked_by = Column(String(255), nullable=True)
 
 
+class AbuseReview(Base):
+    """An admin's decision on an abuse-check verdict (#3346). No file name,
+    no content; the reason is the admin's own text."""
+    __tablename__ = "abuse_reviews"
+
+    id = Column(Integer, primary_key=True)
+    object_id = Column(Integer, index=True, nullable=False)
+    tenant_id = Column(String(100), nullable=True)
+    entscheidung = Column(String(16), nullable=False)      # fehlalarm | bestaetigt
+    status_vorher = Column(String(16), nullable=True)
+    status_nachher = Column(String(16), nullable=True)
+    begruendung = Column(Text, nullable=False)
+    admin = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 # SQLAlchemy Models
 class User(Base):
     __tablename__ = "users"

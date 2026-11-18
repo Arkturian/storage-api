@@ -41,6 +41,7 @@ def env(tmp_path, monkeypatch):
     from storage import abuse_check as A
     from storage import routes as R
     from storage import share_links as SL
+    from storage import abuse_review as AR
     from storage.service import generic_storage
     monkeypatch.setenv("ABUSE_CHECK_ENABLED", "1")
     monkeypatch.setenv("ABUSE_CHECK_MODE", "scharf")   # these tests cover enforcing mode
@@ -58,10 +59,12 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "SessionLocal", S)
     s = S()
     owner = User(email="alex@x", display_name="a", password_hash="", api_key="ko", trust_level="user", device_ids=[])
-    s.add(owner); s.commit()
+    ops = User(email="ops@x", display_name="o", password_hash="", api_key="k-ops-not-a-tenant-key",
+               trust_level="admin", device_ids=[])
+    s.add_all([owner, ops]); s.commit()
     s.add(TenantAPIKey(api_key="k-svc", tenant_id="arkturian", label="svc", is_active=True, is_service=True))
     s.commit()
-    state = {"user": True, "answer": CLEAR, "calls": 0}
+    state = {"user": True, "answer": CLEAR, "calls": 0, "admin": False}
 
     async def fake_ask(obj):
         state["calls"] += 1
@@ -83,6 +86,8 @@ def env(tmp_path, monkeypatch):
     from tenancy.config import get_tenant_id, get_tenant_id_optional
 
     def _cur():
+        if state["admin"]:
+            return s.get(User, ops.id)
         u = s.get(User, owner.id)
         setattr(u, "_storage_on_behalf_of", True)
         return u
@@ -90,6 +95,7 @@ def env(tmp_path, monkeypatch):
     app = FastAPI()
     app.include_router(R.router, prefix="/storage")
     app.include_router(SL.router, prefix="/storage")
+    app.include_router(AR.router, prefix="/storage")
     app.dependency_overrides[get_db] = lambda: s
     app.dependency_overrides[get_current_user] = _cur
     app.dependency_overrides[get_current_user_optional] = lambda: _cur() if state["user"] else None
@@ -456,3 +462,93 @@ def test_shadow_share_link_not_gated(shadow_env):
     assert r.status_code == 200 and "pruefung" not in r.json()
     assert shadow_env.c.get(f"/storage/s/{_tok(r.json()['url'])}", follow_redirects=False).status_code == 302
     assert shadow_env.shadow_calls[-1] == (j["id"], "share_link")
+
+
+
+# --- #3346: admin review of a verdict ---
+
+def _review(env, oid, entscheidung="fehlalarm", begruendung="Fehlalarm, Familienfoto ohne Bezug"):
+    return env.c.post(f"/storage/objects/{oid}/abuse-review",
+                      json={"entscheidung": entscheidung, "begruendung": begruendung})
+
+
+def _hit_with_hls(env, tmp_path, monkeypatch):
+    from storage.service import generic_storage
+    j = _upload(env, public=False)
+    o = env.s.get(StorageObject, j["id"])
+    hls = Path(generic_storage.media_dir) / o.tenant_id / Path(o.object_key).stem
+    hls.mkdir(parents=True)
+    (hls / "master.m3u8").write_text("#EXTM3U")
+    url = "https://x/uploads/storage/media/arkturian/" + hls.name + "/master.m3u8"
+    o.hls_url = url
+    env.s.commit()
+    monkeypatch.setenv("ABUSE_QUARANTINE_DIR", str(tmp_path / "q"))
+    env.A.apply_hit(env.s, o, "csam", 0.6, "test")
+    env.events.clear()
+    return j["id"], hls, url
+
+
+def test_only_real_admin_may_review(env, tmp_path, monkeypatch):
+    oid, _, _ = _hit_with_hls(env, tmp_path, monkeypatch)
+    r = _review(env, oid)                                    # owner via service key + on-behalf
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "admin_required"
+    assert _obj(env, oid).abuse_status == "hit"
+
+
+def test_false_alarm_lifts_block_restores_hls_and_logs(env, tmp_path, monkeypatch):
+    from models import AbuseReview
+    oid, hls, url = _hit_with_hls(env, tmp_path, monkeypatch)
+    assert not hls.exists()
+    env.state["admin"] = True
+    r = _review(env, oid)
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["status_vorher"] == "hit" and j["status_nachher"] == "clear" and j["hls"] == "zurueck"
+    assert j["private_media"] is True                         # one-way, owner sets visibility again
+    o = _obj(env, oid)
+    assert o.abuse_status == "clear" and o.hls_url == url and (hls / "master.m3u8").exists()
+    rows = env.s.query(AbuseReview).filter_by(object_id=oid).all()
+    assert len(rows) == 1 and rows[0].admin == "ops@x" and rows[0].entscheidung == "fehlalarm"
+    assert [(k, p["entscheidung"]) for k, p in env.events] == [("abuse_reviewed", "fehlalarm")]
+    env.state["admin"] = False
+    assert env.c.get(f"/storage/media/{oid}").status_code == 200      # owner reads again (private)
+    lst = env.c.get(f"/storage/objects/{oid}/abuse-review")
+    assert lst.status_code == 403
+
+
+def test_confirmed_keeps_block_and_logs(env, tmp_path, monkeypatch):
+    from models import AbuseReview
+    oid, hls, _ = _hit_with_hls(env, tmp_path, monkeypatch)
+    env.state["admin"] = True
+    r = _review(env, oid, "bestaetigt", "Bestaetigt, Meldung durch Alex veranlasst")
+    assert r.status_code == 200 and r.json()["status_nachher"] == "hit"
+    assert _obj(env, oid).abuse_status == "hit" and not hls.exists()
+    lst = env.c.get(f"/storage/objects/{oid}/abuse-review").json()["reviews"]
+    assert [x["entscheidung"] for x in lst] == ["bestaetigt"]
+    assert env.s.query(AbuseReview).count() == 1
+
+
+def test_held_false_alarm(env):
+    env.state["answer"] = P(sexuell_explizit=0.4)
+    j = _upload(env)
+    env.state["admin"] = True
+    r = _review(env, j["id"])
+    assert r.status_code == 200 and r.json()["status_vorher"] == "held" and r.json()["status_nachher"] == "clear"
+
+
+@pytest.mark.parametrize("body,code", [
+    ({"entscheidung": "vielleicht", "begruendung": "x" * 20}, "invalid_entscheidung"),
+    ({"entscheidung": "fehlalarm", "begruendung": "kurz"}, "invalid_begruendung"),
+])
+def test_review_validation(env, tmp_path, monkeypatch, body, code):
+    oid, _, _ = _hit_with_hls(env, tmp_path, monkeypatch)
+    env.state["admin"] = True
+    r = env.c.post(f"/storage/objects/{oid}/abuse-review", json=body)
+    assert r.status_code == 422 and r.json()["detail"]["code"] == code
+
+
+def test_nothing_to_review(env):
+    j = _upload(env)                                          # clear
+    env.state["admin"] = True
+    r = _review(env, j["id"])
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "nothing_to_review"
