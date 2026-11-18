@@ -137,6 +137,7 @@ async def create_share_link(
     # #3329 (c): images/videos leave only after a clean abuse check. The link
     # is created either way; until "clear" it answers 404 (fail-closed).
     pruefung = await _abuse.ensure_for_share(db, obj)
+    _abuse.shadow_soon(obj, "share_link")
     if pruefung == "hit":
         raise HTTPException(status_code=451, detail={"error": "Content blocked pending review", "code": "abuse_blocked"})
     if pruefung == "held":

@@ -80,13 +80,28 @@ class Refused(CheckUnavailable):
 
 
 def enabled() -> bool:
+    """Checks run at all (shadow or enforcing)."""
     return os.getenv("ABUSE_CHECK_ENABLED", "").strip().lower() in ("1", "true", "yes")
 
 
-def needs_check(obj) -> bool:
+def enforcing() -> bool:
+    """Verdicts take effect. Cloud 18.11.: the first week runs in shadow mode
+    (values logged, nothing held or locked); "scharf" must be set explicitly."""
+    return enabled() and os.getenv("ABUSE_CHECK_MODE", "schatten").strip().lower() == "scharf"
+
+
+def shadow() -> bool:
+    return enabled() and not enforcing()
+
+
+def _is_media(obj) -> bool:
     mime = (getattr(obj, "mime_type", None) or "").lower()
-    return enabled() and (mime.startswith("image/") or mime.startswith("video/")) \
-        and not getattr(obj, "encrypted", False)
+    return (mime.startswith("image/") or mime.startswith("video/")) and not getattr(obj, "encrypted", False)
+
+
+def needs_check(obj) -> bool:
+    """Gate decisions depend on the verdict (enforcing mode only)."""
+    return enforcing() and _is_media(obj)
 
 
 def _source_path(obj) -> Path:
@@ -411,6 +426,73 @@ async def ensure_for_share(db, obj) -> Optional[str]:
         return "failed"
 
 
+def shadow_soon(obj, anlass: str) -> None:
+    """Shadow mode: check in the background, log, change nothing."""
+    if not (shadow() and obj is not None and _is_media(obj)):
+        return
+    try:
+        asyncio.get_event_loop().create_task(shadow_check(obj.id, anlass))
+    except Exception as e:
+        print(f"⚠️ abuse shadow not scheduled object={obj.id}: {type(e).__name__}", flush=True)
+
+
+async def shadow_check(object_id: int, anlass: str) -> Optional[str]:
+    """Same question and evaluation as enforcing mode, but the result only goes
+    into metadata (abuse_check_schatten) and the journal. abuse_status stays
+    untouched, so no gate reacts. A stage-2 csam suspicion (or a second
+    refusal) still raises the event: Alex gets the card, marked "not locked"."""
+    import database
+    from models import StorageObject
+    db = database.SessionLocal()
+    try:
+        obj = db.get(StorageObject, object_id)
+        if obj is None:
+            return None
+        md = dict(obj.metadata_json or {}) if isinstance(obj.metadata_json, dict) else {}
+        rec = dict(md.get("abuse_check_schatten") or {})
+        now = datetime.utcnow().isoformat() + "Z"
+        try:
+            probs = await _ask(obj)
+        except Refused as e:
+            rec["ablehnungen"] = int(rec.get("ablehnungen", 0)) + 1
+            rec.update(fehler=str(e)[:80], am=now, anlass=anlass)
+            md["abuse_check_schatten"] = rec
+            obj.metadata_json = md
+            db.commit()
+            if rec["ablehnungen"] == REFUSALS_FOR_CARD:
+                _shadow_event(obj, "ablehnung", None, anlass, now)
+            return "refused"
+        except CheckUnavailable as e:
+            rec.update(fehler=str(e)[:80], am=now, anlass=anlass)
+            md["abuse_check_schatten"] = rec
+            obj.metadata_json = md
+            db.commit()
+            print(f"⚠️ abuse shadow unavailable object={obj.id}: {e}", flush=True)
+            return "failed"
+        werte = {k: round(v, 4) for k, v in probs.items()}
+        result, kategorie, p = _verdict(probs)
+        rec.update(werte=werte, ergebnis=result, kategorie=kategorie, am=now, anlass=anlass, fehler=None)
+        md["abuse_check_schatten"] = rec
+        obj.metadata_json = md
+        db.commit()
+        print(f"🧪 abuse shadow object={obj.id} anlass={anlass} ergebnis={result} "
+              + " ".join(f"{k}={v}" for k, v in werte.items()), flush=True)
+        if result == "hit" and kategorie == "csam":
+            _shadow_event(obj, "csam", p, anlass, now)
+        return result
+    finally:
+        db.close()
+
+
+def _shadow_event(obj, kategorie: str, p: Optional[float], anlass: str, now: str) -> None:
+    from storage.encrypted_io import emit_event
+    emit_event("abuse_suspected", {"object_id": obj.id, "tenant_id": obj.tenant_id,
+                                   "owner_user_id": obj.owner_user_id, "kategorie": kategorie,
+                                   "wahrscheinlichkeit": round(p, 3) if p is not None else None,
+                                   "anlass": anlass, "geprueft_am": now, "gesperrt": False,
+                                   "schatten": True})
+
+
 def share_allowed(obj) -> bool:
     """Opening a share link: images/videos only with a clean verdict."""
     if getattr(obj, "abuse_status", None) == "hit":
@@ -444,7 +526,7 @@ async def retry_loop() -> None:
     import database
     while True:
         await asyncio.sleep(RETRY_EVERY)
-        if not enabled():
+        if not enforcing():
             continue
         try:
             n = await retry_open(database.SessionLocal)

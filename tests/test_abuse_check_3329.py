@@ -43,6 +43,7 @@ def env(tmp_path, monkeypatch):
     from storage import share_links as SL
     from storage.service import generic_storage
     monkeypatch.setenv("ABUSE_CHECK_ENABLED", "1")
+    monkeypatch.setenv("ABUSE_CHECK_MODE", "scharf")   # these tests cover enforcing mode
     monkeypatch.setenv("STORAGE_SIGN_SECRETS", json.dumps({"k1": "x" * 40}))
     monkeypatch.setenv("STORAGE_SIGN_ACTIVE_KID", "k1")
     up = tmp_path / "up"
@@ -376,3 +377,59 @@ def test_video_takes_highest_value_over_frames(env, monkeypatch):  # env keeps A
     monkeypatch.setattr(A, "_ask_frame", ask_frame)
     best = _run(A._ask_orig(SimpleNamespace(id=1)))    # the original _ask, kept by the fixture
     assert best["gewalt_missbrauch"] == 0.85 and best["csam"] == 0.0
+
+
+
+# --- Shadow mode (Cloud 18.11.: first week logs only, nothing held or locked) ---
+
+@pytest.fixture
+def shadow_env(env, monkeypatch):
+    monkeypatch.delenv("ABUSE_CHECK_MODE", raising=False)   # default once enabled = schatten
+    calls = []
+    monkeypatch.setattr(env.A, "shadow_soon", lambda o, anlass: calls.append((o.id, anlass)))
+    env.shadow_calls = calls
+    return env
+
+
+def test_default_mode_is_shadow(shadow_env):
+    A = shadow_env.A
+    assert A.enabled() and A.shadow() and not A.enforcing()
+
+
+def test_shadow_public_upload_goes_public_now_and_is_checked_later(shadow_env):
+    j = _upload(shadow_env)
+    o = _obj(shadow_env, j["id"])
+    assert o.is_public is True and o.abuse_status is None and o.public_pending is False
+    assert shadow_env.shadow_calls == [(j["id"], "upload_public")]
+    assert shadow_env.state["calls"] == 0          # nothing asked synchronously
+
+
+def test_shadow_check_logs_and_changes_nothing(shadow_env):
+    j = _upload(shadow_env)
+    shadow_env.state["answer"] = P(sexuell_explizit=0.95)
+    r = asyncio.get_event_loop().run_until_complete(shadow_env.A.shadow_check(j["id"], "upload_public"))
+    assert r == "hit"
+    o = _obj(shadow_env, j["id"])
+    assert o.is_public is True and o.abuse_status is None
+    rec = o.metadata_json["abuse_check_schatten"]
+    assert rec["ergebnis"] == "hit" and rec["werte"]["sexuell_explizit"] == 0.95
+    shadow_env.state["user"] = False
+    assert shadow_env.c.get(f"/storage/media/{j['id']}").status_code == 200
+    assert shadow_env.events == []                  # no card outside csam
+
+
+def test_shadow_csam_still_raises_card_marked_not_locked(shadow_env):
+    j = _upload(shadow_env)
+    shadow_env.state["answer"] = P(csam=0.5)
+    asyncio.get_event_loop().run_until_complete(shadow_env.A.shadow_check(j["id"], "upload_public"))
+    (k, p), = shadow_env.events
+    assert k == "abuse_suspected" and p["kategorie"] == "csam" and p["gesperrt"] is False and p["schatten"] is True
+    assert _obj(shadow_env, j["id"]).abuse_status is None
+
+
+def test_shadow_share_link_not_gated(shadow_env):
+    j = _upload(shadow_env, public=False)
+    r = _link(shadow_env, j["id"])
+    assert r.status_code == 200 and "pruefung" not in r.json()
+    assert shadow_env.c.get(f"/storage/s/{_tok(r.json()['url'])}", follow_redirects=False).status_code == 302
+    assert shadow_env.shadow_calls[-1] == (j["id"], "share_link")

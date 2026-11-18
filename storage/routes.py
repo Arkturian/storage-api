@@ -2342,7 +2342,7 @@ async def consume_upload_ticket(
         data=data,
         original_filename=ticket["filename"],
         context=ticket["context"],
-        is_public=ticket["is_public"] and not _abuse.enabled(),  # #3329 c: public only after the check
+        is_public=ticket["is_public"] and not _abuse.enforcing(),  # #3329 c: public only after the check
         collection_id=ticket["collection_id"],
         tenant_id=ticket["tenant_id"],
         ttl_hours=ticket["ttl_hours"],
@@ -2355,8 +2355,10 @@ async def consume_upload_ticket(
         db.commit()
         db.refresh(saved_obj)
     _apply_level(db, saved_obj, ticket.get("visibility_level"))
-    if ticket["is_public"] and _abuse.enabled():
+    if ticket["is_public"] and _abuse.enforcing():
         await _abuse.request_public(db, saved_obj, "upload_public")
+    elif ticket["is_public"]:
+        _abuse.shadow_soon(saved_obj, "upload_public")
 
     if ticket["ai_mode"] and ticket["ai_mode"] != "none":
         try:
@@ -2614,7 +2616,7 @@ async def upload_chunk(
         data=data,
         original_filename=sess["filename"],
         context=sess["context"],
-        is_public=sess["is_public"] and not _abuse.enabled(),  # #3329 c
+        is_public=sess["is_public"] and not _abuse.enforcing(),  # #3329 c
         collection_id=sess["collection_id"],
         tenant_id=sess["tenant_id"],
         ttl_hours=sess["ttl_hours"],
@@ -2627,8 +2629,10 @@ async def upload_chunk(
         db.commit()
         db.refresh(saved_obj)
     _apply_level(db, saved_obj, sess.get("visibility_level"))
-    if sess["is_public"] and _abuse.enabled():
+    if sess["is_public"] and _abuse.enforcing():
         await _abuse.request_public(db, saved_obj, "upload_public")
+    elif sess["is_public"]:
+        _abuse.shadow_soon(saved_obj, "upload_public")
 
     if sess["ai_mode"] and sess["ai_mode"] != "none":
         try:
@@ -3287,7 +3291,7 @@ async def upload_file(
                     data=data,
                     original_filename=file.filename,
                     context=context,
-                    is_public=is_public and not _abuse.enabled(),  # #3329 c
+                    is_public=is_public and not _abuse.enforcing(),  # #3329 c
                     collection_id=collection_id,
                     link_id=link_id,
                     storage_mode=storage_mode,
@@ -3337,8 +3341,10 @@ async def upload_file(
                     db.rollback()
 
         _apply_level(db, saved_obj, visibility_level)  # #3329
-        if is_public and _abuse.enabled():
+        if is_public and _abuse.enforcing():
             await _abuse.request_public(db, saved_obj, "upload_public")
+        elif is_public:
+            _abuse.shadow_soon(saved_obj, "upload_public")
 
         # --- AI Analysis handled by async worker system (check_safety_ai.py) ---
         # The async worker will perform comprehensive analysis with unified Gemini prompt
@@ -3550,7 +3556,7 @@ async def fetch_and_store_remote(
             data=data,
             original_filename=filename,
             context=payload.context,
-            is_public=payload.is_public and not _abuse.enabled(),  # #3329 c
+            is_public=payload.is_public and not _abuse.enforcing(),  # #3329 c
             collection_id=payload.collection_id,
             link_id=payload.link_id,
             tenant_id=tenant_id,
@@ -3562,8 +3568,10 @@ async def fetch_and_store_remote(
             db.commit()
             db.refresh(saved_obj)
         _apply_level(db, saved_obj, payload.visibility_level)
-        if payload.is_public and _abuse.enabled():
+        if payload.is_public and _abuse.enforcing():
             await _abuse.request_public(db, saved_obj, "upload_public")
+        elif payload.is_public:
+            _abuse.shadow_soon(saved_obj, "upload_public")
 
         # Attach tenant_id derived from API key for downstream KG processing
         try:
@@ -7185,6 +7193,8 @@ async def update_object_metadata(
 
     if want_public_checked:
         await _abuse.request_public(db, obj, "patch_public")
+    elif going_public:
+        _abuse.shadow_soon(obj, "patch_public")
 
     if needs_safety_recheck:
         try:
