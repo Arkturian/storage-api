@@ -83,6 +83,7 @@ _TENANT_KEY_COLUMNS = (
     ("may_sign_encrypted", "BOOLEAN DEFAULT 0"),
     ("may_publish_to_post", "BOOLEAN DEFAULT 0"),
     ("may_create_share_links", "BOOLEAN DEFAULT 0"),
+    ("may_sign_intern", "BOOLEAN DEFAULT 0"),
 )
 
 
@@ -202,6 +203,10 @@ async def connect_db():
                                    ("plain_size", "BIGINT")):
                     if _col not in scols:
                         conn.execute(text(f"ALTER TABLE storage_objects ADD COLUMN {_col} {_ddl}"))
+
+                # Stufe "intern" (#3329)
+                if "intern" not in scols:
+                    conn.execute(text("ALTER TABLE storage_objects ADD COLUMN intern BOOLEAN NOT NULL DEFAULT 0"))
 
                 conn.commit()
     except Exception as e:
