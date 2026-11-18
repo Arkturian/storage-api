@@ -418,12 +418,35 @@ def test_shadow_check_logs_and_changes_nothing(shadow_env):
     assert shadow_env.events == []                  # no card outside csam
 
 
-def test_shadow_csam_still_raises_card_marked_not_locked(shadow_env):
+def test_shadow_csam_stage2_locks_for_real(shadow_env):
     j = _upload(shadow_env)
+    tok = _tok(_link(shadow_env, j["id"]).json()["url"])
     shadow_env.state["answer"] = P(csam=0.5)
-    asyncio.get_event_loop().run_until_complete(shadow_env.A.shadow_check(j["id"], "upload_public"))
+    r = asyncio.get_event_loop().run_until_complete(shadow_env.A.shadow_check(j["id"], "upload_public"))
+    assert r == "hit"
+    o = _obj(shadow_env, j["id"])
+    assert o.abuse_status == "hit" and o.is_public is False and o.metadata_json.get("private_media") is True
+    assert shadow_env.c.get(f"/storage/media/{j['id']}").status_code == 451
+    assert shadow_env.c.get(f"/storage/s/{tok}", follow_redirects=False).status_code == 404
     (k, p), = shadow_env.events
-    assert k == "abuse_suspected" and p["kategorie"] == "csam" and p["gesperrt"] is False and p["schatten"] is True
+    assert k == "abuse_suspected" and p["kategorie"] == "csam" and p["gesperrt"] is True
+
+
+def test_shadow_csam_stage1_only_logged(shadow_env):
+    j = _upload(shadow_env)
+    shadow_env.state["answer"] = P(csam=0.1)
+    r = asyncio.get_event_loop().run_until_complete(shadow_env.A.shadow_check(j["id"], "upload_public"))
+    o = _obj(shadow_env, j["id"])
+    assert r == "held" and o.abuse_status is None and o.is_public is True and shadow_env.events == []
+
+
+def test_shadow_second_refusal_card_not_locked(shadow_env):
+    j = _upload(shadow_env)
+    shadow_env.state["answer"] = shadow_env.A.Refused("refusal csam")
+    for _ in range(2):
+        asyncio.get_event_loop().run_until_complete(shadow_env.A.shadow_check(j["id"], "upload_public"))
+    (k, p), = shadow_env.events
+    assert p["kategorie"] == "ablehnung" and p["gesperrt"] is False and p["schatten"] is True
     assert _obj(shadow_env, j["id"]).abuse_status is None
 
 

@@ -438,9 +438,10 @@ def shadow_soon(obj, anlass: str) -> None:
 
 async def shadow_check(object_id: int, anlass: str) -> Optional[str]:
     """Same question and evaluation as enforcing mode, but the result only goes
-    into metadata (abuse_check_schatten) and the journal. abuse_status stays
-    untouched, so no gate reacts. A stage-2 csam suspicion (or a second
-    refusal) still raises the event: Alex gets the card, marked "not locked"."""
+    into metadata (abuse_check_schatten) and the journal; abuse_status stays
+    untouched, so no gate reacts. Exception (Cloud 18.11.): a stage-2 csam
+    suspicion locks for real (apply_hit, card with gesperrt=true). A second
+    refusal raises the event with gesperrt=false, schatten=true."""
     import database
     from models import StorageObject
     db = database.SessionLocal()
@@ -478,7 +479,11 @@ async def shadow_check(object_id: int, anlass: str) -> Optional[str]:
         print(f"🧪 abuse shadow object={obj.id} anlass={anlass} ergebnis={result} "
               + " ".join(f"{k}={v}" for k, v in werte.items()), flush=True)
         if result == "hit" and kategorie == "csam":
-            _shadow_event(obj, "csam", p, anlass, now)
+            # Cloud 18.11.: csam stage 2 takes effect even in shadow mode. A
+            # false alarm keeps a file private until an admin lifts it; a hit
+            # left public for a week cannot be taken back.
+            apply_hit(db, obj, "csam", p, anlass)
+            return "hit"
         return result
     finally:
         db.close()
