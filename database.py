@@ -204,9 +204,9 @@ async def connect_db():
                     if _col not in scols:
                         conn.execute(text(f"ALTER TABLE storage_objects ADD COLUMN {_col} {_ddl}"))
 
-                # Stufe "intern" (#3329)
-                if "intern" not in scols:
-                    conn.execute(text("ALTER TABLE storage_objects ADD COLUMN intern BOOLEAN NOT NULL DEFAULT 0"))
+                # Sichtbarkeitsstufen personal / intern (#3329)
+                if "visibility_level" not in scols:
+                    conn.execute(text("ALTER TABLE storage_objects ADD COLUMN visibility_level VARCHAR(16)"))
 
                 conn.commit()
     except Exception as e:

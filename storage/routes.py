@@ -2252,7 +2252,7 @@ def create_upload_ticket(
     collection_id: Optional[str] = Query(None),
     is_public: bool = Query(False),
     private: bool = Query(False, description="Mark confidential — media endpoint then serves it to owner/admin only"),
-    intern: bool = Query(False, description="#3329: for everyone signed in to the tenant, never anonymous"),
+    visibility_level: Optional[str] = Query(None, description="#3329: personal (tenant) | intern (all tenants of this instance); never anonymous"),
     ai_mode: str = Query("none", description="none | safety | vision | full — AI analysis costs money, default off"),
     ttl_hours: Optional[int] = Query(None, description="Auto-delete the uploaded object after N hours"),
     grant_scope: Optional[str] = Query(None, description="Bind the uploaded object to this scope (media_grants)"),
@@ -2269,7 +2269,7 @@ def create_upload_ticket(
     import secrets as _secrets
 
     grant_scope = _check_upload_scope(grant_scope)
-    _check_intern_request(intern, private, encrypted)
+    visibility_level = _check_level_request(visibility_level, private, encrypted)
     filename = _resolve_upload_filename(filename, x_filename, encrypted)
     if encrypted:
         _require_encryption_ready()
@@ -2282,9 +2282,9 @@ def create_upload_ticket(
         "encrypted": bool(encrypted),
         "context": context,
         "collection_id": collection_id,
-        "is_public": bool(is_public) and not intern,
+        "is_public": bool(is_public) and not visibility_level,
         "private": bool(private),
-        "intern": bool(intern),
+        "visibility_level": visibility_level,
         "ai_mode": ai_mode,
         "ttl_hours": ttl_hours,
         "grant_scope": grant_scope,
@@ -2353,7 +2353,7 @@ async def consume_upload_ticket(
         saved_obj.metadata_json = _mj
         db.commit()
         db.refresh(saved_obj)
-    _apply_intern(db, saved_obj, ticket.get("intern"))
+    _apply_level(db, saved_obj, ticket.get("visibility_level"))
 
     if ticket["ai_mode"] and ticket["ai_mode"] != "none":
         try:
@@ -2509,7 +2509,7 @@ async def upload_chunk(
     collection_id: Optional[str] = Query(None),
     is_public: bool = Query(False),
     private: bool = Query(False),
-    intern: bool = Query(False),
+    visibility_level: Optional[str] = Query(None),
     ai_mode: str = Query("none"),
     ttl_hours: Optional[int] = Query(None),
     grant_scope: Optional[str] = Query(None, description="Bind the finished object to this scope (media_grants); taken from the final chunk"),
@@ -2524,6 +2524,7 @@ async def upload_chunk(
     Returns {received, missing} while incomplete, and the storage object once done.
     """
     grant_scope = _check_upload_scope(grant_scope)
+    visibility_level = _check_level_request(visibility_level, private, encrypted)
     filename = _resolve_upload_filename(filename, x_filename, encrypted)
     if encrypted:
         _require_encryption_ready()
@@ -2543,8 +2544,9 @@ async def upload_chunk(
         "filename": filename,
         "context": context,
         "collection_id": collection_id,
-        "is_public": bool(is_public),
+        "is_public": bool(is_public) and not visibility_level,
         "private": bool(private),
+        "visibility_level": visibility_level,
         "ai_mode": ai_mode,
         "ttl_hours": ttl_hours,
         "encrypted": bool(encrypted),
@@ -2621,7 +2623,7 @@ async def upload_chunk(
         saved_obj.metadata_json = _mj
         db.commit()
         db.refresh(saved_obj)
-    _apply_intern(db, saved_obj, sess.get("intern"))
+    _apply_level(db, saved_obj, sess.get("visibility_level"))
 
     if sess["ai_mode"] and sess["ai_mode"] != "none":
         try:
@@ -2925,7 +2927,7 @@ async def upload_file(
     private: bool = Form(False),  # Issue #420: set metadata_json.private_media → /storage/media serves this object only to owner/admin (403 for everyone else). Set AT UPLOAD to avoid the window where a confidential file is enumerable before a follow-up PATCH lands.
     transcribe_audio: bool = Form(False),  # Video: demux audio + transcribe via api-ai → audio_transcript (needs an analysis ai_mode)
     encrypted: bool = Form(False),  # #3230: store ciphertext only (KMS envelope); implies private, no AI/thumbnails/transcoding
-    intern: bool = Form(False),  # #3329: for everyone signed in to the tenant, never anonymous
+    visibility_level: Optional[str] = Form(None),  # #3329: personal (tenant) | intern (instance); never anonymous
     x_compute_focal: Optional[str] = Header(None),  # Opt-in: "true"/"1" → compute face focal point at upload (images only, AI-cost-free, default off)
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
@@ -2936,9 +2938,9 @@ async def upload_file(
         _check_encrypted_upload(storage_mode, reference_path, external_uri, hls_result, reference_id,
                                 owner_email, file)
     _check_reference_upload(storage_mode, reference_path, current_user, db)
-    _check_intern_request(intern, private, encrypted)
-    if intern:
-        is_public = False  # #3329: intern is never public
+    visibility_level = _check_level_request(visibility_level, private, encrypted)
+    if visibility_level:
+        is_public = False  # #3329: a level is never public
     # #3032 (Befund 107): external_uri was stored unchecked and later fetched
     # by /data-uri with a plain client — a full-response SSRF. Refuse URLs that
     # are not http(s) or that resolve to a non-public or own address now; the
@@ -3329,7 +3331,7 @@ async def upload_file(
                 except Exception:
                     db.rollback()
 
-        _apply_intern(db, saved_obj, intern)  # #3329
+        _apply_level(db, saved_obj, visibility_level)  # #3329
 
         # --- AI Analysis handled by async worker system (check_safety_ai.py) ---
         # The async worker will perform comprehensive analysis with unified Gemini prompt
@@ -3413,7 +3415,7 @@ class RemoteFetchRequest(BaseModel):
     analyze: bool = False
     grant_scope: Optional[str] = None  # Post 5250: bind the fetched object to this scope
     private: bool = False  # #3030: metadata_json.private_media at creation, as on /upload
-    intern: bool = False  # #3329
+    visibility_level: Optional[str] = None  # #3329: personal | intern
 
 
 @router.post("/fetch", response_model=StorageObjectResponse)
@@ -3426,8 +3428,8 @@ async def fetch_and_store_remote(
     tenant_id: str = Depends(get_tenant_id),
 ):
     _fetch_scope = _check_upload_scope(payload.grant_scope)
-    _check_intern_request(payload.intern, payload.private)
-    if payload.intern:
+    payload.visibility_level = _check_level_request(payload.visibility_level, payload.private)
+    if payload.visibility_level:
         payload.is_public = False  # #3329
     # Resolve target owner
     target_owner_id = current_user.id
@@ -3552,7 +3554,7 @@ async def fetch_and_store_remote(
             saved_obj.metadata_json = _mj_f
             db.commit()
             db.refresh(saved_obj)
-        _apply_intern(db, saved_obj, payload.intern)
+        _apply_level(db, saved_obj, payload.visibility_level)
 
         # Attach tenant_id derived from API key for downstream KG processing
         try:
@@ -4241,23 +4243,44 @@ def content_disposition(kind: str, original_filename, object_id) -> str:
     return f"{kind}; filename=\"{ascii_name}\"; filename*=UTF-8''{_quote(raw, safe='')}"
 
 
-def _check_intern_request(intern: bool, private: bool = False, encrypted: bool = False) -> None:
-    """#3329: intern sits between private and public. private_media and
-    encrypted are stricter and one-way, so they cannot be intern."""
-    if intern and (private or encrypted):
+VISIBILITY_LEVELS = ("personal", "intern")
+
+
+def _check_level_request(level: Optional[str], private: bool = False, encrypted: bool = False) -> Optional[str]:
+    """#3329 (Alex 18.11.): private < personal (tenant) < intern (instance) <
+    public. private_media and encrypted are stricter and one-way, so they
+    take no level. Returns the normalised level or None."""
+    if level is None or not str(level).strip():
+        return None
+    level = str(level).strip().lower()
+    if level not in VISIBILITY_LEVELS:
         raise HTTPException(status_code=422, detail={
-            "error": "intern cannot be combined with private or encrypted", "code": "intern_conflict"})
+            "error": f"visibility_level must be one of {', '.join(VISIBILITY_LEVELS)}", "code": "invalid_visibility_level"})
+    if private or encrypted:
+        raise HTTPException(status_code=422, detail={
+            "error": "visibility_level cannot be combined with private or encrypted", "code": "visibility_conflict"})
+    return level
 
 
-def _apply_intern(db, obj, intern: bool) -> None:
-    """Mark a just-stored object intern: never public, readable through
-    cloud-api by everyone signed in to its tenant (#3329)."""
-    if not intern or obj is None:
+def _apply_level(db, obj, level: Optional[str]) -> None:
+    """Give a just-stored object its level: never public, readable through
+    cloud-api by everyone signed in to its tenant (personal) or to any
+    tenant of this instance (intern)."""
+    if not level or obj is None:
         return
-    obj.intern = True
+    obj.visibility_level = level
     obj.is_public = False
     db.commit()
     db.refresh(obj)
+
+
+def object_level(obj) -> Optional[str]:
+    """The effective level: None for public, private_media and encrypted."""
+    level = getattr(obj, "visibility_level", None)
+    if level not in VISIBILITY_LEVELS or getattr(obj, "is_public", False) or getattr(obj, "encrypted", False):
+        return None
+    md = obj.metadata_json if isinstance(getattr(obj, "metadata_json", None), dict) else {}
+    return None if md.get("private_media") else level
 
 
 def _check_media_access(obj, current_user, db=None) -> None:
@@ -6967,7 +6990,7 @@ class StorageObjectUpdate(BaseModel):
     ai_collections: Optional[list] = None
     ai_context_metadata: Optional[dict] = None  # ADDED: Debug info (prompt, response, etc.)
     safety_info: Optional[dict] = None
-    intern: Optional[bool] = None  # #3329: true = intern (never public); is_public=true lifts it
+    visibility_level: Optional[str] = None  # #3329: personal | intern | null (clear); is_public=true lifts it
 
 
 def _clear_object_derivatives(obj) -> None:
@@ -7098,22 +7121,23 @@ async def update_object_metadata(
             _md = update_data["metadata_json"]
             if isinstance(_md, dict):
                 _md["private_media"] = True
-    # #3329: intern sits between private and public.
+    # #3329: levels personal / intern sit between private and public.
+    # visibility_level=null clears the level (the object stays non-public).
     _final_md = update_data["metadata_json"] if isinstance(update_data.get("metadata_json"), dict) else _old_md
-    if update_data.get("intern"):
+    if update_data.get("visibility_level") is not None:
+        _lvl = _check_level_request(update_data["visibility_level"])
         if update_data.get("is_public"):
             raise HTTPException(status_code=422, detail={
-                "error": "intern and is_public exclude each other", "code": "intern_conflict"})
+                "error": "visibility_level and is_public exclude each other", "code": "visibility_conflict"})
         if getattr(obj, "encrypted", False) or _final_md.get("private_media"):
             raise HTTPException(status_code=409, detail={
-                "error": "private or encrypted objects cannot become intern", "code": "intern_conflict"})
+                "error": "private or encrypted objects take no visibility_level", "code": "visibility_conflict"})
+        update_data["visibility_level"] = _lvl
         update_data["is_public"] = False
-    elif update_data.get("is_public") and getattr(obj, "intern", False):
-        update_data["intern"] = False      # intern -> public
-    if _final_md.get("private_media") and (getattr(obj, "intern", False) or update_data.get("intern")):
-        update_data["intern"] = False      # private_media is stricter and wins
-    if "intern" in update_data and update_data["intern"] is None:
-        update_data.pop("intern")
+    elif update_data.get("is_public") and getattr(obj, "visibility_level", None):
+        update_data["visibility_level"] = None      # level -> public
+    if _final_md.get("private_media") and (getattr(obj, "visibility_level", None) or update_data.get("visibility_level")):
+        update_data["visibility_level"] = None      # private_media is stricter and wins
     ai_metadata_updated = "ai_context_metadata" in update_data
 
     # Track is_public flip from False/None → True. If safety analysis wasn't
@@ -8309,7 +8333,7 @@ def sign_media_links(
     ids = list(dict.fromkeys(int(i) for i in payload.ids))
     # #3329: a key flagged may_sign_intern (cloud-api, which checked that the
     # reader is signed in to this tenant) signs intern objects without a grant.
-    may_intern = bool(getattr(row, "may_sign_intern", False))
+    may_level = bool(getattr(row, "may_sign_intern", False))
     objs = {o.id: o for o in db.query(StorageObject).filter(StorageObject.id.in_(ids)).all()}
     granted = {g.object_id for g in db.query(MediaGrant.object_id).filter(
         MediaGrant.scope == scope, MediaGrant.object_id.in_(ids)).all()}
@@ -8322,14 +8346,17 @@ def sign_media_links(
         o = objs.get(oid)
         if o is None or getattr(o, "tombstoned_at", None) is not None:
             items.append({"id": oid, "error": "not_found"}); continue
-        if o.tenant_id != payload.tenant:
+        # #3329: personal = reader's tenant must be the object's (checked
+        # here); intern = any tenant of this instance. payload.tenant is the
+        # reader's tenant, set by cloud-api from the verified identity.
+        level = object_level(o) if may_level else None
+        if o.tenant_id != payload.tenant and level != "intern":
             items.append({"id": oid, "error": "wrong_tenant"}); continue
         md = o.metadata_json if isinstance(o.metadata_json, dict) else {}
         url = f"{base_url}/storage/media/{oid}"
         if o.is_public and not md.get("private_media"):
             items.append({"id": oid, "url": url, "signed": False, "public": True}); continue
-        is_intern = bool(getattr(o, "intern", False)) and not md.get("private_media") and not getattr(o, "encrypted", False)
-        if oid not in granted and not (is_intern and may_intern):
+        if oid not in granted and level is None:
             items.append({"id": oid, "error": "not_granted"}); continue
         # #3230: only a key flagged may_sign_encrypted (cloud-api) mints links
         # for encrypted objects; the other signing keys of the tenant could
@@ -8339,8 +8366,8 @@ def sign_media_links(
         # #3230: an encrypted object's link lives at most 5 minutes.
         _ttl = min(payload.ttl, 300) if getattr(o, "encrypted", False) else payload.ttl
         min_ttl = min(min_ttl, _ttl)
-        if is_intern and _ttl >= 120:
-            # #3329: intern images are embedded over and over. Signing from the
+        if level and _ttl >= 120:
+            # #3329: personal/intern images are embedded over and over. Signing from the
             # start of the current minute gives the same URL for 60 s, so the
             # browser cache holds; the link still lives at least ttl-60 s.
             s = _signing.sign(oid, _ttl, now=int(now) // 60 * 60)
@@ -8348,8 +8375,8 @@ def sign_media_links(
         else:
             s = _signing.sign(oid, _ttl, now=now)
         _item = {"id": oid, "url": f"{url}?exp={s['exp']}&kid={s['kid']}&sig={s['sig']}", "signed": True}
-        if is_intern:
-            _item["intern"] = True
+        if level:
+            _item["visibility_level"] = level
         if getattr(o, "encrypted", False):
             # Always marked: the portal (#3235) recognises encrypted files by
             # this flag, also when the requested ttl needed no capping.

@@ -1,7 +1,8 @@
-"""#3329: Stufe "intern" — for everyone signed in to the object's tenant,
-never anonymous. storage-api does not see portal cookies or agent JWTs:
-cloud-api checks the reader and signs with a key flagged may_sign_intern,
-which needs no grant for intern objects of its tenant."""
+"""#3329 (Alex 18.11.): levels between private and public, never anonymous.
+personal = everyone signed in to the object's tenant; intern = everyone
+signed in to any tenant of this instance. storage-api does not see portal
+cookies or agent JWTs: cloud-api checks the reader and signs with a key
+flagged may_sign_intern, passing the reader's tenant."""
 import json
 import sys
 from pathlib import Path
@@ -48,9 +49,10 @@ def env(tmp_path, monkeypatch):
                TenantAPIKey(api_key=CONTENT, tenant_id="arkturian", label="content", is_active=True,
                             sign_tenants="arkturian")])
     objs = {}
-    for k, kw in (("intern", dict(intern=True)), ("privat", {}), ("oeffentlich", dict(is_public=True)),
-                  ("oneal", dict(intern=True, tenant_id="oneal")),
-                  ("pm", dict(intern=True, metadata_json={"private_media": True}))):
+    for k, kw in (("personal", dict(visibility_level="personal")), ("privat", {}), ("oeffentlich", dict(is_public=True)),
+                  ("oneal_personal", dict(visibility_level="personal", tenant_id="oneal")),
+                  ("oneal_intern", dict(visibility_level="intern", tenant_id="oneal")),
+                  ("pm", dict(visibility_level="personal", metadata_json={"private_media": True}))):
         key = f"u{owner.id}_{k}.txt"
         tenant = kw.pop("tenant_id", "arkturian")
         (up / "media" / "arkturian" / key).write_bytes(DATA)
@@ -83,90 +85,114 @@ def _sign(env, ids, key=CLOUD, tenant="arkturian", ttl=300, scope="cloud-user:7"
     return {i["id"]: i for i in r.json()["items"]}
 
 
-def test_intern_signed_without_grant_for_flagged_key(env):
-    it = _sign(env, [env.objs["intern"]])[env.objs["intern"]]
-    assert it["signed"] is True and it["intern"] is True
+def test_personal_signed_without_grant_for_flagged_key(env):
+    it = _sign(env, [env.objs["personal"]])[env.objs["personal"]]
+    assert it["signed"] is True and it["visibility_level"] == "personal"
     got = env.c.get(urlparse(it["url"]).path + "?" + urlparse(it["url"]).query)
     assert got.status_code == 200 and got.content == DATA
 
 
-def test_intern_url_stable_within_a_minute(env, monkeypatch):
+def test_level_url_stable_within_a_minute(env, monkeypatch):
     t = [1_800_000_010.0]
     monkeypatch.setattr(env.R.time, "time", lambda: t[0])
-    a = _sign(env, [env.objs["intern"]])[env.objs["intern"]]["url"]
+    a = _sign(env, [env.objs["personal"]])[env.objs["personal"]]["url"]
     t[0] += 40
-    b = _sign(env, [env.objs["intern"]])[env.objs["intern"]]["url"]
+    b = _sign(env, [env.objs["personal"]])[env.objs["personal"]]["url"]
     assert a == b
     exp = int(parse_qs(urlparse(a).query)["exp"][0])
     assert exp - t[0] >= 300 - 60
 
 
 def test_key_without_flag_needs_grant(env):
-    assert _sign(env, [env.objs["intern"]], key=CONTENT)[env.objs["intern"]]["error"] == "not_granted"
+    assert _sign(env, [env.objs["personal"]], key=CONTENT)[env.objs["personal"]]["error"] == "not_granted"
+
+
+def test_key_without_flag_keeps_tenant_check_for_intern(env):
+    assert _sign(env, [env.objs["oneal_intern"]], key=CONTENT)[env.objs["oneal_intern"]]["error"] == "wrong_tenant"
 
 
 def test_flag_does_not_open_plain_private_objects(env):
     assert _sign(env, [env.objs["privat"]])[env.objs["privat"]]["error"] == "not_granted"
 
 
-def test_flag_respects_tenant(env):
-    it = _sign(env, [env.objs["oneal"]], tenant="arkturian")[env.objs["oneal"]]
+def test_personal_only_for_the_objects_tenant(env):
+    it = _sign(env, [env.objs["oneal_personal"]], tenant="arkturian")[env.objs["oneal_personal"]]
     assert it["error"] == "wrong_tenant"
+    it = _sign(env, [env.objs["oneal_personal"]], tenant="oneal")[env.objs["oneal_personal"]]
+    assert it["signed"] is True
+
+
+def test_intern_across_tenants(env):
+    it = _sign(env, [env.objs["oneal_intern"]], tenant="arkturian")[env.objs["oneal_intern"]]
+    assert it["signed"] is True and it["visibility_level"] == "intern"
 
 
 def test_private_media_wins_over_intern(env):
     assert _sign(env, [env.objs["pm"]])[env.objs["pm"]]["error"] == "not_granted"
 
 
-def test_intern_not_anonymous_by_id(env):
+@pytest.mark.parametrize("k", ["personal", "oneal_intern"])
+def test_levels_not_anonymous_by_id(env, k):
     env.state["user"] = False
-    assert env.c.get(f"/storage/media/{env.objs['intern']}").status_code in (401, 403)
+    assert env.c.get(f"/storage/media/{env.objs[k]}").status_code in (401, 403)
 
 
 def _patch(env, oid, **body):
     return env.c.patch(f"/storage/objects/{oid}", json=body)
 
 
-def test_patch_public_to_intern_and_back(env):
+def test_patch_public_to_level_and_back(env):
     oid = env.objs["oeffentlich"]
-    j = _patch(env, oid, intern=True).json()
-    assert j["intern"] is True and j["is_public"] is False
+    j = _patch(env, oid, visibility_level="intern").json()
+    assert j["visibility_level"] == "intern" and j["is_public"] is False
+    j = _patch(env, oid, visibility_level="personal").json()
+    assert j["visibility_level"] == "personal"
     j = _patch(env, oid, is_public=True).json()
-    assert j["intern"] is False and j["is_public"] is True
+    assert j["visibility_level"] is None and j["is_public"] is True
 
 
-def test_patch_intern_and_public_together_refused(env):
-    r = _patch(env, env.objs["privat"], intern=True, is_public=True)
-    assert r.status_code == 422 and r.json()["detail"]["code"] == "intern_conflict"
+def test_patch_clear_level(env):
+    j = _patch(env, env.objs["personal"], visibility_level=None).json()
+    assert j["visibility_level"] is None and j["is_public"] is False
 
 
-def test_patch_private_media_cannot_become_intern(env):
-    r = _patch(env, env.objs["privat"], intern=True, metadata_json={"private_media": True})
-    assert r.status_code == 409 and r.json()["detail"]["code"] == "intern_conflict"
+def test_patch_unknown_level(env):
+    r = _patch(env, env.objs["privat"], visibility_level="tenant")
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "invalid_visibility_level"
 
 
-def test_patch_setting_private_media_drops_intern(env):
-    j = _patch(env, env.objs["intern"], metadata_json={"private_media": True}).json()
-    assert j["intern"] is False and j["is_public"] is False
+def test_patch_level_and_public_together_refused(env):
+    r = _patch(env, env.objs["privat"], visibility_level="intern", is_public=True)
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "visibility_conflict"
 
 
-def test_upload_intern_forces_not_public(env):
+def test_patch_private_media_takes_no_level(env):
+    r = _patch(env, env.objs["privat"], visibility_level="intern", metadata_json={"private_media": True})
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "visibility_conflict"
+
+
+def test_patch_setting_private_media_drops_level(env):
+    j = _patch(env, env.objs["personal"], metadata_json={"private_media": True}).json()
+    assert j["visibility_level"] is None and j["is_public"] is False
+
+
+def test_upload_level_forces_not_public(env):
     r = env.c.post("/storage/upload", files={"file": ("n.txt", DATA, "text/plain")},
-                   data={"intern": "true", "is_public": "true", "ai_mode": "none"})
+                   data={"visibility_level": "intern", "is_public": "true", "ai_mode": "none"})
     assert r.status_code == 200, r.text
-    assert r.json()["intern"] is True and r.json()["is_public"] is False
+    assert r.json()["visibility_level"] == "intern" and r.json()["is_public"] is False
 
 
-def test_upload_intern_with_private_refused(env):
+def test_upload_level_with_private_refused(env):
     r = env.c.post("/storage/upload", files={"file": ("n.txt", DATA, "text/plain")},
-                   data={"intern": "true", "private": "true"})
-    assert r.status_code == 422 and r.json()["detail"]["code"] == "intern_conflict"
+                   data={"visibility_level": "personal", "private": "true"})
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "visibility_conflict"
 
 
-def test_ticket_intern(env):
-    r = env.c.post("/storage/upload-ticket", params={"filename": "t.txt", "intern": "true", "is_public": "true"})
+def test_ticket_level(env):
+    r = env.c.post("/storage/upload-ticket", params={"filename": "t.txt", "visibility_level": "personal", "is_public": "true"})
     assert r.status_code == 200, r.text
     tok = r.json()["token"]
     put = env.c.put(f"/storage/upload-ticket/{tok}", content=DATA)
     assert put.status_code == 200, put.text
-    assert put.json()["intern"] is True and put.json()["is_public"] is False
+    assert put.json()["visibility_level"] == "personal" and put.json()["is_public"] is False

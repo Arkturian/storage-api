@@ -65,8 +65,8 @@ class TenantAPIKey(Base):
     may_publish_to_post = Column(Boolean, default=False, nullable=True)
     # #3329: may create share links for an agent's own file (cloud-api)
     may_create_share_links = Column(Boolean, default=False, nullable=True)
-    # #3329: may sign intern objects of its tenants without a grant (cloud-api,
-    # which has checked that the reader is signed in to that tenant)
+    # #3329: may sign personal/intern objects without a grant (cloud-api, which
+    # has checked that the reader is signed in, and to which tenant)
     may_sign_intern = Column(Boolean, default=False, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
@@ -235,9 +235,11 @@ class StorageObject(Base):
     # here; the plaintext DEK exists only in RAM. original_filename carries a
     # placeholder, the real name is enc_filename (HKDF subkey of the DEK).
     encrypted = Column(Boolean, default=False, nullable=False, server_default="0")
-    # #3329: "intern" — readable by everyone signed in to the object's tenant
-    # (checked by cloud-api), never anonymously; always is_public=False.
-    intern = Column(Boolean, default=False, nullable=False, server_default="0")
+    # #3329 (Alex 18.11.): levels between private and public, checked by
+    # cloud-api, never served anonymously; always is_public=False.
+    #   "personal" = everyone signed in to the object's tenant
+    #   "intern"   = everyone signed in to any tenant of this instance
+    visibility_level = Column(String(16), nullable=True)
     enc_kid = Column(String, nullable=True)
     enc_wrapped_dek = Column(LargeBinary, nullable=True)
     enc_recovery_kid = Column(String, nullable=True)
@@ -289,7 +291,7 @@ class StorageObjectResponse(BaseModel):
     thumbnail_url: Optional[str] = None
     webview_url: Optional[str] = None
     share_url: Optional[str] = None  # public objects only: readable link on the share host
-    intern: bool = False  # #3329: for everyone signed in to the tenant, never anonymous
+    visibility_level: Optional[str] = None  # #3329: "personal" (tenant) | "intern" (instance) | None
     grant_scope: Optional[str] = None  # upload/fetch: scope bound in this request; GET /objects/{id}: all bound scopes, owner/admin only (#2568)
     mime_type: str
     file_size_bytes: int
