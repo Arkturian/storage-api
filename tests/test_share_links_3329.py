@@ -250,3 +250,13 @@ def test_link_goes_with_deleted_object(env):
     s.delete(s.get(StorageObject, env.objs["doc"])); s.commit()
     assert s.query(ShareLink).count() == 0
     s.close()
+
+
+def test_access_log_keeps_only_token_prefix():
+    import logging
+    from storage.share_links import _RedactShareTokens
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                            ("1.2.3.4:0", "GET", "/storage/s/AbCdEfGhIjKlMnOpQrStUvWxYz012345/x.pdf", "1.1", 302), None)
+    _RedactShareTokens().filter(rec)
+    msg = rec.getMessage()
+    assert "AbCdEf" in msg and "GhIjKl" not in msg and "/x.pdf" in msg

@@ -18,6 +18,7 @@ be bound to the object by the agent's own upload (not a share). The caller
 refused in v1. Revoking is effective within the signature lifetime (120 s).
 """
 import hashlib
+import logging
 import os
 import re
 import secrets
@@ -37,6 +38,25 @@ from storage import routes as R
 from storage.url_builder import _share_name
 
 router = APIRouter()
+
+_LOG_TOKEN_RE = re.compile(r"(/storage/s/)([A-Za-z0-9_-]{6})[A-Za-z0-9_-]*")
+
+
+class _RedactShareTokens(logging.Filter):
+    """uvicorn's access log prints the path; keep only the token prefix."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.args, tuple) and len(record.args) >= 3 and "/storage/s/" in str(record.args[2]):
+                args = list(record.args)
+                args[2] = _LOG_TOKEN_RE.sub(r"\1\2…", str(args[2]))
+                record.args = tuple(args)
+        except Exception:
+            pass
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_RedactShareTokens())
 
 TOKEN_BYTES = 24                      # 192 bit
 DEFAULT_DAYS = 30
