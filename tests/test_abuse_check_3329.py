@@ -22,7 +22,11 @@ from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from models import Base, ShareLink, StorageObject, TenantAPIKey, User  # noqa: E402
 
-CLEAR = {"csam": 0.01, "sexuell_explizit": 0.02, "gewalt_missbrauch": 0.03}
+CLEAR = {"csam": 0.0, "minderjaehrig_sichtbar": 0.1, "sexuell_explizit": 0.02, "gewalt_missbrauch": 0.03}
+
+
+def P(**kw):
+    return {**{"csam": 0.0, "minderjaehrig_sichtbar": 0.0, "sexuell_explizit": 0.0, "gewalt_missbrauch": 0.0}, **kw}
 
 
 def _png():
@@ -65,6 +69,7 @@ def env(tmp_path, monkeypatch):
             raise a
         return dict(a)
 
+    monkeypatch.setattr(A, "_ask_orig", A._ask, raising=False)
     monkeypatch.setattr(A, "_ask", fake_ask)
     # never touch a real Chroma store from a test (object ids here are small numbers)
     monkeypatch.setattr(A, "_drop_embedding", lambda o: None)
@@ -131,7 +136,7 @@ def test_retry_makes_it_public_later(env):
 
 
 def test_hit_locks_blocks_and_raises_event(env):
-    env.state["answer"] = {"csam": 0.93, "sexuell_explizit": 0.9, "gewalt_missbrauch": 0.1}
+    env.state["answer"] = P(csam=0.93, sexuell_explizit=0.9)
     j = _upload(env)
     o = _obj(env, j["id"])
     assert o.abuse_status == "hit" and o.is_public is False and o.metadata_json.get("private_media") is True
@@ -191,7 +196,7 @@ def test_hit_at_share_refused_and_existing_links_revoked(env):
     tok = _tok(_link(env, j["id"]).json()["url"])
     env.s.get(StorageObject, j["id"]).abuse_status = None   # pretend a later re-check
     env.s.commit()
-    env.state["answer"] = {"csam": 0.0, "sexuell_explizit": 0.0, "gewalt_missbrauch": 0.95}
+    env.state["answer"] = P(gewalt_missbrauch=0.95)
     r = _link(env, j["id"])
     assert r.status_code == 451
     assert env.s.query(ShareLink).filter(ShareLink.revoked_at.is_(None)).count() == 0
@@ -216,7 +221,7 @@ def test_hit_quarantines_hls_out_of_the_nginx_tree(env, tmp_path, monkeypatch):
     env.s.commit()
     q = tmp_path / "quarantine"
     monkeypatch.setenv("ABUSE_QUARANTINE_DIR", str(q))
-    env.state["answer"] = {"csam": 0.0, "sexuell_explizit": 0.95, "gewalt_missbrauch": 0.0}
+    env.state["answer"] = P(sexuell_explizit=0.95)
     r = env.c.patch(f"/storage/objects/{j['id']}", json={"is_public": True})
     assert r.status_code == 200
     o = _obj(env, j["id"])
@@ -226,7 +231,7 @@ def test_hit_quarantines_hls_out_of_the_nginx_tree(env, tmp_path, monkeypatch):
 
 
 def test_hit_object_hidden_from_lists_metadata_and_sign(env):
-    env.state["answer"] = {"csam": 0.9, "sexuell_explizit": 0.0, "gewalt_missbrauch": 0.0}
+    env.state["answer"] = P(csam=0.9)
     j = _upload(env)
     ids = [x["id"] for x in env.c.get("/storage/list", params={"limit": 50}).json()["items"]]
     assert j["id"] not in ids
@@ -243,7 +248,7 @@ def test_hit_object_hidden_from_lists_metadata_and_sign(env):
 def test_hit_drops_embedding(env, monkeypatch):
     dropped = []
     monkeypatch.setattr(env.A, "_drop_embedding", lambda o: dropped.append(o.id))
-    env.state["answer"] = {"csam": 0.0, "sexuell_explizit": 0.0, "gewalt_missbrauch": 0.9}
+    env.state["answer"] = P(gewalt_missbrauch=0.9)
     j = _upload(env)
     assert dropped == [j["id"]]
 
@@ -260,3 +265,114 @@ def test_old_signed_url_blocked_after_hit(env):
     for extra in ({}, {"variant": "thumbnail"}, {"width": "200", "format": "webp"}):
         assert env.c.get(f"/storage/media/{j['id']}", params={**params, **extra}).status_code == 451
     assert env.c.head(f"/storage/media/{j['id']}", params=params).status_code == 451
+
+
+
+@pytest.mark.parametrize("probs,expect", [
+    (P(), ("clear", None)),
+    (P(minderjaehrig_sichtbar=0.99), ("clear", None)),           # a child alone never triggers
+    (P(csam=0.06), ("held", "csam")),
+    (P(csam=0.2), ("hit", "csam")),
+    (P(minderjaehrig_sichtbar=0.5, sexuell_explizit=0.2), ("hit", "csam")),
+    (P(sexuell_explizit=0.3), ("held", "sexuell_explizit")),
+    (P(gewalt_missbrauch=0.79), ("held", "gewalt_missbrauch")),
+    (P(sexuell_explizit=0.8), ("hit", "sexuell_explizit")),
+    (P(gewalt_missbrauch=0.8), ("hit", "gewalt_missbrauch")),
+])
+def test_thresholds_from_contract_6255(probs, expect):
+    from storage import abuse_check as A
+    r, k, _ = A._verdict(probs)
+    assert (r, k) == expect
+
+
+def test_stage1_stays_private_without_lock_or_card(env):
+    env.state["answer"] = P(sexuell_explizit=0.4)
+    j = _upload(env)
+    o = _obj(env, j["id"])
+    assert o.abuse_status == "held" and o.is_public is False and o.public_pending is False
+    assert not (o.metadata_json or {}).get("private_media")
+    assert env.c.get(f"/storage/media/{j['id']}").status_code == 200        # owner still reads it
+    assert env.events == []
+    r = _link(env, j["id"])
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "abuse_held"
+
+
+def test_two_refusals_hold_and_raise_card_event(env):
+    env.state["answer"] = env.A.Refused("refusal csam")
+    j = _upload(env)
+    assert _obj(env, j["id"]).abuse_status == "failed" and env.events == []
+    asyncio.get_event_loop().run_until_complete(env.A.retry_open(env.S))
+    o = _obj(env, j["id"])
+    assert o.abuse_status == "held" and o.is_public is False
+    assert [(k, p["kategorie"]) for k, p in env.events] == [("abuse_suspected", "ablehnung")]
+
+
+def test_values_logged_without_name(env, capsys):
+    env.state["answer"] = CLEAR
+    _upload(env, name="Geheimer Name.png")
+    out = capsys.readouterr().out
+    line = [l for l in out.splitlines() if "abuse check object=" in l][0]
+    assert "csam=0.0" in line and "minderjaehrig_sichtbar=0.1" in line and "Geheimer" not in line
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status_code, self._b = status, body
+
+    def json(self):
+        return self._b
+
+
+class _Client:
+    def __init__(self, resp):
+        self.resp, self.sent = resp, None
+
+    async def post(self, url, json=None, headers=None):
+        self.sent = json
+        return self.resp
+
+
+def _run(coro):
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def test_ask_frame_sends_contract_body_and_parses():
+    from storage import abuse_check as A
+    ans = [{"name": n, "type": "predicate", "probability": 0.01} for n in A.QUESTIONS]
+    c = _Client(_Resp(200, {"answers": ans, "cost_usd": 0.00015}))
+    probs = _run(A._ask_frame(c, "u", "t", b"\xff\xd8jpeg"))
+    assert probs == {n: 0.01 for n in A.QUESTIONS}
+    content = c.sent["input"][0]["content"][0]
+    assert content["type"] == "input_image" and content["image_url"].startswith("data:image/jpeg;base64,")
+    assert [q["name"] for q in c.sent["questions"]] == list(A.QUESTIONS)
+    assert all(q["type"] == "predicate" for q in c.sent["questions"])
+
+
+def test_ask_frame_refusal_and_errors():
+    from storage import abuse_check as A
+    ans = [{"name": "csam", "type": "refusal", "refusal": "nein"}] + \
+          [{"name": n, "type": "predicate", "probability": 0.0} for n in list(A.QUESTIONS)[1:]]
+    with pytest.raises(A.Refused):
+        _run(A._ask_frame(_Client(_Resp(200, {"answers": ans})), "u", "t", b"x"))
+    with pytest.raises(A.CheckUnavailable):
+        _run(A._ask_frame(_Client(_Resp(429, {"error": "decisions_caller_budget_exceeded"})), "u", "t", b"x"))
+
+
+def test_video_takes_highest_value_over_frames(env, monkeypatch):  # env keeps A._ask_orig
+    from storage import abuse_check as A
+    seq = iter([P(), P(gewalt_missbrauch=0.85), P()])
+
+    async def frames(obj):
+        return [b"a", b"b", b"c"]
+
+    async def tok():
+        return "t"
+
+    async def ask_frame(c, url, token, jpeg):
+        return next(seq)
+
+    monkeypatch.setattr(A, "_frames", frames)
+    monkeypatch.setattr(A, "_service_token", tok)
+    monkeypatch.setattr(A, "_ask_frame", ask_frame)
+    best = _run(A._ask_orig(SimpleNamespace(id=1)))    # the original _ask, kept by the fixture
+    assert best["gewalt_missbrauch"] == 0.85 and best["csam"] == 0.0

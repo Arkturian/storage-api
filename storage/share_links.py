@@ -139,6 +139,8 @@ async def create_share_link(
     pruefung = await _abuse.ensure_for_share(db, obj)
     if pruefung == "hit":
         raise HTTPException(status_code=451, detail={"error": "Content blocked pending review", "code": "abuse_blocked"})
+    if pruefung == "held":
+        raise HTTPException(status_code=403, detail={"error": "this file may not be shared outside", "code": "abuse_held"})
     now = _utcnow()
     until = payload.gueltig_bis
     if until is not None and until.tzinfo is not None:
