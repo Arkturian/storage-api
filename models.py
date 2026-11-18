@@ -63,6 +63,8 @@ class TenantAPIKey(Base):
     may_sign_encrypted = Column(Boolean, default=False, nullable=True)
     # #3319: may bind an agent's own file to one content post via /grants/share
     may_publish_to_post = Column(Boolean, default=False, nullable=True)
+    # #3329: may create share links for an agent's own file (cloud-api)
+    may_create_share_links = Column(Boolean, default=False, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
 
@@ -86,6 +88,28 @@ class MediaGrant(Base):
     granted_by_user_id = Column(Integer, nullable=False)
     granted_via = Column(String(255), nullable=True)  # service key label or "admin"
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ShareLink(Base):
+    """An unguessable link to one object for people outside (#3329).
+
+    Only the SHA-256 of the token is stored: a dump or backup holds no valid
+    link. The token itself appears once, in the answer that created it.
+    Works for private objects too, which is the point: what goes out stays
+    private (not enumerable by id) and is reachable only with the token.
+    """
+    __tablename__ = "share_links"
+
+    id = Column(Integer, primary_key=True)
+    token_hash = Column(String(64), unique=True, index=True, nullable=False)
+    token_prefix = Column(String(8), nullable=False)  # for logs and listings only
+    object_id = Column(Integer, index=True, nullable=False)
+    tenant_id = Column(String(100), nullable=False)
+    created_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_by = Column(String(255), nullable=True)
 
 
 # SQLAlchemy Models
@@ -397,6 +421,12 @@ def _grants_mit_loeschen(mapper, connection, target):
         _grants_tabelle[key] = _sa_inspect(connection).has_table(MediaGrant.__tablename__)
     if _grants_tabelle[key]:
         connection.execute(MediaGrant.__table__.delete().where(MediaGrant.object_id == target.id))
+    skey = ("share_links", key)
+    if skey not in _grants_tabelle:
+        from sqlalchemy import inspect as _sa_inspect
+        _grants_tabelle[skey] = _sa_inspect(connection).has_table(ShareLink.__tablename__)
+    if _grants_tabelle[skey]:
+        connection.execute(ShareLink.__table__.delete().where(ShareLink.object_id == target.id))
 
 
 def delete_grants_for(db, object_ids) -> int:
@@ -405,4 +435,9 @@ def delete_grants_for(db, object_ids) -> int:
     ids = [int(i) for i in (object_ids or [])]
     if not ids:
         return 0
-    return db.query(MediaGrant).filter(MediaGrant.object_id.in_(ids)).delete(synchronize_session=False)
+    n = db.query(MediaGrant).filter(MediaGrant.object_id.in_(ids)).delete(synchronize_session=False)
+    try:
+        db.query(ShareLink).filter(ShareLink.object_id.in_(ids)).delete(synchronize_session=False)  # #3329
+    except Exception:
+        pass  # older schema without share_links
+    return n

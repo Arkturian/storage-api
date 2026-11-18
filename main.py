@@ -477,6 +477,8 @@ async def storage_media_head_headers(request: Request, call_next):
 
 # Include routers
 app.include_router(storage_routes.router, prefix="/storage", tags=["Storage"])
+from storage import share_links as _share_links  # noqa: E402  #3329
+app.include_router(_share_links.router, prefix="/storage", tags=["Storage"])
 # Include tenant routes (router already has '/tenants' prefix)
 app.include_router(tenant_routes.router, tags=["Tenancy"])
 app.include_router(admin_routes.router, prefix="/admin", tags=["Admin"])
