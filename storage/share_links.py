@@ -202,6 +202,19 @@ def _not_found() -> HTTPException:
     return HTTPException(status_code=404, detail="Not found", headers=_NO_LEAK)
 
 
+def _creator_still_entitled(db: Session, row: ShareLink) -> bool:
+    """A link must not outlive the right it came from. An agent's link holds
+    only while the agent's own binding to the object still exists (unshare,
+    owner change or a moved grant end it). Owner/admin links stand until
+    revoked or expired."""
+    who = row.created_by or ""
+    if not who.startswith("agent:"):
+        return True
+    scope = who[len("agent:"):]
+    g = db.query(MediaGrant.granted_via).filter(MediaGrant.object_id == row.object_id, MediaGrant.scope == scope).first()
+    return g is not None and not (g[0] or "").startswith((R._SHARE_VIA, R._SHARE_RO_VIA))
+
+
 @router.api_route("/s/{token}", methods=["GET", "HEAD"])
 @router.api_route("/s/{token}/{name}", methods=["GET", "HEAD"])
 def open_share_link(token: str, request: Request, name: Optional[str] = None, db: Session = Depends(get_db)):
@@ -216,6 +229,8 @@ def open_share_link(token: str, request: Request, name: Optional[str] = None, db
         raise _not_found()
     obj = db.query(StorageObject).filter(StorageObject.id == row.object_id).first()
     if obj is None or getattr(obj, "tombstoned_at", None) is not None or getattr(obj, "encrypted", False):
+        raise _not_found()
+    if not _creator_still_entitled(db, row):
         raise _not_found()
     try:
         params = signing.sign(obj.id, REDIRECT_TTL)

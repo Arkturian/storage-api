@@ -260,3 +260,34 @@ def test_access_log_keeps_only_token_prefix():
     _RedactShareTokens().filter(rec)
     msg = rec.getMessage()
     assert "AbCdEf" in msg and "GhIjKl" not in msg and "/x.pdf" in msg
+
+
+def _agent_link(env):
+    j = _create(env, key=CLOUD, scope=AGENT).json()
+    return j, _token(j["url"])
+
+
+def test_agent_link_dies_with_the_agents_grant(env):
+    _, tok = _agent_link(env)
+    assert env.c.get(f"/storage/s/{tok}", follow_redirects=False).status_code == 302
+    s = env.S()
+    s.query(MediaGrant).filter_by(object_id=env.objs["doc"], scope=AGENT).delete(); s.commit(); s.close()
+    assert env.c.get(f"/storage/s/{tok}", follow_redirects=False).status_code == 404
+
+
+def test_owner_link_independent_of_agent_grant(env):
+    tok = _token(_create(env).json()["url"])
+    s = env.S()
+    s.query(MediaGrant).filter_by(object_id=env.objs["doc"]).delete(); s.commit(); s.close()
+    assert env.c.get(f"/storage/s/{tok}", follow_redirects=False).status_code == 302
+
+
+def test_agent_link_follows_rename(env):
+    _, tok = _agent_link(env)
+    r = env.c.post("/storage/grants/move", headers={"X-API-KEY": CLOUD},
+                   json={"tenant": "arkturian", "from_scope": AGENT, "to_scope": "cloud-session:CloudV2-zeit"})
+    assert r.status_code == 200 and r.json()["moved"] >= 1
+    assert env.c.get(f"/storage/s/{tok}", follow_redirects=False).status_code == 302
+    s = env.S()
+    assert s.query(ShareLink).one().created_by == "agent:cloud-session:CloudV2-zeit"
+    s.close()

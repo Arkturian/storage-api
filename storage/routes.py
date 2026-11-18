@@ -8437,6 +8437,17 @@ def move_media_grants(
         .all()
     ):
         g.granted_via = g.granted_via[: g.granted_via.index(":") + 1] + dst
+    # #3329: an agent's share links follow the rename, else they would die
+    # with the old scope's binding.
+    try:
+        from models import ShareLink
+        moved_ids = [r.object_id for r in rows]
+        if moved_ids:
+            db.query(ShareLink).filter(ShareLink.created_by == "agent:" + src,
+                                       ShareLink.object_id.in_(moved_ids)).update(
+                {ShareLink.created_by: "agent:" + dst}, synchronize_session=False)
+    except Exception as e:
+        print(f"⚠️ grants move: share links not renamed: {e}", flush=True)
     db.commit()
     print(f"🔗 grants move key={row.label or row.tenant_id} tenant={payload.tenant} {src} -> {dst} moved={moved} merged={merged}", flush=True)
     return {"from_scope": src, "to_scope": dst, "moved": moved, "merged": merged}
