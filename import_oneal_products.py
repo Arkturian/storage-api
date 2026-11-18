@@ -29,8 +29,8 @@ from knowledge_graph.pipeline import kg_pipeline
 
 
 ONEAL_API_BASE = os.getenv("ONEAL_API_BASE", "https://oneal-api.arkturian.com")
-ONEAL_API_KEY = os.getenv("ONEAL_API_KEY", "oneal_demo_token")
-STORAGE_API_KEY = os.getenv("API_KEY", "Inetpass1")
+ONEAL_API_KEY = os.getenv("ONEAL_API_KEY", "")  # #3057: no built-in value
+STORAGE_API_KEY = os.getenv("API_KEY", "")  # #3057: no built-in value
 TENANT_ID = "oneal"
 
 
@@ -222,6 +222,8 @@ async def import_products(products: List[Dict], db: Session, skip_embeddings: bo
 
 
 async def main():
+    if not ONEAL_API_KEY or not STORAGE_API_KEY:
+        raise SystemExit("ONEAL_API_KEY and API_KEY must be set in the environment (#3057: no built-in values)")
     parser = argparse.ArgumentParser(description="Import O'Neal products to storage-api")
     parser.add_argument('--limit', type=int, help='Limit number of products to import')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be imported without importing')
