@@ -8388,6 +8388,7 @@ def sign_media_links(
         _item = {"id": oid, "url": f"{url}?exp={s['exp']}&kid={s['kid']}&sig={s['sig']}", "signed": True}
         if level_ok:
             _item["visibility_level"] = level
+            _item["tenant"] = o.tenant_id  # cloud-api checks personal against it too
         if getattr(o, "encrypted", False):
             # Always marked: the portal (#3235) recognises encrypted files by
             # this flag, also when the requested ttl needed no capping.

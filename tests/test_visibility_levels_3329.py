@@ -125,6 +125,7 @@ def test_personal_only_for_members_of_the_objects_tenant(env):
     assert _sign(env, [oid])[oid]["error"] == "wrong_tenant"            # reader only in arkturian
     it = _sign(env, [oid], readers=("arkturian", "oneal"))[oid]          # member of both
     assert it["signed"] is True and it["visibility_level"] == "personal"
+    assert it["tenant"] == "oneal"
     oid = env.objs["personal"]
     assert _sign(env, [oid], readers=("oneal",))[oid]["error"] == "not_granted"  # arkturian object, oneal reader
 
@@ -153,7 +154,7 @@ def test_grant_path_unchanged_with_readers(env):
     s.add(MediaGrant(object_id=env.objs["privat"], scope="cloud-user:7", granted_by_user_id=1, granted_via="upload"))
     s.commit()
     it = _sign(env, [env.objs["privat"]], readers=("oneal",))[env.objs["privat"]]
-    assert it["signed"] is True and "visibility_level" not in it
+    assert it["signed"] is True and "visibility_level" not in it and "tenant" not in it
 
 
 def test_private_media_wins_over_intern(env):
