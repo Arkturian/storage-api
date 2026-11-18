@@ -632,6 +632,7 @@ from storage.domain import save_file_and_record, update_file_and_record
 from storage.service import generic_storage, bulk_delete_objects, GenericStorageService
 from storage.external_proxy import fetch_external_file, external_cache
 from storage.url_builder import build_share_url, build_storage_urls, get_base_url_from_request
+from storage import abuse_check as _abuse  # #3329 (c)
 from storage import opencloud as _opencloud
 from admin import routes as admin_routes
 from tenancy.config import tenant_id_for_api_key, get_tenant_id, get_tenant_id_optional
@@ -2341,7 +2342,7 @@ async def consume_upload_ticket(
         data=data,
         original_filename=ticket["filename"],
         context=ticket["context"],
-        is_public=ticket["is_public"],
+        is_public=ticket["is_public"] and not _abuse.enabled(),  # #3329 c: public only after the check
         collection_id=ticket["collection_id"],
         tenant_id=ticket["tenant_id"],
         ttl_hours=ticket["ttl_hours"],
@@ -2354,6 +2355,8 @@ async def consume_upload_ticket(
         db.commit()
         db.refresh(saved_obj)
     _apply_level(db, saved_obj, ticket.get("visibility_level"))
+    if ticket["is_public"] and _abuse.enabled():
+        await _abuse.request_public(db, saved_obj, "upload_public")
 
     if ticket["ai_mode"] and ticket["ai_mode"] != "none":
         try:
@@ -2611,7 +2614,7 @@ async def upload_chunk(
         data=data,
         original_filename=sess["filename"],
         context=sess["context"],
-        is_public=sess["is_public"],
+        is_public=sess["is_public"] and not _abuse.enabled(),  # #3329 c
         collection_id=sess["collection_id"],
         tenant_id=sess["tenant_id"],
         ttl_hours=sess["ttl_hours"],
@@ -2624,6 +2627,8 @@ async def upload_chunk(
         db.commit()
         db.refresh(saved_obj)
     _apply_level(db, saved_obj, sess.get("visibility_level"))
+    if sess["is_public"] and _abuse.enabled():
+        await _abuse.request_public(db, saved_obj, "upload_public")
 
     if sess["ai_mode"] and sess["ai_mode"] != "none":
         try:
@@ -3282,7 +3287,7 @@ async def upload_file(
                     data=data,
                     original_filename=file.filename,
                     context=context,
-                    is_public=is_public,
+                    is_public=is_public and not _abuse.enabled(),  # #3329 c
                     collection_id=collection_id,
                     link_id=link_id,
                     storage_mode=storage_mode,
@@ -3332,6 +3337,8 @@ async def upload_file(
                     db.rollback()
 
         _apply_level(db, saved_obj, visibility_level)  # #3329
+        if is_public and _abuse.enabled():
+            await _abuse.request_public(db, saved_obj, "upload_public")
 
         # --- AI Analysis handled by async worker system (check_safety_ai.py) ---
         # The async worker will perform comprehensive analysis with unified Gemini prompt
@@ -3543,7 +3550,7 @@ async def fetch_and_store_remote(
             data=data,
             original_filename=filename,
             context=payload.context,
-            is_public=payload.is_public,
+            is_public=payload.is_public and not _abuse.enabled(),  # #3329 c
             collection_id=payload.collection_id,
             link_id=payload.link_id,
             tenant_id=tenant_id,
@@ -3555,6 +3562,8 @@ async def fetch_and_store_remote(
             db.commit()
             db.refresh(saved_obj)
         _apply_level(db, saved_obj, payload.visibility_level)
+        if payload.is_public and _abuse.enabled():
+            await _abuse.request_public(db, saved_obj, "upload_public")
 
         # Attach tenant_id derived from API key for downstream KG processing
         try:
@@ -4436,6 +4445,12 @@ def _check_presence_and_privacy(obj, current_user: Optional[User], db: Optional[
     # dauerhaft oeffentlich (P3 24.10.2026: Kontoauszuege seit 30.08. abrufbar).
     if _ist_abgelaufen(obj):
         raise HTTPException(status_code=404, detail={"error": "asset not found", "code": "expired"})
+    # #3329 (c): suspected abuse — blocked for everyone but a real admin, the
+    # owner and signed links included.
+    if getattr(obj, "abuse_status", None) == "hit":
+        if not (current_user is not None and _is_privileged_admin(current_user, db)
+                and not _is_public_default_master(current_user)):
+            raise HTTPException(status_code=451, detail={"error": "Content blocked pending review", "code": "abuse_blocked"})
     # Per-object opt-in privacy (Issue #420): metadata_json.private_media=true
     # closes the public-by-ID hole for genuinely confidential uploads without
     # changing the default contract the public frontends rely on. Only the
@@ -7149,6 +7164,11 @@ async def update_object_metadata(
         and bool(update_data["is_public"])
         and not bool(obj.is_public)
     )
+    # #3329 (c): an image/video goes public only through the abuse check.
+    want_public_checked = going_public and _abuse.needs_check(obj)
+    if want_public_checked:
+        update_data.pop("is_public")
+        going_public = False
     needs_safety_recheck = going_public and obj.ai_safety_status != "completed"
 
     for key, value in update_data.items():
@@ -7160,6 +7180,9 @@ async def update_object_metadata(
 
     db.commit()
     db.refresh(obj)
+
+    if want_public_checked:
+        await _abuse.request_public(db, obj, "patch_public")
 
     if needs_safety_recheck:
         try:

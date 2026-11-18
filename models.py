@@ -240,6 +240,10 @@ class StorageObject(Base):
     #   "personal" = everyone signed in to the object's tenant
     #   "intern"   = everyone signed in to any tenant of this instance
     visibility_level = Column(String(16), nullable=True)
+    # #3329 (c): abuse check before an image/video goes public or outside.
+    # NULL never required | pending | failed | clear | hit (storage/abuse_check.py)
+    abuse_status = Column(String(16), nullable=True)
+    public_pending = Column(Boolean, default=False, nullable=False, server_default="0")
     enc_kid = Column(String, nullable=True)
     enc_wrapped_dek = Column(LargeBinary, nullable=True)
     enc_recovery_kid = Column(String, nullable=True)
@@ -292,6 +296,8 @@ class StorageObjectResponse(BaseModel):
     webview_url: Optional[str] = None
     share_url: Optional[str] = None  # public objects only: readable link on the share host
     visibility_level: Optional[str] = None  # #3329: "personal" (tenant) | "intern" (instance) | None
+    abuse_status: Optional[str] = None  # #3329 (c): pending | failed | clear | hit; NULL = never required
+    public_pending: bool = False  # #3329 (c): asked to go public, waiting for a clean abuse check
     grant_scope: Optional[str] = None  # upload/fetch: scope bound in this request; GET /objects/{id}: all bound scopes, owner/admin only (#2568)
     mime_type: str
     file_size_bytes: int

@@ -207,6 +207,11 @@ async def connect_db():
                 # Sichtbarkeitsstufen personal / intern (#3329)
                 if "visibility_level" not in scols:
                     conn.execute(text("ALTER TABLE storage_objects ADD COLUMN visibility_level VARCHAR(16)"))
+                # Missbrauchsprüfung vor öffentlich/außen (#3329 c)
+                if "abuse_status" not in scols:
+                    conn.execute(text("ALTER TABLE storage_objects ADD COLUMN abuse_status VARCHAR(16)"))
+                if "public_pending" not in scols:
+                    conn.execute(text("ALTER TABLE storage_objects ADD COLUMN public_pending BOOLEAN NOT NULL DEFAULT 0"))
 
                 conn.commit()
     except Exception as e:

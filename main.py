@@ -92,6 +92,13 @@ async def startup():
     except Exception:
         pass
     await connect_db()
+    # #3329 (c): catch up abuse checks that found no verdict (fail-closed).
+    try:
+        import asyncio as _aio
+        from storage import abuse_check as _abuse_chk
+        _aio.get_event_loop().create_task(_abuse_chk.retry_loop())
+    except Exception as _e:
+        print(f"⚠️ abuse retry loop not started: {_e}", flush=True)
     # Idempotent schema migration (no Alembic): add the tombstoned_at column for
     # two-phase / cascade delete if it doesn't exist yet. SQLite ALTER ADD COLUMN.
     try:

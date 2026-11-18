@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 from database import get_db
 from models import MediaGrant, ShareLink, StorageObject, User
+from storage import abuse_check as _abuse
 from storage import routes as R
 from storage.url_builder import _share_name
 
@@ -122,7 +123,7 @@ def _row_out(r: ShareLink) -> dict:
 
 
 @router.post("/objects/{object_id}/share-link")
-def create_share_link(
+async def create_share_link(
     object_id: int,
     payload: ShareLinkCreate,
     request: Request,
@@ -133,6 +134,11 @@ def create_share_link(
     who = _authority(obj, current_user, request, db, payload.scope)
     if getattr(obj, "encrypted", False):
         raise HTTPException(status_code=403, detail={"error": "encrypted objects cannot get a share link", "code": "encrypted_share_link_not_allowed"})
+    # #3329 (c): images/videos leave only after a clean abuse check. The link
+    # is created either way; until "clear" it answers 404 (fail-closed).
+    pruefung = await _abuse.ensure_for_share(db, obj)
+    if pruefung == "hit":
+        raise HTTPException(status_code=451, detail={"error": "Content blocked pending review", "code": "abuse_blocked"})
     now = _utcnow()
     until = payload.gueltig_bis
     if until is not None and until.tzinfo is not None:
@@ -148,7 +154,10 @@ def create_share_link(
     name = _share_name(obj.original_filename)
     url = f"{_share_base(request)}/{token}" + (f"/{quote(name)}" if name else "")
     print(f"🔗 share-link create id={row.id} prefix={row.token_prefix} object={obj.id} by={who} until={until.isoformat()}", flush=True)
-    return {**_row_out(row), "object_id": obj.id, "url": url}
+    out = {**_row_out(row), "object_id": obj.id, "url": url}
+    if pruefung is not None:
+        out["pruefung"] = pruefung  # clear | pending | failed (link opens only after clear)
+    return out
 
 
 @router.get("/objects/{object_id}/share-links")
@@ -231,6 +240,8 @@ def open_share_link(token: str, request: Request, name: Optional[str] = None, db
     if obj is None or getattr(obj, "tombstoned_at", None) is not None or getattr(obj, "encrypted", False):
         raise _not_found()
     if not _creator_still_entitled(db, row):
+        raise _not_found()
+    if not _abuse.share_allowed(obj):
         raise _not_found()
     try:
         params = signing.sign(obj.id, REDIRECT_TTL)
