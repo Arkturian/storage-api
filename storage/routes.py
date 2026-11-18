@@ -8488,6 +8488,37 @@ def _share_grants(db: Session, obj, src: str, dsts: List[str], user_id, reshare:
     return new
 
 
+_AGENT_SCOPE_PREFIXES = ("cloud-session:", "cloud-session-x:")
+_POST_SCOPE_PREFIX = "content-post:"
+
+
+def _is_post_publish(row, src: str, dsts: List[str]) -> bool:
+    """#3319: the one cross-family step. An agent's scope hands one of its own
+    files to exactly one content post. Only a key flagged may_publish_to_post
+    (content-api, which checked the agent's JWT and its write right on the
+    post) may ask for it; cloud-user:* (humans) is not an agent scope."""
+    return (
+        bool(getattr(row, "may_publish_to_post", False))
+        and src.startswith(_AGENT_SCOPE_PREFIXES)
+        and len(dsts) == 1
+        and dsts[0].startswith(_POST_SCOPE_PREFIX)
+    )
+
+
+def _check_post_publish(db: Session, obj, src: str) -> None:
+    """Only the agent's own file, never one it merely received, and never an
+    encrypted one (the post's signing key could not serve it anyway)."""
+    from models import MediaGrant
+
+    if getattr(obj, "encrypted", False):
+        raise HTTPException(status_code=403, detail={"error": "encrypted objects cannot be bound to a post", "code": "encrypted_publish_not_allowed"})
+    g = db.query(MediaGrant.granted_via).filter(MediaGrant.object_id == obj.id, MediaGrant.scope == src).first()
+    if g is None:
+        raise HTTPException(status_code=403, detail={"error": "from_scope is not bound to this object", "code": "not_granted"})
+    if (g[0] or "").startswith((_SHARE_VIA, _SHARE_RO_VIA)):
+        raise HTTPException(status_code=403, detail={"error": "only the agent's own files may be bound to a post, not files shared with it", "code": "not_own_file"})
+
+
 @router.post("/grants/share")
 def share_media_grants(
     payload: GrantShareRequest,
@@ -8502,6 +8533,8 @@ def share_media_grants(
     the agent behind `from_scope` asked for this and that every target is
     an active agent of the same tenant. It only adds bindings, and only
     when `from_scope` is already bound, so it grants less than /move can.
+    One cross-family step exists: agent scope -> one content-post (#3319,
+    see _is_post_publish); it is always read-only.
     """
     if request.headers.get("X-On-Behalf-Of"):
         raise HTTPException(status_code=400, detail={"error": "sharing grants is the service's own act; drop X-On-Behalf-Of", "code": "on_behalf_not_allowed"})
@@ -8514,13 +8547,18 @@ def share_media_grants(
     dsts = list(dict.fromkeys(_validate_scope(d) for d in payload.to_scopes))
     if not (1 <= len(dsts) <= _SHARE_MAX_TARGETS):
         raise HTTPException(status_code=422, detail={"error": f"1..{_SHARE_MAX_TARGETS} to_scopes", "code": "invalid_targets"})
-    if any(_scope_family(d) != _scope_family(src) for d in dsts):
+    publish = _is_post_publish(row, src, dsts)
+    if not publish and any(_scope_family(d) != _scope_family(src) for d in dsts):
         raise HTTPException(status_code=422, detail={"error": "scopes must belong to the same family", "code": "cross_family"})
     obj = db.query(StorageObject).filter(StorageObject.id == payload.object_id).first()
     if obj is None or getattr(obj, "tombstoned_at", None) is not None or obj.tenant_id != payload.tenant:
         raise HTTPException(status_code=404, detail={"error": "object not found", "code": "not_found"})
-    new = _share_grants(db, obj, src, [d for d in dsts if d != src], current_user.id, payload.reshare)
-    print(f"🔗 grants share key={row.label or row.tenant_id} object={obj.id} {src} -> {','.join(new) or '-'} reshare={payload.reshare}", flush=True)
+    reshare = payload.reshare
+    if publish:
+        _check_post_publish(db, obj, src)
+        reshare = False  # a post never passes the file on
+    new = _share_grants(db, obj, src, [d for d in dsts if d != src], current_user.id, reshare)
+    print(f"🔗 grants share key={row.label or row.tenant_id} object={obj.id} {src} -> {','.join(new) or '-'} reshare={reshare}{' publish' if publish else ''}", flush=True)
     return {"object_id": obj.id, "from_scope": src, "shared": new,
             "already": [d for d in dsts if d not in new]}
 

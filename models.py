@@ -61,6 +61,8 @@ class TenantAPIKey(Base):
     # #3230: may mint signed links for encrypted objects (cloud-api's signing
     # key). Other signing keys keep signing everything else. Set by ops only.
     may_sign_encrypted = Column(Boolean, default=False, nullable=True)
+    # #3319: may bind an agent's own file to one content post via /grants/share
+    may_publish_to_post = Column(Boolean, default=False, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
 
