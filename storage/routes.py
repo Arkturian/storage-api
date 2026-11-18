@@ -6481,6 +6481,8 @@ def list_objects(
     _restrict = _grant_restrict.sql_filter(StorageObject, db)
     if _restrict is not None:
         q = q.filter(_restrict)
+    if not operator_view:  # #3329 (c): a blocked object is listed to admins only
+        q = q.filter(or_(StorageObject.abuse_status.is_(None), StorageObject.abuse_status != "hit"))
 
     if context:
         q = q.filter(StorageObject.context == context)
@@ -8386,6 +8388,8 @@ def sign_media_links(
         level_ok = (level == "personal" and o.tenant_id in readers) or (level == "intern" and bool(readers))
         if o.tenant_id != payload.tenant and not level_ok:
             items.append({"id": oid, "error": "wrong_tenant"}); continue
+        if getattr(o, "abuse_status", None) == "hit":  # #3329 (c)
+            items.append({"id": oid, "error": "abuse_blocked"}); continue
         md = o.metadata_json if isinstance(o.metadata_json, dict) else {}
         url = f"{base_url}/storage/media/{oid}"
         if o.is_public and not md.get("private_media"):

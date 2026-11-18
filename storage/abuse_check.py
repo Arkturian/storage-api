@@ -25,7 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
+import shutil
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Tuple
 
 import httpx
@@ -63,13 +66,39 @@ def _image_url(obj) -> str:
             f"&exp={s['exp']}&kid={s['kid']}&sig={s['sig']}")
 
 
+_token_cache = {"token": None, "until": 0.0}
+
+
+async def _service_token() -> str:
+    """storage-api's own identity at auth-api (service:storage-api, rights
+    ai:jev and ai:decisions), client_credentials, cached until shortly before
+    expiry. Credentials from /etc/storage-api/ai-client.env (EnvironmentFile)."""
+    import time
+    if _token_cache["token"] and time.time() < _token_cache["until"]:
+        return _token_cache["token"]
+    cid = os.getenv("STORAGE_API_SERVICE_CLIENT_ID", "").strip()
+    sec = os.getenv("STORAGE_API_SERVICE_CLIENT_SECRET", "").strip()
+    url = os.getenv("STORAGE_API_SERVICE_TOKEN_URL", "").strip()
+    if not (cid and sec and url):
+        raise CheckUnavailable("no service identity")
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.post(url, data={"grant_type": "client_credentials", "client_id": cid, "client_secret": sec})
+        j = r.json()
+        tok = j["access_token"]
+        _token_cache.update(token=tok, until=time.time() + max(60, int(j.get("expires_in", 3600)) - 120))
+        return tok
+    except Exception as e:
+        raise CheckUnavailable(f"token {type(e).__name__}")
+
+
 async def _ask(obj) -> dict:
     """Probabilities per question from api-ai. Contract with AiApi pending;
     this is the one place that changes when it is final."""
     url = os.getenv("ABUSE_CHECK_URL", "").strip()
-    token = os.getenv("ABUSE_CHECK_TOKEN", "").strip()
-    if not url or not token:
+    if not url:
         raise CheckUnavailable("not configured")
+    token = await _service_token()
     body = {"image_url": _image_url(obj), "questions": list(QUESTIONS),
             "object_id": obj.id, "tenant_id": obj.tenant_id}
     try:
@@ -109,6 +138,47 @@ def _attempts(obj) -> int:
     return int((md.get("abuse_check") or {}).get("versuche", 0))
 
 
+def _quarantine_hls(obj) -> Optional[str]:
+    """nginx serves .m3u8/.ts below the upload root straight from disk, without
+    the app (storage-api nginx, /uploads/*.m3u8|*.ts). A blocked video must
+    leave that tree: move its HLS folder outside, or failing that rename it
+    in place to an unguessable name. Never deleted (a false alarm can be
+    undone by an admin). Returns where it went, or None."""
+    try:
+        from storage.service import generic_storage
+        key = getattr(obj, "object_key", None)
+        if not key:
+            return None
+        src = Path(generic_storage.media_dir) / (obj.tenant_id or "arkturian") / Path(key).stem
+        if not src.is_dir():
+            return None
+        qroot = Path(os.getenv("ABUSE_QUARANTINE_DIR")
+                     or Path(generic_storage.upload_root).parent.parent / "storage-quarantine")
+        try:
+            qroot.mkdir(parents=True, exist_ok=True)
+            dst = qroot / f"{obj.id}_{src.name}"
+            shutil.move(str(src), str(dst))
+            return str(dst)
+        except Exception as e:
+            dst = src.with_name(f".q_{secrets.token_hex(16)}")
+            src.rename(dst)
+            print(f"⚠️ abuse quarantine fell back to rename object={obj.id}: {type(e).__name__}", flush=True)
+            return str(dst)
+    except Exception as e:
+        print(f"🔴 abuse quarantine of HLS failed object={obj.id}: {type(e).__name__}: {e}", flush=True)
+        return "FEHLER"
+
+
+def _drop_embedding(obj) -> None:
+    """The knowledge graph may hold a description of the image; remove it.
+    It is derived data and can be rebuilt if an admin lifts the block."""
+    try:
+        from knowledge_graph.vector_store import get_vector_store
+        get_vector_store(tenant_id=obj.tenant_id).delete_embedding(obj.id)
+    except Exception as e:
+        print(f"⚠️ abuse: embedding not removed object={obj.id}: {type(e).__name__}", flush=True)
+
+
 def apply_hit(db, obj, kategorie: str, p: float, anlass: str) -> None:
     from models import ShareLink
     now = datetime.utcnow()
@@ -120,6 +190,10 @@ def apply_hit(db, obj, kategorie: str, p: float, anlass: str) -> None:
     md["private_media"] = True
     obj.metadata_json = md
     _record(obj, kategorie=kategorie, p=round(p, 3), am=now.isoformat() + "Z")
+    if getattr(obj, "hls_url", None):
+        _record(obj, hls_url=obj.hls_url, hls_quarantaene=_quarantine_hls(obj))
+        obj.hls_url = None
+    _drop_embedding(obj)
     db.query(ShareLink).filter(ShareLink.object_id == obj.id, ShareLink.revoked_at.is_(None)).update(
         {ShareLink.revoked_at: now, ShareLink.revoked_by: "abuse_check"}, synchronize_session=False)
     db.commit()

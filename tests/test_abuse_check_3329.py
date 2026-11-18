@@ -66,6 +66,8 @@ def env(tmp_path, monkeypatch):
         return dict(a)
 
     monkeypatch.setattr(A, "_ask", fake_ask)
+    # never touch a real Chroma store from a test (object ids here are small numbers)
+    monkeypatch.setattr(A, "_drop_embedding", lambda o: None)
     events = []
     from storage import encrypted_io
     monkeypatch.setattr(encrypted_io, "emit_event", lambda k, p: events.append((k, p)))
@@ -201,3 +203,60 @@ def test_flag_off_changes_nothing(env, monkeypatch):
     j = _upload(env)
     o = _obj(env, j["id"])
     assert o.is_public is True and o.abuse_status is None and env.state["calls"] == 0
+
+
+def test_hit_quarantines_hls_out_of_the_nginx_tree(env, tmp_path, monkeypatch):
+    from storage.service import generic_storage
+    j = _upload(env, public=False)
+    o = env.s.get(StorageObject, j["id"])
+    hls = Path(generic_storage.media_dir) / o.tenant_id / Path(o.object_key).stem
+    hls.mkdir(parents=True)
+    (hls / "master.m3u8").write_text("#EXTM3U")
+    o.hls_url = "https://x/uploads/storage/media/arkturian/" + hls.name + "/master.m3u8"
+    env.s.commit()
+    q = tmp_path / "quarantine"
+    monkeypatch.setenv("ABUSE_QUARANTINE_DIR", str(q))
+    env.state["answer"] = {"csam": 0.0, "sexuell_explizit": 0.95, "gewalt_missbrauch": 0.0}
+    r = env.c.patch(f"/storage/objects/{j['id']}", json={"is_public": True})
+    assert r.status_code == 200
+    o = _obj(env, j["id"])
+    assert o.abuse_status == "hit" and o.hls_url is None
+    assert not hls.exists() and (q / f"{o.id}_{hls.name}" / "master.m3u8").exists()
+    assert o.metadata_json["abuse_check"]["hls_quarantaene"].startswith(str(q))
+
+
+def test_hit_object_hidden_from_lists_metadata_and_sign(env):
+    env.state["answer"] = {"csam": 0.9, "sexuell_explizit": 0.0, "gewalt_missbrauch": 0.0}
+    j = _upload(env)
+    ids = [x["id"] for x in env.c.get("/storage/list", params={"limit": 50}).json()["items"]]
+    assert j["id"] not in ids
+    assert env.c.get(f"/storage/objects/{j['id']}").status_code == 451
+    from models import MediaGrant
+    env.s.add(TenantAPIKey(api_key="k-sign", tenant_id="arkturian", label="sign", is_active=True, sign_tenants="arkturian"))
+    env.s.add(MediaGrant(object_id=j["id"], scope="cloud-user:1", granted_by_user_id=1, granted_via="upload"))
+    env.s.commit()
+    r = env.c.post("/storage/sign", headers={"X-API-KEY": "k-sign"},
+                   json={"tenant": "arkturian", "scope": "cloud-user:1", "ids": [j["id"]], "ttl": 300})
+    assert r.json()["items"][0]["error"] == "abuse_blocked"
+
+
+def test_hit_drops_embedding(env, monkeypatch):
+    dropped = []
+    monkeypatch.setattr(env.A, "_drop_embedding", lambda o: dropped.append(o.id))
+    env.state["answer"] = {"csam": 0.0, "sexuell_explizit": 0.0, "gewalt_missbrauch": 0.9}
+    j = _upload(env)
+    assert dropped == [j["id"]]
+
+
+def test_old_signed_url_blocked_after_hit(env):
+    from storage import signing
+    j = _upload(env, public=False)
+    params = signing.sign(j["id"], 300)
+    env.state["user"] = False
+    assert env.c.get(f"/storage/media/{j['id']}", params=params).status_code == 200
+    o = env.s.get(StorageObject, j["id"])
+    env.A.apply_hit(env.s, o, "csam", 0.9, "test")
+    env.s.expire_all()
+    for extra in ({}, {"variant": "thumbnail"}, {"width": "200", "format": "webp"}):
+        assert env.c.get(f"/storage/media/{j['id']}", params={**params, **extra}).status_code == 451
+    assert env.c.head(f"/storage/media/{j['id']}", params=params).status_code == 451
