@@ -78,9 +78,14 @@ def env(tmp_path, monkeypatch):
     s.close()
 
 
-def _sign(env, ids, key=CLOUD, tenant="arkturian", ttl=300, scope="cloud-user:7"):
-    r = env.c.post("/storage/sign", headers={"X-API-KEY": key},
-                   json={"tenant": tenant, "scope": scope, "ids": list(ids), "ttl": ttl})
+_NO = object()
+
+
+def _sign(env, ids, key=CLOUD, tenant="arkturian", ttl=300, scope="cloud-user:7", readers=("arkturian",)):
+    body = {"tenant": tenant, "scope": scope, "ids": list(ids), "ttl": ttl}
+    if readers is not _NO:
+        body["leser_mandanten"] = list(readers)
+    r = env.c.post("/storage/sign", headers={"X-API-KEY": key}, json=body)
     assert r.status_code == 200, r.text
     return {i["id"]: i for i in r.json()["items"]}
 
@@ -107,7 +112,7 @@ def test_key_without_flag_needs_grant(env):
     assert _sign(env, [env.objs["personal"]], key=CONTENT)[env.objs["personal"]]["error"] == "not_granted"
 
 
-def test_key_without_flag_keeps_tenant_check_for_intern(env):
+def test_key_without_flag_keeps_tenant_check_for_intern(env):  # readers ignored without the flag
     assert _sign(env, [env.objs["oneal_intern"]], key=CONTENT)[env.objs["oneal_intern"]]["error"] == "wrong_tenant"
 
 
@@ -115,16 +120,40 @@ def test_flag_does_not_open_plain_private_objects(env):
     assert _sign(env, [env.objs["privat"]])[env.objs["privat"]]["error"] == "not_granted"
 
 
-def test_personal_only_for_the_objects_tenant(env):
-    it = _sign(env, [env.objs["oneal_personal"]], tenant="arkturian")[env.objs["oneal_personal"]]
-    assert it["error"] == "wrong_tenant"
-    it = _sign(env, [env.objs["oneal_personal"]], tenant="oneal")[env.objs["oneal_personal"]]
-    assert it["signed"] is True
+def test_personal_only_for_members_of_the_objects_tenant(env):
+    oid = env.objs["oneal_personal"]
+    assert _sign(env, [oid])[oid]["error"] == "wrong_tenant"            # reader only in arkturian
+    it = _sign(env, [oid], readers=("arkturian", "oneal"))[oid]          # member of both
+    assert it["signed"] is True and it["visibility_level"] == "personal"
+    oid = env.objs["personal"]
+    assert _sign(env, [oid], readers=("oneal",))[oid]["error"] == "not_granted"  # arkturian object, oneal reader
 
 
 def test_intern_across_tenants(env):
-    it = _sign(env, [env.objs["oneal_intern"]], tenant="arkturian")[env.objs["oneal_intern"]]
+    it = _sign(env, [env.objs["oneal_intern"]])[env.objs["oneal_intern"]]
     assert it["signed"] is True and it["visibility_level"] == "intern"
+
+
+def test_intern_needs_some_membership(env):
+    oid = env.objs["oneal_intern"]
+    assert _sign(env, [oid], readers=())[oid]["error"] == "wrong_tenant"
+    oid = env.objs["personal"]
+    assert _sign(env, [oid], readers=())[oid]["error"] == "not_granted"
+
+
+def test_without_leser_mandanten_no_level_reads(env):
+    oid = env.objs["personal"]
+    assert _sign(env, [oid], readers=_NO)[oid]["error"] == "not_granted"
+    oid = env.objs["oneal_intern"]
+    assert _sign(env, [oid], readers=_NO)[oid]["error"] == "wrong_tenant"
+
+
+def test_grant_path_unchanged_with_readers(env):
+    s = env.s
+    s.add(MediaGrant(object_id=env.objs["privat"], scope="cloud-user:7", granted_by_user_id=1, granted_via="upload"))
+    s.commit()
+    it = _sign(env, [env.objs["privat"]], readers=("oneal",))[env.objs["privat"]]
+    assert it["signed"] is True and "visibility_level" not in it
 
 
 def test_private_media_wins_over_intern(env):

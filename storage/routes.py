@@ -8158,6 +8158,10 @@ class SignRequest(BaseModel):
     scope: str
     ids: List[int]
     ttl: int = 600
+    # #3329: the reader's verified tenant memberships, set by cloud-api from
+    # the checked identity (agent: its tenant; person: tenants without guest
+    # access). Only used with may_sign_intern; absent = no level reads.
+    leser_mandanten: Optional[List[str]] = None
 
 
 class GrantRequest(BaseModel):
@@ -8334,6 +8338,11 @@ def sign_media_links(
     # #3329: a key flagged may_sign_intern (cloud-api, which checked that the
     # reader is signed in to this tenant) signs intern objects without a grant.
     may_level = bool(getattr(row, "may_sign_intern", False))
+    readers = None
+    if may_level and payload.leser_mandanten is not None:
+        if len(payload.leser_mandanten) > 100:
+            raise HTTPException(status_code=422, detail={"error": "at most 100 leser_mandanten", "code": "invalid_leser_mandanten"})
+        readers = {str(t).strip() for t in payload.leser_mandanten if str(t).strip()}
     objs = {o.id: o for o in db.query(StorageObject).filter(StorageObject.id.in_(ids)).all()}
     granted = {g.object_id for g in db.query(MediaGrant.object_id).filter(
         MediaGrant.scope == scope, MediaGrant.object_id.in_(ids)).all()}
@@ -8346,17 +8355,19 @@ def sign_media_links(
         o = objs.get(oid)
         if o is None or getattr(o, "tombstoned_at", None) is not None:
             items.append({"id": oid, "error": "not_found"}); continue
-        # #3329: personal = reader's tenant must be the object's (checked
-        # here); intern = any tenant of this instance. payload.tenant is the
-        # reader's tenant, set by cloud-api from the verified identity.
-        level = object_level(o) if may_level else None
-        if o.tenant_id != payload.tenant and level != "intern":
+        # #3329 (contract with Cloud-worker, variant B): `tenant` stays the
+        # instance tenant for the key and the grant path. Without a grant a
+        # level reads only for a verified reader: personal when the object's
+        # tenant is one of leser_mandanten, intern when there is any.
+        level = object_level(o) if readers is not None else None
+        level_ok = (level == "personal" and o.tenant_id in readers) or (level == "intern" and bool(readers))
+        if o.tenant_id != payload.tenant and not level_ok:
             items.append({"id": oid, "error": "wrong_tenant"}); continue
         md = o.metadata_json if isinstance(o.metadata_json, dict) else {}
         url = f"{base_url}/storage/media/{oid}"
         if o.is_public and not md.get("private_media"):
             items.append({"id": oid, "url": url, "signed": False, "public": True}); continue
-        if oid not in granted and level is None:
+        if oid not in granted and not level_ok:
             items.append({"id": oid, "error": "not_granted"}); continue
         # #3230: only a key flagged may_sign_encrypted (cloud-api) mints links
         # for encrypted objects; the other signing keys of the tenant could
@@ -8366,7 +8377,7 @@ def sign_media_links(
         # #3230: an encrypted object's link lives at most 5 minutes.
         _ttl = min(payload.ttl, 300) if getattr(o, "encrypted", False) else payload.ttl
         min_ttl = min(min_ttl, _ttl)
-        if level and _ttl >= 120:
+        if level_ok and _ttl >= 120:
             # #3329: personal/intern images are embedded over and over. Signing from the
             # start of the current minute gives the same URL for 60 s, so the
             # browser cache holds; the link still lives at least ttl-60 s.
@@ -8375,7 +8386,7 @@ def sign_media_links(
         else:
             s = _signing.sign(oid, _ttl, now=now)
         _item = {"id": oid, "url": f"{url}?exp={s['exp']}&kid={s['kid']}&sig={s['sig']}", "signed": True}
-        if level:
+        if level_ok:
             _item["visibility_level"] = level
         if getattr(o, "encrypted", False):
             # Always marked: the portal (#3235) recognises encrypted files by
