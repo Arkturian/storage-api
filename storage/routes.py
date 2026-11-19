@@ -633,6 +633,7 @@ from storage.service import generic_storage, bulk_delete_objects, GenericStorage
 from storage.external_proxy import fetch_external_file, external_cache
 from storage.url_builder import build_share_url, build_storage_urls, get_base_url_from_request
 from storage import abuse_check as _abuse  # #3329 (c)
+from storage import einstufung as _einstufung  # #3391 (6250 b)
 from storage import opencloud as _opencloud
 from admin import routes as admin_routes
 from tenancy.config import tenant_id_for_api_key, get_tenant_id, get_tenant_id_optional
@@ -2359,6 +2360,8 @@ async def consume_upload_ticket(
         await _abuse.request_public(db, saved_obj, "upload_public")
     elif ticket["is_public"]:
         _abuse.shadow_soon(saved_obj, "upload_public")
+    _einstufung.schatten_bald(saved_obj, grant_scope=ticket.get("grant_scope"), explizit=_einstufung.ausdruecklich(
+        ticket["is_public"], ticket["private"], ticket.get("encrypted"), ticket.get("visibility_level")))  # #3391
 
     if ticket["ai_mode"] and ticket["ai_mode"] != "none":
         try:
@@ -2633,6 +2636,8 @@ async def upload_chunk(
         await _abuse.request_public(db, saved_obj, "upload_public")
     elif sess["is_public"]:
         _abuse.shadow_soon(saved_obj, "upload_public")
+    _einstufung.schatten_bald(saved_obj, grant_scope=grant_scope, explizit=_einstufung.ausdruecklich(
+        sess["is_public"], sess["private"], sess.get("encrypted"), sess.get("visibility_level")))  # #3391
 
     if sess["ai_mode"] and sess["ai_mode"] != "none":
         try:
@@ -3345,6 +3350,8 @@ async def upload_file(
             await _abuse.request_public(db, saved_obj, "upload_public")
         elif is_public:
             _abuse.shadow_soon(saved_obj, "upload_public")
+        _einstufung.schatten_bald(saved_obj, grant_scope=grant_scope, explizit=_einstufung.ausdruecklich(
+            is_public, private, encrypted, visibility_level))  # #3391
 
         # --- AI Analysis handled by async worker system (check_safety_ai.py) ---
         # The async worker will perform comprehensive analysis with unified Gemini prompt
@@ -3572,6 +3579,8 @@ async def fetch_and_store_remote(
             await _abuse.request_public(db, saved_obj, "upload_public")
         elif payload.is_public:
             _abuse.shadow_soon(saved_obj, "upload_public")
+        _einstufung.schatten_bald(saved_obj, grant_scope=payload.grant_scope, explizit=_einstufung.ausdruecklich(
+            payload.is_public, payload.private, False, payload.visibility_level))  # #3391
 
         # Attach tenant_id derived from API key for downstream KG processing
         try:
