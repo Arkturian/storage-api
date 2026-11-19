@@ -9,7 +9,8 @@ Order, first matching rule wins:
    backups, logs, exports and everything from Business stay private. A list
    of public collections does not exist yet, so that rule is absent.
 4. Otherwise Jev chooses between privat and personal, from metadata only
-   (file name, type, size, context, collection, uploader). personal only at
+   (extension, type, size class, fixed keywords, context, collection,
+   uploader kind; never the raw file name). personal only at
    p >= 0.8; below that, on error, 429 (daily limit) or after 2 s: privat.
 5. Jev never assigns intern, öffentlich or privat verschlüsselt.
 
@@ -19,10 +20,13 @@ without the file name; the visibility is never changed. There is no
 enforcing mode yet; Cloud decides about it after the evaluation with AiApi.
 Jev is never a permission gate.
 
-Question and option texts are AiApi's measured wording (api-ai
+Option texts are AiApi's measured wording (api-ai
 tools/sichtbarkeit_bench.py, neutral variant, 60/60 in Post 6249). AiApi's
 option "intern" there meant all signed-in users of one tenant, which is
-today's "personal"; only the option key is renamed.
+today's "personal"; only the option key is renamed. Unlike the benchmark,
+Jev gets no file name (Cloud 19.11.): only extension, MIME, size class,
+keywords from a fixed list (also for context and collection), and the uploader's kind
+(agent, mensch, dienst). The shadow evaluation shows what that costs.
 """
 from __future__ import annotations
 
@@ -50,7 +54,28 @@ STUFEN = {
                  "Diagramme, Dokumentation, Testdateien, Vorschaubilder, eigene Designs."),
 }
 FRAGE = ("Welche Sichtbarkeit passt fuer diese hochgeladene Datei? Beurteile nur die Angaben "
-         "(Dateiname, Typ, Groesse, Kontext, Sammlung, Hochlader); der Inhalt ist nicht bekannt.")
+         "(Endung, Typ, Groessenklasse, Schlagwoerter aus dem Dateinamen, Kontext, Sammlung, Art des "
+         "Hochladers); Dateiname und Inhalt sind nicht bekannt.")
+
+# Cloud 19.11. (condition for the release): Jev never sees the raw file name,
+# it often carries a person's name and Jev has no zero data retention. Only
+# keywords from this fixed list, found locally in the name, are sent. Words
+# of four letters or more match as the start of a name part ("Lohnverrechnung"
+# -> lohn), shorter ones only as a whole part.
+SCHLAGWOERTER = (
+    "render", "scan", "rechnung", "invoice", "lohn", "gehalt", "vertrag", "contract", "angebot",
+    "honorar", "quittung", "receipt", "beleg", "kontoauszug", "steuer", "ausweis", "reisepass",
+    "bewerbung", "lebenslauf", "befund", "arzt", "foto", "photo", "selfie", "portrait", "screenshot",
+    "export", "backup", "dump", "log", "protokoll", "bericht", "report", "entwurf", "draft", "logo",
+    "icon", "thumbnail", "preview", "vorschau", "diagramm", "diagram", "chart", "mockup", "design",
+    "test", "demo", "sample", "beispiel", "video", "clip", "audio", "musik", "music", "song", "tts",
+    "voice", "stimme", "modell", "model", "texture", "textur", "genimage", "generated", "flow",
+    "ki", "ai", "avatar", "showreel", "doku", "readme", "manual", "anleitung", "praesentation",
+    "slides", "poster", "banner", "hintergrund", "background", "karte", "map",
+    "genvideo", "upload", "portal", "chat", "content", "post", "beitrag", "produkt",
+    "product", "katalog", "catalog", "vertraege", "kunde", "customer",
+)
+_GROESSEN = ((100_000, "unter 100 KB"), (5_000_000, "100 KB bis 5 MB"), (100_000_000, "5 bis 100 MB"))
 
 # Rule 3: fixed private contexts. Matched as whole words in context and
 # collection, lower case.
@@ -94,11 +119,49 @@ def feste_regel(obj, von: str) -> Optional[str]:
     return None
 
 
+def schlagwoerter(dateiname: Optional[str]) -> list:
+    """Keywords from the fixed list found in a name; never free text."""
+    stamm = re.sub(r"\.[A-Za-z0-9]{1,8}$", "", dateiname or "")
+    stamm = re.sub(r"([a-z])([A-Z])", r"\1 \2", stamm).lower()
+    teile = [t for t in re.split(r"[^a-z0-9äöüß]+", stamm) if t]
+    gefunden = []
+    for w in SCHLAGWOERTER:
+        if any(t == w or (len(w) >= 4 and t.startswith(w)) for t in teile):
+            gefunden.append(w)
+    return gefunden
+
+
+def _endung(dateiname: Optional[str]) -> Optional[str]:
+    m = re.search(r"\.([A-Za-z0-9]{1,8})$", dateiname or "")
+    return m.group(1).lower() if m else None
+
+
+def _groesse(n) -> Optional[str]:
+    if not isinstance(n, int):
+        return None
+    for grenze, name in _GROESSEN:
+        if n < grenze:
+            return name
+    return "ueber 100 MB"
+
+
+def _feld(wert) -> list:
+    """Context and collection are free text too and may carry names, so they
+    go out only as keywords from the same fixed list."""
+    return schlagwoerter(str(wert) + ".x") if wert else []
+
+
+def _art(von: str) -> str:
+    return "agent" if von.startswith("agent:") else von
+
+
 def zustand(obj, von: str) -> str:
-    """The state Jev sees, in the format of AiApi's benchmark."""
-    return json.dumps({"datei": obj.original_filename, "mime": obj.mime_type,
-                       "bytes": obj.file_size_bytes, "kontext": obj.context,
-                       "sammlung": obj.collection_id, "von": von}, ensure_ascii=False)
+    """The state Jev sees: features only, no file name, no agent name."""
+    return json.dumps({"endung": _endung(obj.original_filename), "mime": obj.mime_type,
+                       "groesse": _groesse(obj.file_size_bytes),
+                       "schlagwoerter": schlagwoerter(obj.original_filename),
+                       "kontext": _feld(obj.context), "sammlung": _feld(obj.collection_id),
+                       "hochlader": _art(von)}, ensure_ascii=False)
 
 
 class JevFehler(Exception):

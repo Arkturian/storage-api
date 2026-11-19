@@ -82,9 +82,29 @@ def test_personal_only_at_threshold(jev):
     assert jev.params[0] == {"engine": "jev", "max_attempts": 1}
     q = jev.bodies[0]["questions"]["stufe"]
     assert q["type"] == "choice" and set(q["criteria"]) == {"privat", "personal"}
-    assert json.loads(jev.bodies[0]["state"]) == {"datei": "flora_render_v3.png", "mime": "image/png",
-                                                  "bytes": 120000, "kontext": "genimage", "sammlung": None,
-                                                  "von": "agent:Wave"}
+    assert json.loads(jev.bodies[0]["state"]) == {"endung": "png", "mime": "image/png",
+                                                  "groesse": "100 KB bis 5 MB", "schlagwoerter": ["render"],
+                                                  "kontext": ["genimage"], "sammlung": [],
+                                                  "hochlader": "agent"}
+
+
+@pytest.mark.parametrize("name,woerter", [
+    ("Lohnverrechnung_Mustermann.pdf", ["lohn"]),
+    ("RechnungKundeHofer_2026-04.pdf", ["rechnung", "kunde"]),
+    ("Vertrag Anna Musterfrau unterschrieben.pdf", ["vertrag"]),
+    ("IMG_4412.JPG", []),
+])
+def test_no_raw_file_name_reaches_jev(jev, name, woerter):
+    """Cloud 19.11.: a person's name in the file name never leaves storage-api.
+    Only keywords from the fixed list go out."""
+    run(E.vorschlag(_obj(original_filename=name, context="Projekt Mustermann/Hofer"), "agent:Martin-Pflegschaft"))
+    gesendet = json.dumps(jev.bodies[0], ensure_ascii=False)
+    for teil in ("Mustermann", "mustermann", "Hofer", "hofer", "Anna", "Musterfrau", "4412",
+                 "Lohnverrechnung", "Martin", "Pflegschaft"):
+        assert teil not in gesendet, teil
+    zust = json.loads(jev.bodies[0]["state"])
+    assert zust["schlagwoerter"] == woerter
+    assert set(zust) == {"endung", "mime", "groesse", "schlagwoerter", "kontext", "sammlung", "hochlader"}
 
 
 def test_low_confidence_is_privat(jev):
