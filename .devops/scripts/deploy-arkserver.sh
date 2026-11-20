@@ -183,7 +183,7 @@ echo "deployed: $(git rev-parse --short "$from_rev")   target: $short"
 if [[ ${#files[@]} -gt 0 ]]; then
   printf '  %s\n' "${files[@]}"
 else
-  echo "  no runtime file changed: only the markers advance, no copy, no restart"
+  echo "  no runtime file changed: no copy; markers advance, restart so /health reports $short"
 fi
 
 # -------------------------------------------------------------------- tests
@@ -240,28 +240,36 @@ if [[ ${#files[@]} -gt 0 ]]; then
       git show "$target:$f" | sudo install -m 644 /dev/stdin "$LIVE/$f"
     fi
   done
-
-  step "Restart $SERVICE"
-  since="$(date '+%Y-%m-%d %H:%M:%S')"
-  sudo systemctl restart "$SERVICE"
-  health_ok || die "health check failed after restart"
-  if sudo journalctl -u "$SERVICE" --since "$since" --no-pager | grep -q "Traceback"; then
-    sudo journalctl -u "$SERVICE" --since "$since" --no-pager | tail -40 >&2
-    die "traceback after restart"
-  fi
-
-  step "Verify"
-  for f in "${files[@]}"; do
-    git show "$target:$f" | cmp -s - "$LIVE/$f" || die "verify: $f differs after copy"
-  done
-  sudo journalctl -u "$SERVICE" --since "$since" --no-pager | grep -i "migration" || true
-
 fi
+
+# #3508: the process reads .deployed-rev once at start and reports it in
+# GET /health as "commit". So it is written BEFORE the restart, and the
+# service restarts on every release, also one without runtime files —
+# otherwise /health would keep naming the previous commit. A rollback
+# restores the previous file and restarts again.
+echo "$target" | sudo tee "$LIVE/.deployed-rev.new" > /dev/null
+sudo mv -f "$LIVE/.deployed-rev.new" "$LIVE/.deployed-rev"
+
+step "Restart $SERVICE"
+since="$(date '+%Y-%m-%d %H:%M:%S')"
+sudo systemctl restart "$SERVICE"
+health_ok || die "health check failed after restart"
+if sudo journalctl -u "$SERVICE" --since "$since" --no-pager | grep -q "Traceback"; then
+  sudo journalctl -u "$SERVICE" --since "$since" --no-pager | tail -40 >&2
+  die "traceback after restart"
+fi
+
+step "Verify"
+for f in "${files[@]}"; do
+  git show "$target:$f" | cmp -s - "$LIVE/$f" || die "verify: $f differs after copy"
+done
+sudo journalctl -u "$SERVICE" --since "$since" --no-pager | grep -i "migration" || true
+# The new process must report the target, never an older or guessed commit.
+reported="$(curl -s "$HEALTH_URL" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("commit") or "")' 2>/dev/null || true)"
+[[ "$reported" == "$target" ]] || die "health reports commit '${reported:-null}', expected $target"
 
 step "Markers"
 note="origin/main @ $short ($(date +%F), deploy-arkserver.sh, backup $B); before: origin/main @ "
-echo "$target" | sudo tee "$LIVE/.deployed-rev.new" > /dev/null
-sudo mv -f "$LIVE/.deployed-rev.new" "$LIVE/.deployed-rev"
 sudo sed -i "0,/origin\/main @ /s|origin/main @ |$note|" "$LIVE/DEPLOYED_REVISION.txt"
 grep -q "origin/main @ $short " "$LIVE/DEPLOYED_REVISION.txt" || die "DEPLOYED_REVISION.txt not updated"
 

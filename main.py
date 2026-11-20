@@ -500,9 +500,16 @@ def root():
         "description": "Media storage and AI analysis service"
     }
 
+# #3508: the running commit, read once at start (see startup_commit.py).
+from pathlib import Path as _Path  # noqa: E402
+from startup_commit import read_startup_commit as _read_startup_commit  # noqa: E402
+
+STARTUP_COMMIT = _read_startup_commit(_Path(__file__).resolve().parent)
+
+
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "storage-api"}
+    return {"status": "healthy", "service": "storage-api", "commit": STARTUP_COMMIT}
 
 if __name__ == "__main__":
     import uvicorn

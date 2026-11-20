@@ -45,11 +45,21 @@ cat > "$T/bin/systemctl" <<'EOF'
 echo "systemctl $*" >> "$FAKE/events"
 rc=0
 if [[ -s "$FAKE/restart_rc" ]]; then rc="$(head -n1 "$FAKE/restart_rc")"; sed -i 1d "$FAKE/restart_rc"; fi
+# A started process reads .deployed-rev once (#3508); $FAKE/stuck_rev simulates
+# one that keeps reporting an old commit.
+if [[ "$rc" == 0 ]]; then
+  if [[ -s "$FAKE/stuck_rev" ]]; then cp "$FAKE/stuck_rev" "$FAKE/started_rev"
+  else cat "$STORAGE_LIVE_DIR/.deployed-rev" > "$FAKE/started_rev" 2>/dev/null || : > "$FAKE/started_rev"; fi
+fi
 exit "$rc"
 EOF
 cat > "$T/bin/curl" <<'EOF'
 #!/usr/bin/env bash
-printf '%s' "$(cat "$FAKE/health" 2>/dev/null || echo 200)"
+# With -w: the status code. Without: the /health body with the commit the
+# running process read at start.
+if [[ " $* " == *" -w "* ]]; then printf '%s' "$(cat "$FAKE/health" 2>/dev/null || echo 200)"; exit 0; fi
+c="$(tr -d '[:space:]' < "$FAKE/started_rev" 2>/dev/null)"
+printf '{"status":"healthy","service":"storage-api","commit":%s}' "$([[ -n "$c" ]] && echo "\"$c\"" || echo null)"
 EOF
 cat > "$T/bin/journalctl" <<'EOF'
 #!/usr/bin/env bash
@@ -162,6 +172,14 @@ fresh_live
 run --from "$C1"; rc=$?
 [[ $rc -ne 0 ]] && grep -q "expect <sha> is required" "$T/out" && ok "refused" || bad "exit $rc"
 
+echo "L) restarted process reports another commit than the target (#3508)"
+fresh_live; echo "$C1" > "$T/fake/stuck_rev"
+run --expect "$C2" --from "$C1"; rc=$?
+[[ $rc -ne 0 ]] && grep -q "health reports commit '$C1', expected $C2" "$T/out" && ok "refused" || { bad "exit $rc"; tail -5 "$T/out"; }
+live_is_v1 && ok "files restored" || bad "files not restored"
+no_marker && ok "no success marker, .deployed-rev rolled back" || bad "marker written"
+rm -f "$T/fake/stuck_rev"
+
 echo "H) success"
 fresh_live
 run --expect "$C2" --from "$C1"; rc=$?
@@ -169,6 +187,7 @@ run --expect "$C2" --from "$C1"; rc=$?
 [[ "$(cat "$T/live/main.py")" == v2 && "$(cat "$T/live/storage/routes.py")" == v2 ]] && ok "files are v2" || bad "files not v2"
 [[ "$(cat "$T/live/.deployed-rev")" == "$C2" ]] && ok ".deployed-rev = target" || bad ".deployed-rev wrong"
 grep -q "origin/main @ ${C2:0:7} " "$T/live/DEPLOYED_REVISION.txt" && ok "DEPLOYED_REVISION updated" || bad "DEPLOYED_REVISION not updated"
+[[ "$(cat "$T/fake/started_rev")" == "$C2" ]] && ok "restarted process reports the target (#3508)" || bad "/health reports $(cat "$T/fake/started_rev")"
 b="$(ls -d "$T"/backups/*)"; [[ "$(stat -c %a "$b")" == 700 && "$(stat -c %a "$b/storage.db")" == 600 ]] && ok "backup 700/600" || bad "backup modes $(stat -c %a "$b" "$b/storage.db" | tr '\n' ' ')"
 
 echo "I) second run: already deployed, nothing touched"
@@ -176,13 +195,14 @@ echo "I) second run: already deployed, nothing touched"
 run --expect "$C2"; rc=$?
 [[ $rc -eq 0 ]] && grep -q "Already deployed" "$T/out" && [[ ! -s "$T/fake/events" ]] && ok "idempotent" || bad "exit $rc"
 
-echo "J) tooling-only release: markers advance, no copy, no restart"
+echo "J) tooling-only release: no copy, markers advance, restart so /health names c3"
 cd "$T/repo"; echo "# tool" >> .devops/scripts/deploy-arkserver.sh; git commit -qam c3; C3="$(git rev-parse HEAD)"; git push -q origin main; cd - > /dev/null
 : > "$T/fake/events"
 run --expect "$C3"; rc=$?
 [[ $rc -eq 0 ]] && ok "exit 0" || { bad "exit $rc"; tail -5 "$T/out"; }
-[[ ! -s "$T/fake/events" ]] && ok "no restart" || bad "service touched"
+[[ "$(grep -c restart "$T/fake/events")" -eq 1 ]] && ok "one restart" || bad "restart count $(grep -c restart "$T/fake/events")"
 [[ "$(cat "$T/live/main.py")" == v2 && "$(cat "$T/live/.deployed-rev")" == "$C3" ]] && ok "files unchanged, marker = c3" || bad "state wrong"
+[[ "$(cat "$T/fake/started_rev")" == "$C3" ]] && ok "/health reports c3" || bad "/health reports $(cat "$T/fake/started_rev")"
 
 echo "K) private backup unreadable to the invoking user (real sudo, root 700): restart fails, rollback restores"
 if /usr/bin/sudo -n true 2>/dev/null; then
