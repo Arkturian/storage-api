@@ -47,6 +47,9 @@ class TenantAPIKey(Base):
     # front (comm-api signs per agent and per message), so sign_scopes cannot
     # express it. Enforced by the sign_only_keys middleware in main.py.
     sign_only = Column(Boolean, default=False, nullable=True)
+    # #3631: name of a positive route list (storage/route_profiles.py). NULL =
+    # no list. An unknown name allows nothing. Set by ops only.
+    route_profile = Column(String(40), nullable=True)
     # #1960 (variant 3): a key that authenticates AS an existing account,
     # typically system@api for the MCP gateway or cloud-api, so ownership of
     # their uploads stays intact — but never as an operator. Only the real

@@ -95,6 +95,46 @@ def _sign_only_identity(api_key: str, db: Session) -> Optional[User]:
     return user
 
 
+def _route_profile_identity(api_key: str, db: Session) -> Optional[User]:
+    """A key with a route profile acts as its own machine account (#3631).
+
+    Grants need a real user id, so a transient identity as for sign-only keys
+    would not do. The account is <profile>.<tenant>@api: it holds no key, so
+    the value cannot outlive its row in tenant_api_keys, and the @api suffix
+    keeps it out of reach of X-On-Behalf-Of. It owns only what this key stored.
+    """
+    from models import TenantAPIKey
+    row = (db.query(TenantAPIKey)
+           .filter(TenantAPIKey.api_key == api_key, TenantAPIKey.is_active.is_(True),
+                   TenantAPIKey.route_profile.isnot(None))
+           .one_or_none())
+    if row is None:
+        return None
+    email = f"{row.route_profile}.{row.tenant_id}@api"
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        try:
+            user = User(email=email, display_name=f"{row.route_profile} ({row.tenant_id})",
+                        password_hash="", api_key=None, trust_level="user", device_ids=[])
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        except Exception:
+            db.rollback()  # another worker created it first
+            user = db.query(User).filter(User.email == email).first()
+            if user is None:
+                return None
+    try:
+        row.last_used_at = datetime.utcnow()
+        user.last_active_at = datetime.utcnow()
+        db.commit()
+    except Exception:
+        db.rollback()
+    setattr(user, _AUTH_VIA, f"route-profile:{row.label or row.tenant_id}")
+    setattr(user, "_storage_privileged_admin", False)
+    return user
+
+
 def verify_api_key(api_key: str, db: Session) -> Optional[User]:
     """Verify API key and return user"""
     if not api_key:
@@ -134,6 +174,10 @@ def verify_api_key(api_key: str, db: Session) -> Optional[User]:
     signer = _sign_only_identity(api_key, db)
     if signer is not None:
         return signer
+
+    profiled = _route_profile_identity(api_key, db)
+    if profiled is not None:
+        return profiled
 
     # #1960 variant 3: a service key that acts as an existing account
     # (system@api for the MCP gateway / cloud-api). Owner of what that account
