@@ -68,6 +68,33 @@ def _service_identity(api_key: str, db: Session) -> Optional[User]:
     return user
 
 
+def _sign_only_identity(api_key: str, db: Session) -> Optional[User]:
+    """A sign-only key authenticates as nobody who exists (#3627).
+
+    It only ever reaches POST /storage/sign (gate in main.py), and that route
+    decides from the key row alone. Without this it would run the steps below:
+    become <tenant>@api, create that user, or overwrite its users.api_key, so
+    the key would outlive its own row. The returned object is never added to
+    a session.
+    """
+    from models import TenantAPIKey
+    row = (db.query(TenantAPIKey)
+           .filter(TenantAPIKey.api_key == api_key, TenantAPIKey.is_active.is_(True))
+           .one_or_none())
+    if row is None or not row.is_sign_only:
+        return None
+    try:
+        row.last_used_at = datetime.utcnow()
+        db.commit()
+    except Exception:
+        db.rollback()
+    user = User(email=f"{row.tenant_id}@sign-only", display_name="Sign-only key",
+                password_hash="", api_key=None, trust_level="user", device_ids=[])
+    setattr(user, _AUTH_VIA, f"sign-only:{row.label or row.tenant_id}")
+    setattr(user, "_storage_privileged_admin", False)
+    return user
+
+
 def verify_api_key(api_key: str, db: Session) -> Optional[User]:
     """Verify API key and return user"""
     if not api_key:
@@ -103,6 +130,10 @@ def verify_api_key(api_key: str, db: Session) -> Optional[User]:
     # users.api_key and kept working after the key was switched off.
     if tenant_key_state(api_key, db) is False:
         return None
+
+    signer = _sign_only_identity(api_key, db)
+    if signer is not None:
+        return signer
 
     # #1960 variant 3: a service key that acts as an existing account
     # (system@api for the MCP gateway / cloud-api). Owner of what that account
