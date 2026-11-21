@@ -76,6 +76,7 @@ _TENANT_KEY_COLUMNS = (
     ("is_service", "BOOLEAN DEFAULT 0"),
     ("sign_tenants", "VARCHAR(500)"),
     ("sign_scopes", "VARCHAR(1000)"),
+    ("sign_only", "BOOLEAN DEFAULT 0"),
     ("acts_as_email", "VARCHAR(255)"),
     ("may_attach_hls", "BOOLEAN DEFAULT 0"),
     ("may_set_owner", "BOOLEAN DEFAULT 0"),

@@ -185,12 +185,12 @@ def _apply_cors_for_head(headers: dict, request: Request) -> dict:
     return headers
 
 
-# A key narrowed by sign_scopes is a signing key and nothing else (Post 5764).
-# Without this gate it would still authenticate as its tenant user
-# ({tenant}@api) on every other route — upload, list, replace, delete — so
-# "may sign one scope" would quietly mean much more. One choke point for all
-# routes, because every route reads the key from the X-API-KEY header.
-_SIGN_ONLY_PATHS = frozenset({"/storage/sign"})
+# A key narrowed by sign_scopes (Post 5764) or flagged sign_only (#3627) is a
+# signing key and nothing else. Without this gate it would still authenticate
+# as its tenant user ({tenant}@api) on every other route — upload, list,
+# replace, delete — so "may sign" would quietly mean much more. One choke point
+# for all routes, because every route reads the key from the X-API-KEY header.
+_SIGN_ONLY_ROUTE = ("POST", "/storage/sign")
 
 
 def _is_sign_only_key(api_key: str) -> bool:
@@ -202,19 +202,20 @@ def _is_sign_only_key(api_key: str) -> bool:
     db = next(gen)
     try:
         row = (
-            db.query(TenantAPIKey.sign_scopes)
+            db.query(TenantAPIKey)
             .filter(TenantAPIKey.api_key == api_key, TenantAPIKey.is_active.is_(True))
             .first()
         )
+        return row is not None and row.is_sign_only
     finally:
         gen.close()
-    return row is not None and row[0] is not None
 
 
-@app.middleware("http")
 async def sign_only_keys(request: Request, call_next):
     key = (request.headers.get("x-api-key") or "").strip()
-    if key and request.url.path not in _SIGN_ONLY_PATHS and _is_sign_only_key(key):
+    # scope["path"] is what the router matches; request.url is rebuilt from the
+    # client's Host header and must not decide an access rule.
+    if key and (request.method, request.scope["path"]) != _SIGN_ONLY_ROUTE and _is_sign_only_key(key):
         from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=403,
@@ -560,3 +561,8 @@ app.add_middleware(DefaultMasterTally)
 # gateway, per agent). Outermost, so every layer below sees the scope.
 from storage.grant_restrict import GrantScopeRestrict  # noqa: E402
 app.add_middleware(GrantScopeRestrict)
+
+# #3627: stays the outermost layer. The HEAD /storage/media answer is a
+# middleware of its own; registered inside it, this gate never saw those calls.
+from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
+app.add_middleware(BaseHTTPMiddleware, dispatch=sign_only_keys)

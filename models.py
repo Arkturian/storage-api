@@ -42,6 +42,11 @@ class TenantAPIKey(Base):
     # A key with sign_scopes may only sign: it cannot move, share, unshare or
     # look up grants, since those act on arbitrary scopes (Post 5764).
     sign_scopes = Column(String(1000), nullable=True)
+    # #3627: a key that may call POST /storage/sign and nothing else, for every
+    # scope of its sign_tenants. For callers whose scopes are not known up
+    # front (comm-api signs per agent and per message), so sign_scopes cannot
+    # express it. Enforced by the sign_only_keys middleware in main.py.
+    sign_only = Column(Boolean, default=False, nullable=True)
     # #1960 (variant 3): a key that authenticates AS an existing account,
     # typically system@api for the MCP gateway or cloud-api, so ownership of
     # their uploads stays intact — but never as an operator. Only the real
@@ -72,6 +77,12 @@ class TenantAPIKey(Base):
     last_used_at = Column(DateTime, nullable=True)
 
     tenant = relationship("Tenant", back_populates="api_keys")
+
+    @property
+    def is_sign_only(self) -> bool:
+        """May call POST /storage/sign and nothing else (Post 5764, #3627)."""
+        return self.sign_scopes is not None or bool(self.sign_only)
+
 
 
 class MediaGrant(Base):
