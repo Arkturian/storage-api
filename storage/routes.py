@@ -2911,6 +2911,17 @@ async def _store_encrypted_upload(request, db, current_user, tenant_id, *, data:
     return _hydrate_encrypted_response(resp, saved_obj, request)
 
 
+async def _check_ingest_upload(request: Request, db: Session) -> None:
+    """#3631: a key with the ingest profile stores private files and nothing else."""
+    from storage import route_profiles
+    row = _presented_tenant_key(request, db)
+    if row is None or row.route_profile != route_profiles.INGEST:
+        return
+    problem = route_profiles.ingest_upload_problem(await request.form(), request.headers)
+    if problem:
+        raise HTTPException(status_code=403, detail={"error": problem, "code": "ingest_upload_refused"})
+
+
 @router.post("/upload", response_model=StorageObjectResponse)
 async def upload_file(
     request: Request,
@@ -2948,6 +2959,7 @@ async def upload_file(
     api_key_header: Optional[str] = Security(_APIKeyHeader(name="X-API-KEY", auto_error=False)),
     tenant_id: Optional[str] = Depends(get_tenant_id),
 ):
+    await _check_ingest_upload(request, db)
     if encrypted:
         _check_encrypted_upload(storage_mode, reference_path, external_uri, hls_result, reference_id,
                                 owner_email, file)

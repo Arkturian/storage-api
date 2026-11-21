@@ -193,7 +193,8 @@ def _apply_cors_for_head(headers: dict, request: Request) -> dict:
 _SIGN_ONLY_ROUTE = ("POST", "/storage/sign")
 
 
-def _is_sign_only_key(api_key: str) -> bool:
+def _key_limits(api_key: str):
+    """(is_sign_only, route_profile) of an active tenant key, else None."""
     from database import get_db
     from models import TenantAPIKey
     # Same session source as the routes (honours dependency overrides), and
@@ -206,21 +207,37 @@ def _is_sign_only_key(api_key: str) -> bool:
             .filter(TenantAPIKey.api_key == api_key, TenantAPIKey.is_active.is_(True))
             .first()
         )
-        return row is not None and row.is_sign_only
+        return None if row is None else (row.is_sign_only, row.route_profile)
     finally:
         gen.close()
 
 
+def _is_sign_only_key(api_key: str) -> bool:
+    limits = _key_limits(api_key)
+    return limits is not None and limits[0]
+
+
 async def sign_only_keys(request: Request, call_next):
+    """Outermost gate for keys limited to a list of routes (#3627, #3631)."""
     key = (request.headers.get("x-api-key") or "").strip()
-    # scope["path"] is what the router matches; request.url is rebuilt from the
-    # client's Host header and must not decide an access rule.
-    if key and (request.method, request.scope["path"]) != _SIGN_ONLY_ROUTE and _is_sign_only_key(key):
+    limits = _key_limits(key) if key else None
+    if limits is not None:
         from fastapi.responses import JSONResponse
-        return JSONResponse(
-            status_code=403,
-            content={"detail": {"error": "this key may only call POST /storage/sign", "code": "sign_only_key"}},
-        )
+        from storage.route_profiles import route_allowed
+        # scope["path"] is what the router matches; request.url is rebuilt from
+        # the client's Host header and must not decide an access rule.
+        route = (request.method, request.scope["path"])
+        sign_only, profile = limits
+        if sign_only and route != _SIGN_ONLY_ROUTE:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": {"error": "this key may only call POST /storage/sign", "code": "sign_only_key"}},
+            )
+        if profile is not None and not route_allowed(profile, *route):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": {"error": "route not in this key's profile", "code": "route_profile_denied"}},
+            )
     return await call_next(request)
 
 
