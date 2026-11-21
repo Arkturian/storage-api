@@ -5704,8 +5704,10 @@ def get_media_trim_bounds(
     # Tenant ownership is resolved from the API key by the dedicated tenancy
     # dependency above. The legacy User model has no tenant_id attribute;
     # reading it here made every authenticated trim-bounds request crash.
+    # #3597: a public object is public for everyone, as on /media and /objects;
+    # the tenant check only guards non-public objects.
     resolved_tenant_id = tenant_id or "public"
-    if obj.tenant_id != "public":
+    if obj.tenant_id != "public" and not obj.is_public:
         if resolved_tenant_id != obj.tenant_id:
             raise HTTPException(status_code=403, detail="Access denied")
 
