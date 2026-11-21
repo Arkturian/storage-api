@@ -116,7 +116,7 @@ live_is_v1() {
   [[ "$(cat "$T/live/main.py")" == v1 && "$(cat "$T/live/storage/routes.py")" == v1 ]]
 }
 no_marker() {
-  [[ ! -e "$T/live/.deployed-rev" ]] && grep -q "(seed)" "$T/live/DEPLOYED_REVISION.txt" \
+  [[ ! -e "$T/live/.deployed-rev" && ! -e "$T/live/.deployed-commit" ]] && grep -q "(seed)" "$T/live/DEPLOYED_REVISION.txt" \
     && ! grep -q deploy-arkserver.sh "$T/live/DEPLOYED_REVISION.txt"
 }
 
@@ -186,6 +186,8 @@ run --expect "$C2" --from "$C1"; rc=$?
 [[ $rc -eq 0 ]] && ok "exit 0" || { bad "exit $rc"; tail -20 "$T/out"; }
 [[ "$(cat "$T/live/main.py")" == v2 && "$(cat "$T/live/storage/routes.py")" == v2 ]] && ok "files are v2" || bad "files not v2"
 [[ "$(cat "$T/live/.deployed-rev")" == "$C2" ]] && ok ".deployed-rev = target" || bad ".deployed-rev wrong"
+[[ "$(cat "$T/live/.deployed-commit")" == "$C2" ]] && ok ".deployed-commit = target (#3583)" || bad ".deployed-commit wrong"
+[[ ! "$T/live/main.py" -nt "$T/live/.deployed-commit" && ! "$T/live/storage/routes.py" -nt "$T/live/.deployed-commit" ]] && ok ".deployed-commit not older than the copied files" || bad "copied file newer than .deployed-commit"
 grep -q "origin/main @ ${C2:0:7} " "$T/live/DEPLOYED_REVISION.txt" && ok "DEPLOYED_REVISION updated" || bad "DEPLOYED_REVISION not updated"
 [[ "$(cat "$T/fake/started_rev")" == "$C2" ]] && ok "restarted process reports the target (#3508)" || bad "/health reports $(cat "$T/fake/started_rev")"
 b="$(ls -d "$T"/backups/*)"; [[ "$(stat -c %a "$b")" == 700 && "$(stat -c %a "$b/storage.db")" == 600 ]] && ok "backup 700/600" || bad "backup modes $(stat -c %a "$b" "$b/storage.db" | tr '\n' ' ')"
@@ -203,11 +205,12 @@ run --expect "$C3"; rc=$?
 [[ "$(grep -c restart "$T/fake/events")" -eq 1 ]] && ok "one restart" || bad "restart count $(grep -c restart "$T/fake/events")"
 [[ "$(cat "$T/live/main.py")" == v2 && "$(cat "$T/live/.deployed-rev")" == "$C3" ]] && ok "files unchanged, marker = c3" || bad "state wrong"
 [[ "$(cat "$T/fake/started_rev")" == "$C3" ]] && ok "/health reports c3" || bad "/health reports $(cat "$T/fake/started_rev")"
+[[ "$(cat "$T/live/.deployed-commit")" == "$C3" ]] && ok ".deployed-commit = c3 on a tooling-only release" || bad ".deployed-commit wrong"
 
 echo "K) private backup unreadable to the invoking user (real sudo, root 700): restart fails, rollback restores"
 if /usr/bin/sudo -n true 2>/dev/null; then
   cd "$T/repo"; echo v4 > main.py; echo v4 > storage/routes.py; git commit -qam c4; C4="$(git rev-parse HEAD)"; git push -q origin main; cd - > /dev/null
-  fresh_live; echo "$C3" > "$T/live/.deployed-rev"
+  fresh_live; echo "$C3" > "$T/live/.deployed-rev"; echo "$C3" > "$T/live/.deployed-commit"
   echo v2 > "$T/live/main.py"; echo v2 > "$T/live/storage/routes.py"
   printf '42\n0\n' > "$T/fake/restart_rc"
   FAKE_REAL_SUDO=1 BOWNER=root BGROUP=root run --expect "$C4"; rc=$?
@@ -216,7 +219,7 @@ if /usr/bin/sudo -n true 2>/dev/null; then
   [[ $rc -eq 42 ]] && ok "original exit code 42 kept" || { bad "exit $rc"; tail -8 "$T/out"; }
   [[ "$(cat "$T/live/main.py" 2>/dev/null)" == v2 && "$(cat "$T/live/storage/routes.py" 2>/dev/null)" == v2 ]] \
     && ok "files restored from the private backup (not deleted)" || bad "files: $(cat "$T/live/main.py" 2>&1)/$(cat "$T/live/storage/routes.py" 2>&1)"
-  [[ "$(cat "$T/live/.deployed-rev")" == "$C3" ]] && grep -q "(seed)" "$T/live/DEPLOYED_REVISION.txt" && ok "markers restored" || bad "markers wrong"
+  [[ "$(cat "$T/live/.deployed-rev")" == "$C3" && "$(cat "$T/live/.deployed-commit")" == "$C3" ]] && grep -q "(seed)" "$T/live/DEPLOYED_REVISION.txt" && ok "markers restored" || bad "markers wrong"
   grep -q "rollback complete" "$T/out" && ok "rollback reported" || bad "no rollback report"
 else
   echo "  - skipped: needs passwordless sudo"; failn=$((failn + 1))
