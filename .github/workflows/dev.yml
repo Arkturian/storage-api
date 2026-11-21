@@ -10,7 +10,8 @@ on:
 
 jobs:
   build:
-    runs-on: ${{ vars.RUNNER_LABEL || 'arkserver' }}
+    # Own runner only (labels self-hosted, Linux, X64, arkserver), never GitHub-hosted.
+    runs-on: [self-hosted, linux, arkserver]
 
     steps:
       - uses: actions/checkout@v4
@@ -28,3 +29,9 @@ jobs:
       # across the codebase without needing the dependencies installed.
       - name: Syntax / compile check
         run: /usr/bin/python3.11 -m compileall -q main.py storage tasks ai_analysis knowledge_graph tenancy admin
+
+      # #3597: a key in a *.example file (or a burnt key anywhere in the tree)
+      # fails here on push, not only at release time. The guard needs only the
+      # standard library and the system pytest (Debian python3-pytest).
+      - name: No keys in example files (#3597)
+        run: /usr/bin/python3.11 -m pytest -q -p no:cacheprovider tests/test_example_secrets_3597.py
