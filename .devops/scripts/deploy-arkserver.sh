@@ -96,11 +96,14 @@ rollback() {
   done
   sudo cp -p "$B/markers/DEPLOYED_REVISION.txt" "$LIVE/DEPLOYED_REVISION.txt" || bad=1
   sudo cmp -s "$B/markers/DEPLOYED_REVISION.txt" "$LIVE/DEPLOYED_REVISION.txt" || bad=1
-  if sudo test -e "$B/markers/.deployed-rev"; then
-    sudo cp -p "$B/markers/.deployed-rev" "$LIVE/.deployed-rev" || bad=1
-  else
-    sudo rm -f "$LIVE/.deployed-rev" || bad=1
-  fi
+  local marker
+  for marker in .deployed-rev .deployed-commit; do
+    if sudo test -e "$B/markers/$marker"; then
+      sudo cp -p "$B/markers/$marker" "$LIVE/$marker" || bad=1
+    else
+      sudo rm -f "$LIVE/$marker" || bad=1
+    fi
+  done
   sudo systemctl restart "$SERVICE" || { echo "   restart during rollback failed" >&2; bad=1; }
   health_ok || { echo "   health after rollback failed" >&2; bad=1; }
   return "$bad"
@@ -213,6 +216,7 @@ for f in "${files[@]}"; do
 done
 sudo cp -p "$LIVE/DEPLOYED_REVISION.txt" "$B/markers/"
 [[ ! -e "$LIVE/.deployed-rev" ]] || sudo cp -p "$LIVE/.deployed-rev" "$B/markers/"
+[[ ! -e "$LIVE/.deployed-commit" ]] || sudo cp -p "$LIVE/.deployed-commit" "$B/markers/"
 # Online backup: consistent even while the service writes (WAL), mode 600.
 sudo -u "$BACKUP_OWNER" python3 -I - "$DB" "$B/storage.db" <<'PY'
 import os, sqlite3, sys
@@ -249,6 +253,11 @@ fi
 # restores the previous file and restarts again.
 echo "$target" | sudo tee "$LIVE/.deployed-rev.new" > /dev/null
 sudo mv -f "$LIVE/.deployed-rev.new" "$LIVE/.deployed-rev"
+# #3583: the release reconciler (kern_erheben.py) reads .deployed-commit and
+# treats a source file newer than it as a hand change. It is written after the
+# copy for that reason, and on every release. The git HEAD in LIVE is stale.
+echo "$target" | sudo tee "$LIVE/.deployed-commit.new" > /dev/null
+sudo mv -f "$LIVE/.deployed-commit.new" "$LIVE/.deployed-commit"
 
 step "Restart $SERVICE"
 since="$(date '+%Y-%m-%d %H:%M:%S')"
