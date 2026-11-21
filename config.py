@@ -80,7 +80,7 @@ class Settings:
 
     # External APIs
     ONEAL_API_BASE: str = os.getenv("ONEAL_API_BASE", "https://oneal-api.arkturian.com")
-    ONEAL_API_KEY: Optional[str] = os.getenv("ONEAL_API_KEY", "oneal_demo_token")
+    ONEAL_API_KEY: Optional[str] = os.getenv("ONEAL_API_KEY", "")
     
     # User Settings
     NEW_USER_TRUST_LEVEL: str = os.getenv("NEW_USER_TRUST_LEVEL", "user")

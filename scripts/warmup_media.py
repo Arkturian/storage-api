@@ -12,7 +12,7 @@ if they already exist. The script is network-heavy but idempotent.
 Usage:
     python scripts/warmup_media.py --tenant oneal \
         --api-base https://api-storage.arkturian.com \
-        --api-key oneal_demo_token
+        --api-key <api-key>
 """
 
 from __future__ import annotations

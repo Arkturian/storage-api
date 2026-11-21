@@ -29,7 +29,7 @@ from knowledge_graph.pipeline import kg_pipeline
 
 
 ONEAL_API_BASE = os.getenv("ONEAL_API_BASE", "https://oneal-api.arkturian.com")
-ONEAL_API_KEY = os.getenv("ONEAL_API_KEY", "oneal_demo_token")
+ONEAL_API_KEY = os.getenv("ONEAL_API_KEY", "")
 STORAGE_API_KEY = os.getenv("API_KEY", "Inetpass1")
 TENANT_ID = "oneal"
 
