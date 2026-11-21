@@ -12,6 +12,7 @@ This script:
 
 import asyncio
 import httpx
+import os
 import sys
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from storage.domain import save_file_and_record
 
 
 ONEAL_API_URL = "https://oneal-api.arkturian.com/v1/products"
-ONEAL_API_KEY = "oneal_demo_token"
+ONEAL_API_KEY = os.environ.get("ONEAL_API_KEY", "")  # #3597: never a literal key in the repo
 
 
 async def fetch_oneal_products(limit: int = 10):
