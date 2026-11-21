@@ -120,8 +120,12 @@ def test_bootstrap_does_not_reactivate_or_seed_keys(db, monkeypatch, tmp_path):
     tc.bootstrap_tenant_registry()
     db.expire_all()
     assert db.query(TenantAPIKey).filter(TenantAPIKey.api_key == TENANT_KEY).one().is_active is False
-    for literal in ("oneal_demo_token", "Inetpass1"):
-        assert db.query(TenantAPIKey).filter(TenantAPIKey.api_key == literal).count() == 0
+    # #3597: the burnt O'Neal key is compared by hash, never written here.
+    from test_example_secrets_3597 import BURNT_KEY_HASHES
+    import hashlib
+    keys = [r.api_key or "" for r in db.query(TenantAPIKey).all()]
+    assert not any(hashlib.sha256(k.encode()).hexdigest() in BURNT_KEY_HASHES for k in keys)
+    assert db.query(TenantAPIKey).filter(TenantAPIKey.api_key == "Inetpass1").count() == 0
     assert not snapshot.exists()  # no plain-text key mirror any more
 
 
@@ -129,7 +133,7 @@ def test_no_hardcoded_keys_in_tenancy_or_admin():
     root = Path(__file__).resolve().parent.parent
     for rel in ("tenancy/config.py", "admin/routes.py"):
         src = (root / rel).read_text()
-        assert "oneal_demo_token" not in src and '"Inetpass1"' not in src, rel
+        assert '"Inetpass1"' not in src, rel  # burnt keys: test_example_secrets_3597
 
 
 def test_deactivated_tenant_key_is_rejected_not_promoted(client, db):

@@ -18,7 +18,7 @@ from pathlib import Path
 
 
 ONEAL_API_URL = "https://oneal-api.arkturian.com/v1/products"
-ONEAL_API_KEY = "oneal_demo_token"
+ONEAL_API_KEY = os.environ.get("ONEAL_API_KEY", "")  # #3597: never a literal key in the repo
 STORAGE_API_URL = "https://api-storage.arkturian.com/storage/upload"
 
 

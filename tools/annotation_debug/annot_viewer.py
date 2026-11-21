@@ -2,7 +2,7 @@
 """Quick visualizer for AI annotations stored in storage-api.
 
 Usage:
-  python annot_viewer.py --object-id 4601 --api-key oneal_demo_token
+  python annot_viewer.py --object-id 4601 --api-key <api-key>
 
 The tool fetches the StorageObject metadata and annotations, downloads the
 image, and draws anchors plus bounding boxes using matplotlib.  This is useful
