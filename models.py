@@ -83,8 +83,14 @@ class TenantAPIKey(Base):
 
     @property
     def is_sign_only(self) -> bool:
-        """May call POST /storage/sign and nothing else (Post 5764, #3627)."""
-        return self.sign_scopes is not None or bool(self.sign_only)
+        """May call POST /storage/sign and nothing else (Post 5764, #3627).
+
+        A key with a route profile is governed by that positive list instead;
+        its sign_scopes still narrow what it may sign (project-uploader).
+        sign_only always wins."""
+        if self.sign_only:
+            return True
+        return self.sign_scopes is not None and self.route_profile is None
 
 
 
