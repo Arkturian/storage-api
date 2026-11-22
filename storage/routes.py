@@ -2912,14 +2912,32 @@ async def _store_encrypted_upload(request, db, current_user, tenant_id, *, data:
 
 
 async def _check_ingest_upload(request: Request, db: Session) -> None:
-    """#3631: a key with the ingest profile stores private files and nothing else."""
+    """#3631: a key with the ingest or project-uploader profile stores private files and nothing else."""
     from storage import route_profiles
     row = _presented_tenant_key(request, db)
-    if row is None or row.route_profile != route_profiles.INGEST:
+    if row is None or row.route_profile not in (route_profiles.INGEST, route_profiles.PROJECT_UPLOADER):
         return
-    problem = route_profiles.ingest_upload_problem(await request.form(), request.headers)
+    if row.route_profile == route_profiles.INGEST:
+        problem = route_profiles.ingest_upload_problem(await request.form(), request.headers)
+    else:
+        problem = route_profiles.project_upload_problem(await request.form(), request.headers,
+                                                        _key_sign_scopes(row) or ())
     if problem:
         raise HTTPException(status_code=403, detail={"error": problem, "code": "ingest_upload_refused"})
+
+
+def _project_uploader_key(request: Request, db: Session):
+    """The presented key when it carries the project-uploader profile, else None."""
+    from storage import route_profiles
+    row = _presented_tenant_key(request, db)
+    return row if row is not None and row.route_profile == route_profiles.PROJECT_UPLOADER else None
+
+
+def _is_profile_account(current_user, row) -> bool:
+    """current_user is the machine account of this profiled key, not someone it acts for."""
+    return (row is not None and not getattr(current_user, "_storage_on_behalf_of", False)
+            and (getattr(current_user, "email", "") or "").lower()
+            == f"{row.route_profile}.{row.tenant_id}@api".lower())
 
 
 @router.post("/upload", response_model=StorageObjectResponse)
@@ -8288,8 +8306,20 @@ def _require_grant_authority(obj, current_user, request: Request, db: Session) -
     if getattr(current_user, "_storage_on_behalf_of", False) and obj.owner_user_id == current_user.id:
         row = _presented_tenant_key(request, db)
         return f"service:{(row.label or row.tenant_id) if row else 'unknown'}"
+    # project-uploader: its machine account manages the bindings of what it stored itself.
+    row = _project_uploader_key(request, db)
+    if _is_profile_account(current_user, row) and obj.owner_user_id == current_user.id:
+        return f"profile:{row.label or row.tenant_id}"
     # Same answer for "not yours" and "not there": no existence oracle.
     raise HTTPException(status_code=404, detail="Not found")
+
+
+def _check_project_grant_scope(request: Request, db: Session, scope: str) -> None:
+    """project-uploader binds its own objects to agents and its own scopes only."""
+    from storage import route_profiles
+    row = _project_uploader_key(request, db)
+    if row is not None and not route_profiles.project_scope_allowed(scope, _key_sign_scopes(row) or ()):
+        raise HTTPException(status_code=403, detail={"error": "scope not allowed for this key", "code": "scope_not_allowed"})
 
 
 def _grant_object(object_id: int, db: Session):
@@ -8320,6 +8350,7 @@ def create_media_grant(
     scope = _validate_scope(payload.scope)
     obj = _grant_object(object_id, db)
     via = _require_grant_authority(obj, current_user, request, db)
+    _check_project_grant_scope(request, db, scope)
     existing = db.query(MediaGrant).filter(MediaGrant.object_id == obj.id, MediaGrant.scope == scope).first()
     if existing:
         return {"object_id": obj.id, "scope": scope, "created": False}
@@ -8361,6 +8392,7 @@ def delete_media_grant(
     scope = _validate_scope(scope)
     obj = _grant_object(object_id, db)
     via = _require_grant_authority(obj, current_user, request, db)
+    _check_project_grant_scope(request, db, scope)
     n = db.query(MediaGrant).filter(MediaGrant.object_id == obj.id, MediaGrant.scope == scope).delete()
     db.commit()
     print(f"🔗 ungrant object={obj.id} scope={scope} by_user={current_user.id} via={via} removed={n}", flush=True)
@@ -8383,6 +8415,7 @@ def sign_media_links(
     """
     from datetime import timezone
     from models import MediaGrant
+    from storage import route_profiles as _route_profiles
     from storage import signing as _signing
 
     if request.headers.get("X-On-Behalf-Of"):
@@ -8417,6 +8450,11 @@ def sign_media_links(
     objs = {o.id: o for o in db.query(StorageObject).filter(StorageObject.id.in_(ids)).all()}
     granted = {g.object_id for g in db.query(MediaGrant.object_id).filter(
         MediaGrant.scope == scope, MediaGrant.object_id.in_(ids)).all()}
+    # project-uploader signs only what its machine account stored itself, even
+    # when someone else bound a foreign object to its scope.
+    own_only = None
+    if row.route_profile == _route_profiles.PROJECT_UPLOADER:
+        own_only = current_user.id if _is_profile_account(current_user, row) else -1
     base_url = get_base_url_from_request(request).rstrip("/")
     now = time.time()
     items = []
@@ -8426,6 +8464,8 @@ def sign_media_links(
         o = objs.get(oid)
         if o is None or getattr(o, "tombstoned_at", None) is not None:
             items.append({"id": oid, "error": "not_found"}); continue
+        if own_only is not None and o.owner_user_id != own_only:
+            items.append({"id": oid, "error": "not_granted"}); continue
         # #3329 (contract with Cloud-worker, variant B): `tenant` stays the
         # instance tenant for the key and the grant path. Without a grant a
         # level reads only for a verified reader: personal when the object's

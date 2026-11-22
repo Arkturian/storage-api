@@ -27,6 +27,8 @@ PORTAL = "k-portal-3631"
 POST = "k-post-3631"
 INGEST = "k-ingest-3631"
 UNKNOWN = "k-unknown-3631"
+PROJECT = "k-project-3631"
+CANVAS = "project-api:canvas"
 AGENT = "cloud-session:Goliath"
 OTHER = "cloud-session:Martin"
 OWNER = "owner@example.org"
@@ -43,8 +45,12 @@ EXPECTED = {
         ("POST", "/storage/objects/1/grants"), ("DELETE", "/storage/objects/1/grants"),
     },
     P.INGEST: {("POST", "/storage/upload")},
+    P.PROJECT_UPLOADER: {
+        ("POST", "/storage/upload"), ("POST", "/storage/sign"),
+        ("POST", "/storage/objects/1/grants"), ("DELETE", "/storage/objects/1/grants"),
+    },
 }
-KEY_OF = {P.PORTAL_SIGNER: PORTAL, P.POST_SIGNER: POST, P.INGEST: INGEST}
+KEY_OF = {P.PORTAL_SIGNER: PORTAL, P.POST_SIGNER: POST, P.INGEST: INGEST, P.PROJECT_UPLOADER: PROJECT}
 
 
 def _all_endpoints():
@@ -85,6 +91,8 @@ def env(tmp_path, monkeypatch):
         TenantAPIKey(api_key=POST, tenant_id="david", label="post", is_active=True, sign_tenants="david",
                      is_service=True, may_publish_to_post=True, route_profile=P.POST_SIGNER),
         TenantAPIKey(api_key=INGEST, tenant_id="david", label="ingest", is_active=True, route_profile=P.INGEST),
+        TenantAPIKey(api_key=PROJECT, tenant_id="david", label="project-api", is_active=True,
+                     sign_tenants="david", sign_scopes=CANVAS, route_profile=P.PROJECT_UPLOADER),
         TenantAPIKey(api_key=UNKNOWN, tenant_id="david", label="x", is_active=True, sign_tenants="david",
                      route_profile="no-such-profile"),
     ])
@@ -346,3 +354,105 @@ def test_migration_adds_the_column(tmp_path):
         database.migrate_tenant_api_keys(conn)
         database.migrate_tenant_api_keys(conn)   # idempotent
         assert conn.execute(text("SELECT route_profile FROM tenant_api_keys")).scalar() is None
+
+
+# --- project-uploader (Project Canvas, 23.11.2026) ---------------------------------
+
+PLANNER = "cloud-session-x:50726f6a656374204d616e61676572"  # "Project Manager"
+
+
+def _project(c, headers=None, **fields):
+    return _ingest(c, key=PROJECT, headers=headers, **fields)
+
+
+def test_project_uploader_stores_binds_and_signs_its_own_file(env):
+    c, _, eng = env
+    r = _project(c, grant_scope=f"{CANVAS},{AGENT},{PLANNER}")
+    assert r.status_code == 200, r.text
+    new = r.json()["id"]
+    with eng.connect() as conn:
+        row = conn.execute(text("SELECT o.is_public, u.email, o.metadata_json FROM storage_objects o "
+                                "JOIN users u ON u.id=o.owner_user_id WHERE o.id=:i"), {"i": new}).one()
+    assert not row[0]
+    assert row[1] == "project-uploader.david@api"
+    assert '"private_media": true' in row[2]
+    for s in (CANVAS, AGENT, PLANNER):
+        assert _count(eng, "SELECT count(*) FROM media_grants WHERE object_id=:o AND scope=:s", o=new, s=s) == 1
+
+    r = c.post("/storage/sign", headers={"X-API-KEY": PROJECT},
+               json={"tenant": "david", "scope": CANVAS, "ids": [new], "ttl": 60})
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["signed"] is True
+
+    # A participant who joins later is bound and unbound again.
+    h = {"X-API-KEY": PROJECT}
+    assert c.post(f"/storage/objects/{new}/grants", headers=h, json={"scope": OTHER}).status_code == 200
+    assert _count(eng, "SELECT count(*) FROM media_grants WHERE object_id=:o AND scope=:s", o=new, s=OTHER) == 1
+    assert c.delete(f"/storage/objects/{new}/grants", headers=h, params={"scope": OTHER}).status_code == 200
+    assert _count(eng, "SELECT count(*) FROM media_grants WHERE object_id=:o AND scope=:s", o=new, s=OTHER) == 0
+
+
+def test_project_uploader_cannot_touch_foreign_objects(env):
+    c, oid, eng = env  # oid belongs to OWNER and is bound to AGENT
+    assert _project(c).status_code == 200  # the machine account exists from here on
+    h = {"X-API-KEY": PROJECT}
+    before = _snapshot(eng)["media_grants"]  # key and user rows only note "last used"
+    assert c.post(f"/storage/objects/{oid}/grants", headers=h, json={"scope": OTHER}).status_code == 404
+    assert c.delete(f"/storage/objects/{oid}/grants", headers=h, params={"scope": AGENT}).status_code == 404
+    assert _snapshot(eng)["media_grants"] == before
+
+    # Even when the owner binds the foreign object to the Canvas scope, the key does not sign it.
+    with eng.begin() as conn:
+        conn.execute(text("INSERT INTO media_grants (object_id, scope, granted_by_user_id, granted_via) "
+                          "VALUES (:o, :s, 1, 'test')"), {"o": oid, "s": CANVAS})
+    r = c.post("/storage/sign", headers=h, json={"tenant": "david", "scope": CANVAS, "ids": [oid], "ttl": 60})
+    assert r.status_code == 200
+    assert r.json()["items"][0] == {"id": oid, "error": "not_granted"}
+
+
+def test_project_uploader_signs_only_its_own_scope(env):
+    c, _, _ = env
+    new = _project(c, grant_scope=f"{CANVAS},{AGENT}").json()["id"]
+    r = c.post("/storage/sign", headers={"X-API-KEY": PROJECT},
+               json={"tenant": "david", "scope": AGENT, "ids": [new], "ttl": 60})
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == "scope_not_allowed"
+
+
+@pytest.mark.parametrize("scope", ["content-post:7", "cloud-user:1", "comm-message:42.1", "project-api:other"])
+def test_project_uploader_binds_no_other_family(env, scope):
+    c, _, eng = env
+    new = _project(c).json()["id"]
+    grants = _count(eng, "SELECT count(*) FROM media_grants")
+    r = c.post(f"/storage/objects/{new}/grants", headers={"X-API-KEY": PROJECT}, json={"scope": scope})
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == "scope_not_allowed"
+    r = _project(c, grant_scope=f"{CANVAS},{scope}")
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == "ingest_upload_refused"
+    assert _count(eng, "SELECT count(*) FROM media_grants") == grants
+
+
+@pytest.mark.parametrize("fields", [
+    {"is_public": "true"}, {"private": "false"}, {"reuse_existing": "true"}, {"owner_email": OWNER},
+    {"storage_mode": "reference"}, {"reference_path": "/etc/passwd"}, {"visibility_level": "intern"},
+    {"encrypted": "true"}, {"ai_mode": "vision"}, {"collection_id": "c"},
+])
+def test_project_uploader_refuses_everything_beyond_a_private_file(env, fields):
+    c, _, eng = env
+    assert _project(c).status_code == 200
+    objects = _count(eng, "SELECT count(*) FROM storage_objects")
+    r = _project(c, **fields)
+    assert r.status_code == 403, r.text
+    assert _count(eng, "SELECT count(*) FROM storage_objects") == objects
+
+
+def test_project_uploader_cannot_act_for_anyone(env):
+    c, oid, eng = env
+    objects = _count(eng, "SELECT count(*) FROM storage_objects")
+    assert _project(c, headers={"X-On-Behalf-Of": OWNER}).status_code == 403
+    assert _count(eng, "SELECT count(*) FROM storage_objects") == objects
+    r = c.post(f"/storage/objects/{oid}/grants", headers={"X-API-KEY": PROJECT, "X-On-Behalf-Of": OWNER},
+               json={"scope": OTHER})
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == "not_a_service_key"
