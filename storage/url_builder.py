@@ -114,6 +114,36 @@ def build_storage_urls(
     }
 
 
+_PREFIX_RE = re.compile(r"^(/[A-Za-z0-9._~-]+)+$")
+
+
+def public_prefix() -> str:
+    """Public path prefix this instance sits behind (#3862), e.g. "/svc/storage".
+
+    On customer instances a reverse proxy mounts storage-api under a path;
+    links built from scheme + host alone then hit the portal instead. The
+    prefix comes from this instance's own configuration (STORAGE_URL_PREFIX),
+    never from a request header a client could set. Unset or malformed -> "".
+    """
+    raw = os.getenv("STORAGE_URL_PREFIX", "").strip().rstrip("/")
+    if not raw:
+        return ""
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    if not _PREFIX_RE.match(raw) or any(seg in (".", "..") for seg in raw.split("/")):
+        return ""
+    return raw
+
+
+def with_public_prefix(base: str) -> str:
+    """Append the configured public prefix to an origin-style base URL once."""
+    base = (base or "").rstrip("/")
+    prefix = public_prefix()
+    if not prefix or base.endswith(prefix):
+        return base
+    return f"{base}{prefix}"
+
+
 def _trusted_hosts() -> set:
     raw = os.getenv("STORAGE_TRUSTED_HOSTS", "")
     return {h.strip().lower() for h in raw.split(",") if h.strip()}
@@ -154,7 +184,7 @@ def get_base_url_from_request(request: Request) -> str:
     if trusted and (host or "").strip().lower() not in trusted:
         fallback = os.getenv("STORAGE_BASE_URL", "").rstrip("/")
         if fallback:
-            return fallback
+            return with_public_prefix(fallback)
 
     # Clean scheme: remove any trailing slashes, backslashes, or colons
     if scheme:
@@ -173,4 +203,4 @@ def get_base_url_from_request(request: Request) -> str:
         # Remove trailing slashes and backslashes
         host = host.rstrip("/\\")
 
-    return f"{scheme}://{host}"
+    return with_public_prefix(f"{scheme}://{host}")

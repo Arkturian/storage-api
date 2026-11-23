@@ -110,7 +110,8 @@ def _share_base(request: Request) -> str:
     base = os.getenv("STORAGE_SHARE_BASE_URL", "").strip().rstrip("/")
     if base:
         return f"{base}/s"
-    return f"{str(request.base_url).rstrip('/')}/storage/s"
+    from storage.url_builder import with_public_prefix
+    return f"{with_public_prefix(str(request.base_url))}/storage/s"
 
 
 def _row_out(r: ShareLink) -> dict:
