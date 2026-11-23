@@ -578,6 +578,8 @@ app.add_middleware(DefaultMasterTally)
 # gateway, per agent). Outermost, so every layer below sees the scope.
 from storage.grant_restrict import GrantScopeRestrict  # noqa: E402
 app.add_middleware(GrantScopeRestrict)
+from storage.origin_tenant import CallerTenantHeader  # noqa: E402
+app.add_middleware(CallerTenantHeader)
 
 # #3627: stays the outermost layer. The HEAD /storage/media answer is a
 # middleware of its own; registered inside it, this gate never saw those calls.

@@ -694,6 +694,7 @@ def build_hls_url(tenant_id: str, basename: str) -> str:
 
 
 from storage import grant_restrict as _grant_restrict  # noqa: E402
+from storage import origin_tenant as _origin_tenant  # noqa: E402
 
 
 def _grant_restriction_gate(request: Request) -> None:
@@ -2290,6 +2291,7 @@ def create_upload_ticket(
         "ai_mode": ai_mode,
         "ttl_hours": ttl_hours,
         "grant_scope": grant_scope,
+        "origin_tenant": _origin_tenant.trusted(db),  # #3811: the PUT carries no key
         "expires_at": time.time() + _TICKET_TTL_SECONDS,
     }
     base = str(request.base_url).rstrip("/")
@@ -2313,6 +2315,11 @@ async def consume_upload_ticket(
     ticket = _UPLOAD_TICKETS.pop(token, None)  # single use, even on failure
     if not ticket:
         raise HTTPException(status_code=404, detail={"error": "unknown or already used ticket", "code": "ticket_invalid"})
+    with _origin_tenant.use(ticket.get("origin_tenant")):
+        return await _consume_upload_ticket(ticket, request, db)
+
+
+async def _consume_upload_ticket(ticket: Dict[str, Any], request: Request, db: Session):
 
     data = await request.body()
     if not data:

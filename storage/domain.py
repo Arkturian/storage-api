@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from storage import origin_tenant as _origin_tenant
 from typing import Optional
 from sqlalchemy.orm import Session
 
@@ -160,6 +161,7 @@ async def save_file_and_record(
         external_uri=external_uri,
         ai_context_metadata=ai_context_metadata or {},
         expires_at=expires_at,
+        origin_tenant=_origin_tenant.trusted(db),  # #3811
     )
     if encrypted:
         for _f in ("encrypted", "enc_kid", "enc_wrapped_dek", "enc_recovery_kid",

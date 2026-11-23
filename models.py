@@ -280,6 +280,11 @@ class StorageObject(Base):
     # NULL never required | pending | failed | clear | hit (storage/abuse_check.py)
     abuse_status = Column(String(16), nullable=True)
     public_pending = Column(Boolean, default=False, nullable=False, server_default="0")
+    # #3811: home tenant of the caller when the MCP gateway uploads for an agent
+    # or person of another tenant. The object itself stays in the gateway's
+    # tenant; this only makes customer files findable, exportable and erasable.
+    # Set by the server from X-Caller-Tenant (only from a may_assert_scope key).
+    origin_tenant = Column(String(64), nullable=True, index=True)
     enc_kid = Column(String, nullable=True)
     enc_wrapped_dek = Column(LargeBinary, nullable=True)
     enc_recovery_kid = Column(String, nullable=True)

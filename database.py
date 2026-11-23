@@ -214,6 +214,11 @@ async def connect_db():
                     conn.execute(text("ALTER TABLE storage_objects ADD COLUMN abuse_status VARCHAR(16)"))
                 if "public_pending" not in scols:
                     conn.execute(text("ALTER TABLE storage_objects ADD COLUMN public_pending BOOLEAN NOT NULL DEFAULT 0"))
+                # #3811: home tenant of the caller behind the MCP gateway
+                if "origin_tenant" not in scols:
+                    conn.execute(text("ALTER TABLE storage_objects ADD COLUMN origin_tenant VARCHAR(64)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_storage_objects_origin_tenant "
+                                      "ON storage_objects (origin_tenant)"))
 
                 conn.commit()
     except Exception as e:
