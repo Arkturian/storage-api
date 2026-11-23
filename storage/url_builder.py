@@ -8,11 +8,12 @@ not stored in the database. This allows for:
 - No database migrations when URLs change
 """
 
+import ipaddress
 import os
 import re
 import unicodedata
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from fastapi import Request
 
@@ -135,11 +136,34 @@ def public_prefix() -> str:
     return raw
 
 
+def _is_loopback_base(base: str) -> bool:
+    """True when the base URL names a loopback host (127.0.0.0/8, ::1, localhost).
+
+    #3865: services on the same machine call uvicorn directly
+    (http://127.0.0.1:8002), past nginx; there the public prefix does not
+    exist and must not be added. Decided by the host in the URL, not by the
+    peer address: nginx also delivers over loopback.
+    """
+    try:
+        host = (urlsplit(base).hostname or "").strip().lower()
+    except ValueError:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def with_public_prefix(base: str) -> str:
-    """Append the configured public prefix to an origin-style base URL once."""
+    """Append the configured public prefix to an origin-style base URL once.
+
+    Not for loopback bases (#3865), see _is_loopback_base.
+    """
     base = (base or "").rstrip("/")
     prefix = public_prefix()
-    if not prefix or base.endswith(prefix):
+    if not prefix or base.endswith(prefix) or _is_loopback_base(base):
         return base
     return f"{base}{prefix}"
 
