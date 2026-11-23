@@ -4171,6 +4171,24 @@ def _is_shared_identity(user_id, db) -> bool:
         return True
 
 
+def _gateway_reads_granted(obj, current_user, db) -> bool:
+    """The MCP gateway, narrowed to one agent, reads the METADATA of an object
+    bound to that agent although another account owns it (assets_download after
+    a successful signature, Project Canvas uploads owned by project-uploader).
+
+    Only a key flagged may_assert_scope, only with X-Grant-Scope-Restrict, and
+    only with a media_grants row for exactly that scope. The bytes still go
+    through a signed link."""
+    scope = _grant_restrict.current_scope()
+    if not scope or obj is None or current_user is None:
+        return False
+    if not bool(getattr(current_user, "_storage_may_assert_scope", False)):
+        return False
+    from models import MediaGrant
+    return db.query(MediaGrant.id).filter(MediaGrant.object_id == obj.id,
+                                          MediaGrant.scope == scope).first() is not None
+
+
 def _shared_owner_direct_ok(obj, current_user, db) -> bool:
     """#3230: may the owner path (bytes or real name) serve this encrypted
     object to this caller? Always for a personal owner. For a shared service
@@ -6340,17 +6358,21 @@ def get_object_metadata(
         raise HTTPException(status_code=404, detail="Not found")
 
     # Check permissions
+    granted = _gateway_reads_granted(obj, current_user, db)
     if not obj.is_public:
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
         if (obj.owner_user_id != current_user.id and not _is_privileged_admin(current_user, db)
-                and not _grant_restrict.level_readable(obj, db)):  # #3329: personal/intern via the gateway
+                and not _grant_restrict.level_readable(obj, db)  # #3329: personal/intern via the gateway
+                and not granted):
             raise HTTPException(status_code=403, detail="Forbidden")
     # Confidential, tombstoned or expired objects: same answer as on the byte
     # routes. Until #3029 only anonymous callers were held back from
     # private_media, so any tenant key read OCR, transcripts and hls_url of
     # objects that were is_public=1 and private_media=true.
-    _check_presence_and_privacy(obj, current_user, db, metadata=True)
+    # A grant for the narrowed agent stands in for the owner here, as a signed
+    # link does on the byte routes; the safety verdict still applies.
+    _check_presence_and_privacy(obj, current_user, db, signed=granted, metadata=True)
 
     response_obj = StorageObjectResponse.from_orm(obj)
 
