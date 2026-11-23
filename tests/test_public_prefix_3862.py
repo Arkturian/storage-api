@@ -106,3 +106,56 @@ def test_share_link_base_carries_prefix(monkeypatch):
     assert _share_base(req) == "https://inst.example/storage/s"
     monkeypatch.setenv("STORAGE_URL_PREFIX", PREFIX)
     assert _share_base(req) == "https://inst.example/svc/storage/storage/s"
+
+
+# --- #3865: loopback callers (cloud-api/comm on the same machine, past nginx) ---
+
+@pytest.mark.parametrize("host", ["127.0.0.1:8002", "127.0.0.1", "localhost", "localhost:8002",
+                                  "[::1]:8002", "[::1]", "127.0.1.1:8002", "LOCALHOST:8002"])
+def test_loopback_host_gets_no_prefix(monkeypatch, host):
+    monkeypatch.setenv("STORAGE_URL_PREFIX", PREFIX)
+    assert get_base_url_from_request(_req(host, proto="http")) == f"http://{host}"
+
+
+@pytest.mark.parametrize("host", ["inst.example", "inst.example:443", "10.0.0.5:8002", "localhost.evil.example"])
+def test_public_host_gets_prefix(monkeypatch, host):
+    monkeypatch.setenv("STORAGE_URL_PREFIX", PREFIX)
+    assert get_base_url_from_request(_req(host)) == f"https://{host}{PREFIX}"
+
+
+def test_loopback_fallback_base_gets_no_prefix(monkeypatch):
+    """Customer instances: STORAGE_BASE_URL=http://127.0.0.1:8002 stays as it is."""
+    monkeypatch.setenv("STORAGE_URL_PREFIX", PREFIX)
+    monkeypatch.setenv("STORAGE_TRUSTED_HOSTS", "inst.example")
+    monkeypatch.setenv("STORAGE_BASE_URL", "http://127.0.0.1:8002")
+    assert get_base_url_from_request(_req("evil.example")) == "http://127.0.0.1:8002"
+
+
+def test_loopback_ignores_client_prefix_header(monkeypatch):
+    monkeypatch.setenv("STORAGE_URL_PREFIX", PREFIX)
+    got = get_base_url_from_request(_req("127.0.0.1:8002", {"x-forwarded-prefix": "/evil"}, proto="http"))
+    assert got == "http://127.0.0.1:8002"
+
+
+def test_loopback_share_base_and_ticket_base(monkeypatch):
+    from storage.share_links import _share_base
+    monkeypatch.delenv("STORAGE_SHARE_BASE_URL", raising=False)
+    monkeypatch.setenv("STORAGE_URL_PREFIX", PREFIX)
+    assert _share_base(SimpleNamespace(base_url="http://127.0.0.1:8002/")) == "http://127.0.0.1:8002/storage/s"
+    assert with_public_prefix("http://[::1]:8002/") == "http://[::1]:8002"
+
+
+def test_signature_does_not_depend_on_prefix(env, monkeypatch):
+    """The HMAC covers id:exp:kid only, so prefixed and loopback links carry the same sig."""
+    from urllib.parse import parse_qs, urlsplit
+    from storage import signing
+    c, (ref, _) = env
+    monkeypatch.setenv("STORAGE_URL_PREFIX", PREFIX)
+    pub = _sign(c, NARROW, DAILY, [ref]).json()["items"][0]["url"]
+    loop = c.post("/storage/sign", headers={"X-API-KEY": NARROW, "host": "127.0.0.1:8002"},
+                  json={"tenant": "arkturian", "scope": DAILY, "ids": [ref], "ttl": 60}).json()["items"][0]["url"]
+    assert urlsplit(pub).path == f"{PREFIX}/storage/media/{ref}"
+    assert urlsplit(loop).path == f"/storage/media/{ref}"
+    for u in (pub, loop):
+        q = {k: v[0] for k, v in parse_qs(urlsplit(u).query).items()}
+        assert signing.verify(ref, int(q["exp"]), q["kid"], q["sig"])
