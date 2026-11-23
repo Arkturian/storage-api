@@ -134,3 +134,15 @@ def test_migration_adds_the_column(tmp_path):
         conn.execute(text("CREATE TABLE storage_objects (id INTEGER PRIMARY KEY, object_key VARCHAR)"))
     import inspect
     assert "origin_tenant" in inspect.getsource(database)
+
+
+def test_upload_ticket_url_carries_public_prefix(env, monkeypatch):
+    """#3862: behind /svc/storage the ticket URL must include the prefix."""
+    c, _ = env
+    monkeypatch.setenv("STORAGE_URL_PREFIX", "/svc/storage")
+    r = c.post("/storage/upload-ticket", headers={"X-API-KEY": PLAIN}, params={"filename": "p.bin"})
+    assert r.status_code == 200, r.text
+    assert r.json()["upload_url"].startswith("http://testserver/svc/storage/storage/upload-ticket/")
+    monkeypatch.delenv("STORAGE_URL_PREFIX")
+    r = c.post("/storage/upload-ticket", headers={"X-API-KEY": PLAIN}, params={"filename": "p.bin"})
+    assert r.json()["upload_url"].startswith("http://testserver/storage/upload-ticket/")

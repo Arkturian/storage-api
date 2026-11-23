@@ -631,7 +631,7 @@ from fastapi.security.api_key import APIKeyHeader as _APIKeyHeader
 from storage.domain import save_file_and_record, update_file_and_record
 from storage.service import generic_storage, bulk_delete_objects, GenericStorageService
 from storage.external_proxy import fetch_external_file, external_cache
-from storage.url_builder import build_share_url, build_storage_urls, get_base_url_from_request
+from storage.url_builder import build_share_url, build_storage_urls, get_base_url_from_request, with_public_prefix
 from storage import abuse_check as _abuse  # #3329 (c)
 from storage import einstufung as _einstufung  # #3391 (6250 b)
 from storage import opencloud as _opencloud
@@ -2294,7 +2294,7 @@ def create_upload_ticket(
         "origin_tenant": _origin_tenant.trusted(db),  # #3811: the PUT carries no key
         "expires_at": time.time() + _TICKET_TTL_SECONDS,
     }
-    base = str(request.base_url).rstrip("/")
+    base = with_public_prefix(str(request.base_url))
     return {
         "upload_url": f"{base}/storage/upload-ticket/{token}",
         "token": token,
