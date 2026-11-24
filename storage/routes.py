@@ -2919,13 +2919,16 @@ async def _store_encrypted_upload(request, db, current_user, tenant_id, *, data:
 
 
 async def _check_ingest_upload(request: Request, db: Session) -> None:
-    """#3631: a key with the ingest or project-uploader profile stores private files and nothing else."""
+    """#3631/#3958: a key with an upload profile stores private files and nothing else."""
     from storage import route_profiles
     row = _presented_tenant_key(request, db)
-    if row is None or row.route_profile not in (route_profiles.INGEST, route_profiles.PROJECT_UPLOADER):
+    if row is None or row.route_profile not in (route_profiles.INGEST, route_profiles.PROJECT_UPLOADER,
+                                                route_profiles.YOUTUBE_UPLOADER):
         return
     if row.route_profile == route_profiles.INGEST:
         problem = route_profiles.ingest_upload_problem(await request.form(), request.headers)
+    elif row.route_profile == route_profiles.YOUTUBE_UPLOADER:
+        problem = route_profiles.youtube_upload_problem(await request.form(), request.headers)
     else:
         problem = route_profiles.project_upload_problem(await request.form(), request.headers,
                                                         _key_sign_scopes(row) or ())
@@ -6552,7 +6555,12 @@ def list_objects(
     # view, and without a grouping filter mine=false stays operator-only.
     grouping = bool(link_id or collection_id or collection_like)
     operator_view = (not anonymous) and _is_privileged_admin(current_user, db)
-    if anonymous:
+    # #3958: a key with a route profile lists what its machine account stored,
+    # never the foreign public rows a grouping filter would otherwise add.
+    presented = None if anonymous else _presented_tenant_key(request, db)
+    if presented is not None and presented.route_profile is not None:
+        q = q.filter(StorageObject.owner_user_id == current_user.id)
+    elif anonymous:
         pass  # no ownership concept without a key — the public filter above rules
     elif operator_view and (grouping or not mine):
         pass
