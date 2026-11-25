@@ -552,3 +552,51 @@ def test_nothing_to_review(env):
     env.state["admin"] = True
     r = _review(env, j["id"])
     assert r.status_code == 409 and r.json()["detail"]["code"] == "nothing_to_review"
+
+
+# --- #3366: a 429 from api-ai's daily limit waits for resets_at ---------------
+
+def test_ask_frame_429_carries_resets_at():
+    from storage import abuse_check as A
+    body = {"detail": {"error": "decisions_caller_budget_exceeded", "resets_at": "2026-11-26T00:00:00+01:00"}}
+    with pytest.raises(A.RateLimited) as e:
+        _run(A._ask_frame(_Client(_Resp(429, body)), "u", "t", b"x"))
+    assert e.value.resets_at == "2026-11-25T23:00:00Z"
+    with pytest.raises(A.RateLimited) as e:
+        _run(A._ask_frame(_Client(_Resp(429, {"error": "x"})), "u", "t", b"x"))
+    assert e.value.resets_at is None
+
+
+def test_rate_limited_object_waits_and_keeps_its_attempts(env):
+    A = env.A
+    env.state["answer"] = A.RateLimited("http 429", "2999-01-01T00:00:00Z")
+    j = _upload(env)
+    o = _obj(env, j["id"])
+    assert o.abuse_status == "failed" and o.is_public is False
+    assert o.metadata_json["abuse_check"]["versuche"] == 0
+    assert o.metadata_json["abuse_check"]["naechster_versuch"] == "2999-01-01T00:00:00Z"
+    env.state["answer"] = CLEAR
+    assert _run(A.retry_open(env.S)) == 0          # still waiting for the reset
+    assert env.state["calls"] == 1
+
+
+def test_rate_limit_over_lets_the_retry_through(env):
+    A = env.A
+    env.state["answer"] = A.RateLimited("http 429", "2000-01-01T00:00:00Z")
+    j = _upload(env)
+    env.state["answer"] = CLEAR
+    assert _run(A.retry_open(env.S)) == 1
+    o = _obj(env, j["id"])
+    assert o.abuse_status == "clear" and o.is_public is True
+
+
+def test_other_failure_clears_the_wait(env):
+    A = env.A
+    env.state["answer"] = A.RateLimited("http 429", "2999-01-01T00:00:00Z")
+    j = _upload(env)
+    o = _obj(env, j["id"])
+    env.state["answer"] = A.CheckUnavailable("http 503")
+    _run(A.check(env.s, o, "nachgeholt"))
+    o = _obj(env, j["id"])
+    assert o.metadata_json["abuse_check"]["naechster_versuch"] is None
+    assert o.metadata_json["abuse_check"]["versuche"] == 1
