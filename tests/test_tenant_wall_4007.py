@@ -226,13 +226,15 @@ def test_cloud_portal_key_marks_the_humans_tenant(env):
     r = _upload(c, {"X-API-KEY": CLOUD, "X-Caller-Tenant": "lesser"}, "portal.bin")
     assert r.status_code == 200, r.text
     assert _origin(eng, r.json()["id"]) == "lesser"
+    assert r.json()["origin_tenant"] == "lesser"  # cloud-api checks this fail-closed
 
 
 def test_plain_key_cannot_mark_a_tenant(env):
     c, eng, _ = env
     r = _upload(c, {"X-API-KEY": PLAIN, "X-Caller-Tenant": "lesser"}, "plain.bin")
-    assert r.status_code == 200, r.text
+    assert r.status_code == 200, r.text  # ignored, not refused
     assert _origin(eng, r.json()["id"]) is None
+    assert r.json()["origin_tenant"] is None
 
 
 def test_origin_key_gets_no_wall_and_no_extra_reads(env):
@@ -268,3 +270,11 @@ def test_tenants_header_of_a_stranger_does_not_open_the_wall(env):
     h = {"X-API-KEY": GATEWAY, "X-Grant-Scope-Restrict": "mcp-gateway:ohne storage-scope",
          "X-Caller-Tenant": "lesser", "X-Grant-Scope-Tenants": "lesser"}
     assert not listed(c, h, ids) & {"op_pub", "ark_pub", "edera_pub"}
+
+
+def test_keyless_read_does_not_show_the_origin_tenant(env):
+    c, _, ids = env
+    r = c.get(f"/storage/objects/{ids['les_pub']}")
+    assert r.status_code == 200 and r.json().get("origin_tenant") is None
+    r = c.get(f"/storage/objects/{ids['les_pub']}", headers=agent("Blender", "lesser"))
+    assert r.json().get("origin_tenant") == "lesser"

@@ -6322,9 +6322,10 @@ def _anon_hidden_collections() -> List[str]:
 
 
 def _strip_owner_for_anonymous(response_obj):
-    """Who owns a public file is not public (Issue #2418)."""
+    """Who owns a public file is not public (Issue #2418), nor whose tenant it came from (#4007)."""
     response_obj.owner_email = None
     response_obj.owner_user_id = None
+    response_obj.origin_tenant = None
     return response_obj
 
 

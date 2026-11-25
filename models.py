@@ -343,6 +343,7 @@ class StorageObjectResponse(BaseModel):
     visibility_level: Optional[str] = None  # #3329: "personal" (tenant) | "intern" (instance) | None
     abuse_status: Optional[str] = None  # #3329 (c): pending | failed | clear | hit; NULL = never required
     public_pending: bool = False  # #3329 (c): asked to go public, waiting for a clean abuse check
+    origin_tenant: Optional[str] = None  # #3811/#4007: home tenant marked on upload; never shown keyless
     grant_scope: Optional[str] = None  # upload/fetch: scope bound in this request; GET /objects/{id}: all bound scopes, owner/admin only (#2568)
     mime_type: str
     file_size_bytes: int
