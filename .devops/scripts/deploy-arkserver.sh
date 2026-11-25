@@ -159,7 +159,7 @@ mapfile -t changes < <(git diff --name-status --no-renames "$from_rev" "$target"
 for line in "${changes[@]}"; do
   status="${line%%$'\t'*}"; path="${line#*$'\t'}"
   case "$path" in
-    tests/*|docs/*|.github/*|.devops/*|devops|*.md|.gitignore|.env*.example) continue ;;
+    tests/*|scripts/test_*|docs/*|.github/*|.devops/*|devops|*.md|.gitignore|.env*.example) continue ;;
     requirements.txt) die "requirements.txt changed — LIVE keeps a deliberate local-path difference; deploy that by hand" ;;
   esac
   # A deletion whose file is already gone from LIVE needs no decision any more
