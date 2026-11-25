@@ -11,7 +11,9 @@ The wall applies when all of these hold:
   * the request is narrowed (X-Grant-Scope-Restrict, i.e. not a superadmin),
   * the presenting key is active and flagged may_assert_scope (the gateway),
   * the caller's verified home tenant (X-Caller-Tenant, #3811) is not the
-    key's tenant, or is missing (fail closed: then no tenant is "own").
+    key's tenant, or is missing (fail closed: then no tenant is "own"),
+  * and the key's tenant is not among the caller's verified tenants
+    (X-Grant-Scope-Tenants, #3329: memberships of a person).
 
 Under the wall a caller of tenant T
   * lists and finds only rows with origin_tenant == T, rows bound to its own
@@ -49,7 +51,10 @@ def wall(db) -> Optional[Tuple[Optional[str]]]:
             row = None
         if row is not None and bool(getattr(row, "may_assert_scope", False)):
             caller = origin_tenant.trusted(db)
-            if caller != row.tenant_id:
+            # A verified member of the key's tenant (X-Grant-Scope-Tenants, from
+            # the same checked JWT) is no stranger, whatever their home tenant.
+            member = row.tenant_id in grant_restrict.trusted_tenants(db)
+            if caller != row.tenant_id and not member:
                 result = (caller,)
     grant_restrict._wall.set((result,))
     return result

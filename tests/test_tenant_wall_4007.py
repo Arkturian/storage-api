@@ -253,3 +253,18 @@ def test_lesser_upload_through_gateway_is_listed_to_lesser_only(env):
     assert new in {i["id"] for i in lst}
     lst = c.get("/storage/list", headers=agent("EderaBot", "edera"), params={"limit": 500}).json()["items"]
     assert new not in {i["id"] for i in lst}
+
+
+def test_member_of_the_operator_tenant_is_no_stranger(env):
+    """Counter-probe: a person with memberships lesser and arkturian keeps the operator view."""
+    c, _, ids = env
+    h = {"X-API-KEY": GATEWAY, "X-Grant-Scope-Restrict": "mcp-gateway:ohne storage-scope",
+         "X-Caller-Tenant": "lesser", "X-Grant-Scope-Tenants": "lesser,arkturian"}
+    assert {"op_pub", "ark_pub", "edera_pub"} <= listed(c, h, ids)
+
+
+def test_tenants_header_of_a_stranger_does_not_open_the_wall(env):
+    c, _, ids = env
+    h = {"X-API-KEY": GATEWAY, "X-Grant-Scope-Restrict": "mcp-gateway:ohne storage-scope",
+         "X-Caller-Tenant": "lesser", "X-Grant-Scope-Tenants": "lesser"}
+    assert not listed(c, h, ids) & {"op_pub", "ark_pub", "edera_pub"}
