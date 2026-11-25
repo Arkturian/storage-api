@@ -4,7 +4,8 @@ The gateway uploads with one shared key of tenant "arkturian". Without a mark,
 a customer agent's files are indistinguishable from ours. The gateway sends the
 `tenant` claim of the verified JWT as X-Caller-Tenant; storage-api believes it
 only from an active key flagged may_assert_scope (or, since #4007,
-may_assert_origin) and stores it on new objects
+may_assert_origin), or from the instance's own master key (#4009, not the
+old public default), and stores it on new objects
 as storage_objects.origin_tenant. The object's tenant_id does not change.
 
 A missing or untrusted header marks nothing; that is not an error.
@@ -29,6 +30,8 @@ def trusted(db) -> Optional[str]:
     raw, key = _raw.get(), _api_key.get()
     if not raw or not key or db is None or not _TENANT_RE.match(raw):
         return None
+    if _is_master(key):
+        return raw  # #4009 (a): the instance's master key is full operator anyway
     try:
         from models import TenantAPIKey
         row = (db.query(TenantAPIKey)
@@ -40,6 +43,19 @@ def trusted(db) -> Optional[str]:
     # #4007: may_assert_origin marks uploads only (cloud-api portal uploads).
     ok = bool(getattr(row, "may_assert_scope", False)) or bool(getattr(row, "may_assert_origin", False))
     return raw if ok else None
+
+
+def _is_master(key: str) -> bool:
+    """The storage-api's own master key (settings.API_KEY), never the old public default (#3969)."""
+    try:
+        import hmac
+        from config import settings
+        from storage.public_default import is_public_default
+        master = settings.API_KEY or ""
+        return bool(master) and not is_public_default(master) and hmac.compare_digest(
+            key.encode(), master.encode())
+    except Exception:
+        return False
 
 
 @contextmanager

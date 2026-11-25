@@ -134,9 +134,26 @@ def test_tenant_b_sees_nothing_of_a_or_the_operator(env):
     assert listed(c, agent("EderaBot", "edera"), ids) == {"edera_pub", "edera_priv", "op_intern"}
 
 
-def test_missing_caller_tenant_fails_closed(env):
+def test_tenants_header_alone_walls_too(env):
+    """No home tenant, but verified memberships: the wall uses them."""
     c, _, ids = env
-    assert listed(c, agent("Blender", None), ids) <= {"les_priv_blender", "op_shared_to_blender", "op_intern"}
+    h = {"X-API-KEY": GATEWAY, "X-Grant-Scope-Restrict": "cloud-session:Blender", "X-Grant-Scope-Tenants": "lesser"}
+    assert listed(c, h, ids) == {"les_pub", "les_priv_blender", "op_shared_to_blender", "op_intern"}
+
+
+def test_gateway_naming_no_tenant_keeps_3030_behaviour(env):
+    """Older gateways (single-tenant customer instances) send neither header."""
+    c, _, ids = env
+    got = listed(c, agent("Blender", None), ids)
+    assert {"op_pub", "ark_pub", "les_pub", "edera_pub"} <= got
+    assert not got & {"op_priv", "edera_priv", "les_priv_other"}
+
+
+def test_single_tenant_instance_with_matching_claim_has_no_wall(env):
+    """Customer instance: gateway key tenant == the agents' tenant claim."""
+    c, _, ids = env
+    got = listed(c, agent("Cloud", "arkturian"), ids)
+    assert {"op_pub", "ark_pub", "les_pub", "edera_pub"} <= got
 
 
 def test_operator_agent_keeps_its_view(env):
