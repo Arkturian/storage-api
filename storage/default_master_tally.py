@@ -20,7 +20,7 @@ import threading
 import time
 from collections import Counter
 
-DEFAULT_LITERAL = "Inetpass1"
+from storage.public_default import is_public_default  # noqa: E402  (#3969: hash only)
 FLUSH_SECONDS = int(os.getenv("STORAGE_DEFAULT_MASTER_TALLY_FLUSH", "300"))
 TALLY_PATH = os.getenv("STORAGE_DEFAULT_MASTER_TALLY_PATH", "/var/lib/storage-api/default-master-usage.jsonl")
 
@@ -59,7 +59,7 @@ class DefaultMasterTally:
     def _active(self) -> bool:
         try:
             from config import settings
-            return settings.API_KEY == DEFAULT_LITERAL
+            return is_public_default(settings.API_KEY)
         except Exception:
             return False
 
@@ -91,7 +91,7 @@ class DefaultMasterTally:
                     ua = v.decode("latin-1")[:120]
                 elif lk == b"x-forwarded-for":
                     xff = v.decode("latin-1").split(",")[0].strip()[:64]
-            if key is not None and key.strip() == DEFAULT_LITERAL.encode():
+            if key is not None and is_public_default(key):
                 peer = (scope.get("client") or ("", 0))[0]
                 bucket = (peer, xff, ua, scope.get("method", ""), _norm_path(scope.get("path", "")))
                 self.note(bucket)

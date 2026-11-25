@@ -19,6 +19,7 @@ import auth  # noqa: E402
 from config import settings  # noqa: E402
 from models import Base, StorageObject, User  # noqa: E402
 from storage import default_master_tally as T  # noqa: E402
+from public_default_fixture import PUBLIC_DEFAULT_TEST  # noqa: E402
 
 
 def _system_user():
@@ -28,14 +29,14 @@ def _system_user():
 
 
 def test_default_master_still_operator_until_switched(monkeypatch):
-    monkeypatch.setattr(settings, "API_KEY", "Inetpass1")
+    monkeypatch.setattr(settings, "API_KEY", PUBLIC_DEFAULT_TEST)
     monkeypatch.setattr(auth, "tenant_key_state", lambda k, d: None)
     monkeypatch.delenv("STORAGE_DEFAULT_MASTER_UNPRIVILEGED", raising=False)
     assert auth.is_privileged_admin(_system_user(), object()) is True
 
 
 def test_default_master_never_operator_when_switched(monkeypatch):
-    monkeypatch.setattr(settings, "API_KEY", "Inetpass1")
+    monkeypatch.setattr(settings, "API_KEY", PUBLIC_DEFAULT_TEST)
     monkeypatch.setattr(auth, "tenant_key_state", lambda k, d: None)
     monkeypatch.setenv("STORAGE_DEFAULT_MASTER_UNPRIVILEGED", "1")
     assert auth.is_privileged_admin(_system_user(), object()) is False
@@ -54,7 +55,7 @@ def test_real_master_unaffected_by_switch(monkeypatch):
 
 @pytest.fixture
 def tally_client(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "API_KEY", "Inetpass1")
+    monkeypatch.setattr(settings, "API_KEY", PUBLIC_DEFAULT_TEST)
     monkeypatch.setattr(auth, "tenant_key_state", lambda k, d: None)
     monkeypatch.delenv("STORAGE_DEFAULT_MASTER_UNPRIVILEGED", raising=False)
     out = tmp_path / "tally.jsonl"
@@ -80,14 +81,14 @@ def _flush(client):
 
 def test_tally_counts_default_key_without_recording_it(tally_client):
     c, out = tally_client
-    c.get("/storage/objects/123", headers={"X-API-KEY": "Inetpass1", "User-Agent": "probe/1"})
-    c.get("/storage/objects/456", headers={"X-API-KEY": "Inetpass1", "User-Agent": "probe/1"})
-    c.get("/plain", headers={"X-API-KEY": "Inetpass1", "User-Agent": "probe/1"})
+    c.get("/storage/objects/123", headers={"X-API-KEY": PUBLIC_DEFAULT_TEST, "User-Agent": "probe/1"})
+    c.get("/storage/objects/456", headers={"X-API-KEY": PUBLIC_DEFAULT_TEST, "User-Agent": "probe/1"})
+    c.get("/plain", headers={"X-API-KEY": PUBLIC_DEFAULT_TEST, "User-Agent": "probe/1"})
     c.get("/plain", headers={"X-API-KEY": "some-other-key"})
     c.get("/plain")
     _flush(c)
     text = out.read_text()
-    assert "Inetpass1" not in text and "some-other-key" not in text
+    assert PUBLIC_DEFAULT_TEST not in text and "some-other-key" not in text
     rows = [json.loads(line) for line in text.splitlines()]
     plain = {(r["path"], r["priv"]): r["n"] for r in rows}
     assert plain[("/storage/objects/{id}", False)] == 2
@@ -100,7 +101,7 @@ def test_tally_counts_default_key_without_recording_it(tally_client):
 def test_tally_silent_once_master_is_real(tally_client, monkeypatch):
     c, out = tally_client
     monkeypatch.setattr(settings, "API_KEY", "a-real-rotated-secret")
-    c.get("/plain", headers={"X-API-KEY": "Inetpass1"})
+    c.get("/plain", headers={"X-API-KEY": PUBLIC_DEFAULT_TEST})
     _flush(c)
     assert not out.exists() or out.read_text() == ""
 
@@ -173,11 +174,11 @@ def test_admin_key_gate_follows_switch(monkeypatch):
     from admin import routes as A
     monkeypatch.delenv("AI_INTERNAL_API_KEY", raising=False)
     monkeypatch.delenv("ADMIN_API_KEYS", raising=False)
-    monkeypatch.setattr(A.settings, "API_KEY", "Inetpass1")
+    monkeypatch.setattr(A.settings, "API_KEY", PUBLIC_DEFAULT_TEST)
     monkeypatch.delenv("STORAGE_DEFAULT_MASTER_UNPRIVILEGED", raising=False)
-    assert A.require_admin_key("Inetpass1") == "master"
+    assert A.require_admin_key(PUBLIC_DEFAULT_TEST) == "master"
     monkeypatch.setenv("STORAGE_DEFAULT_MASTER_UNPRIVILEGED", "1")
     with pytest.raises(Exception):
-        A.require_admin_key("Inetpass1")
+        A.require_admin_key(PUBLIC_DEFAULT_TEST)
     monkeypatch.setattr(A.settings, "API_KEY", "real-secret")
     assert A.require_admin_key("real-secret") == "master"

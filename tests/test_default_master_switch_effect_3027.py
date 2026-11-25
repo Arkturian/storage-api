@@ -21,8 +21,9 @@ from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from models import Base, StorageObject, User  # noqa: E402
+from public_default_fixture import PUBLIC_DEFAULT_TEST  # noqa: E402
 
-DEFAULT = "Inetpass1"
+DEFAULT = PUBLIC_DEFAULT_TEST
 
 
 @pytest.fixture

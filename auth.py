@@ -7,8 +7,8 @@ import string
 from typing import Optional
 import os
 
-# config.py falls back to this literal when API_KEY is unset; it is public (#1960).
-_BUILTIN_DEFAULT_MASTER = "Inetpass1"
+# The retired public default master is recognised by hash only (#1960, #3969).
+from storage.public_default import is_public_default
 
 from database import get_db
 import logging
@@ -379,7 +379,7 @@ def is_privileged_admin(current_user, db) -> bool:
             result = False
     except Exception:
         return False
-    if result and email == "system@api" and settings.API_KEY == _BUILTIN_DEFAULT_MASTER:
+    if result and email == "system@api" and is_public_default(settings.API_KEY):
         # AP 2.6 / #1960: while API_KEY is unset, the master is config.py's
         # publicly known literal, so system@api is whoever read a frontend
         # bundle. It must not be an operator. Switched by

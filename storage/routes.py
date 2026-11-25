@@ -4408,7 +4408,8 @@ def _is_public_default_master(current_user) -> bool:
     privilege that would be dangerous in a stranger's hands. The restriction
     is tied to the risk condition: setting a real API_KEY lifts it by itself.
     """
-    return settings.API_KEY == "Inetpass1" and getattr(current_user, "email", None) == "system@api"
+    from storage.public_default import is_public_default
+    return is_public_default(settings.API_KEY) and getattr(current_user, "email", None) == "system@api"
 
 
 def _require_bulk_admin(current_user, db) -> None:
@@ -4546,7 +4547,7 @@ def _check_presence_and_privacy(obj, current_user: Optional[User], db: Optional[
                 _is_admin = False
         _is_owner = current_user is not None and getattr(obj, "owner_user_id", None) == current_user.id
         # As long as this deployment still runs the HARDCODED default master key
-        # (config.py fallback "Inetpass1"), that key is publicly known — it ships
+        # (the retired config.py fallback, #1960), that key is publicly known — it ships
         # inside browser bundles — and it authenticates as system@api, the owner
         # of nearly every object. Honouring owner/admin here would void the gate
         # for anyone who reads a frontend's JS (verified 2026-07-30). So while the
@@ -6961,7 +6962,11 @@ def _notify_artrack_storage_deleted(object_id: int) -> None:
     import json as _json
 
     artrack_url = os.getenv("ARTRACK_API_URL", "https://api-artrack.arkturian.com")
-    api_key = os.getenv("ARTRACK_API_KEY") or os.getenv("X_API_KEY") or "Inetpass1"
+    # #3969: no built-in fallback. Without a configured key there is nothing to send.
+    api_key = os.getenv("ARTRACK_API_KEY") or os.getenv("X_API_KEY")
+    if not api_key:
+        print(f"⚠️  artrack cleanup-refs for {object_id} skipped: ARTRACK_API_KEY unset", flush=True)
+        return
     url = f"{artrack_url}/admin/storage/{object_id}/cleanup-refs"
 
     def _fire():

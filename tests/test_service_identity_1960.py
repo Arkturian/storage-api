@@ -16,8 +16,9 @@ from sqlalchemy.orm import sessionmaker  # noqa: E402
 import auth  # noqa: E402
 import config  # noqa: E402
 from models import Base, StorageObject, Tenant, TenantAPIKey, User  # noqa: E402
+from public_default_fixture import PUBLIC_DEFAULT_TEST  # noqa: E402
 
-LITERAL = "Inetpass1"
+LITERAL = PUBLIC_DEFAULT_TEST
 MASTER = "fresh-master-0123456789abcdef0123456789"
 GATEWAY = "gw-key-0123456789abcdef0123456789abcd"
 CLOUDAPI = "ca-key-0123456789abcdef0123456789abcd"

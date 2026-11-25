@@ -9,7 +9,7 @@ Runs against an ISOLATED instance (own DB copy, own upload dir). Needs:
               F (other tenant)
 The script sets sign_tenants on one service key in THAT db copy.
 """
-import argparse, sqlite3, sys, time
+import argparse, os, sqlite3, sys, time
 import httpx
 
 FAIL = []
@@ -25,13 +25,13 @@ P, Q, R, F = o["P"], o["Q"], o["R"], o["F"]
 db = sqlite3.connect(a.db)
 svc = db.execute("select api_key from tenant_api_keys where tenant_id='arkturian' and is_service=1 and is_active=1 order by rowid limit 1").fetchone()[0]
 svc2 = db.execute("select api_key from tenant_api_keys where tenant_id='arkturian' and is_service=1 and is_active=1 and api_key<>? limit 1", (svc,)).fetchone()
-plain = db.execute("select api_key from tenant_api_keys where tenant_id='arkturian' and coalesce(is_service,0)=0 and api_key<>'Inetpass1' and is_active=1 limit 1").fetchone()[0]
+plain = db.execute("select api_key from tenant_api_keys where tenant_id='arkturian' and coalesce(is_service,0)=0 and coalesce(label,'')<>'default' and is_active=1 limit 1").fetchone()[0]
 owner_q = db.execute("select u.email from storage_objects o join users u on u.id=o.owner_user_id where o.id=?", (Q,)).fetchone()[0]
 other_email = db.execute("select email from users where id<>(select owner_user_id from storage_objects where id=?) and trust_level='user' limit 1", (Q,)).fetchone()[0]
 db.execute("update tenant_api_keys set sign_tenants='arkturian' where api_key=?", (svc,)); db.commit()
 B = a.base
 S = httpx.Client(base_url=B, headers={"X-API-KEY": svc}, timeout=60)
-ADMIN = httpx.Client(base_url=B, headers={"X-API-KEY": "Inetpass1"}, timeout=60)
+ADMIN = httpx.Client(base_url=B, headers={"X-API-KEY": os.environ["STORAGE_ADMIN_KEY"]}, timeout=60)
 PLAIN = httpx.Client(base_url=B, headers={"X-API-KEY": plain}, timeout=60)
 anon = httpx.Client(base_url=B, timeout=60)
 scope = "content-post:5226"

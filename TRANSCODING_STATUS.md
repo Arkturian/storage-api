@@ -151,7 +151,7 @@ systemctl restart celery-worker
 ```bash
 # Test video hochladen:
 ssh root@arkserver 'curl -X POST "https://api-storage.arkserver.arkturian.com/storage/upload" \
-  -H "X-API-KEY: Inetpass1" \
+  -H "X-API-KEY: $STORAGE_API_KEY" \
   -F "file=@/tmp/test-video.mp4;type=video/mp4" \
   -F "title=ZIP Mode Test" \
   -F "ai_mode=safety"'
@@ -263,7 +263,7 @@ curl http://localhost:8082/health
 
 # Upload test video:
 curl -X POST "https://api-storage.arkserver.arkturian.com/storage/upload" \
-  -H "X-API-KEY: Inetpass1" \
+  -H "X-API-KEY: $STORAGE_API_KEY" \
   -F "file=@/tmp/test.mp4;type=video/mp4" \
   -F "title=Test" \
   -F "ai_mode=safety"

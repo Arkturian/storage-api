@@ -16,7 +16,7 @@ ap = argparse.ArgumentParser(); ap.add_argument("--db", required=True); ap.add_a
 a = ap.parse_args(); B = a.base
 db = sqlite3.connect(a.db)
 svc = db.execute("select api_key from tenant_api_keys where tenant_id='arkturian' and is_service=1 and is_active=1 order by rowid limit 1").fetchone()[0]
-plain = db.execute("select api_key from tenant_api_keys where tenant_id='arkturian' and coalesce(is_service,0)=0 and api_key<>'Inetpass1' and is_active=1 limit 1").fetchone()[0]
+plain = db.execute("select api_key from tenant_api_keys where tenant_id='arkturian' and coalesce(is_service,0)=0 and coalesce(label,'')<>'default' and is_active=1 limit 1").fetchone()[0]
 db.execute("update tenant_api_keys set sign_tenants='arkturian' where api_key=?", (svc,)); db.commit()
 P = httpx.Client(base_url=B, headers={"X-API-KEY": plain}, timeout=60)
 S = httpx.Client(base_url=B, headers={"X-API-KEY": svc}, timeout=60)
