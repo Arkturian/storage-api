@@ -1,0 +1,19 @@
+[Unit]
+Description=Storage API AI Worker
+After=network.target storage-api.service
+
+[Service]
+EnvironmentFile=/etc/storage-api/secrets.env
+Type=simple
+User=root
+WorkingDirectory=/var/www/api-storage.arkturian.com
+Environment="PYTHONPATH=/var/www/api-storage.arkturian.com"
+Environment="AI_QUEUE_FILE=/mnt/backup-disk/logs/ai_analysis_queue.txt"
+ExecStart=/var/www/api-storage.arkturian.com/venv/bin/python /var/www/api-storage.arkturian.com/scripts/ai_worker.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/storage_ai_worker.log
+StandardError=append:/var/log/storage_ai_worker.log
+
+[Install]
+WantedBy=multi-user.target

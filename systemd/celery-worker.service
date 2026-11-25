@@ -3,6 +3,7 @@ Description=Celery Worker for Storage API
 After=network.target redis-server.service
 
 [Service]
+EnvironmentFile=/etc/storage-api/secrets.env
 Type=simple
 User=root
 Group=root
@@ -12,16 +13,16 @@ Environment="PYTHONPATH=/var/www/api-storage.arkturian.com"
 Environment="CHROMA_COLLECTION_NAME=tenant_knowledge"
 Environment="CHROMA_DB_PATH=/var/www/api-storage.arkturian.com/chroma_db"
 Environment="DATABASE_URL=sqlite:////var/lib/storage-api/storage.db"
-Environment="DEFAULT_TENANT_ID=arkturian"
-Environment="OPENAI_API_KEY=YOUR_OPENAI_API_KEY_HERE"
+Environment="DEFAULT_TENANT_ID=arkserver"
 Environment="STORAGE_UPLOAD_DIR=/mnt/backup-disk/uploads/storage"
 Environment="TRANSCODING_MODE=remote"
-Environment="TRANSCODING_API_URL=http://arkserver.arkturian.com:8082"
-Environment="TRANSCODING_RESPONSE_MODE=zip"
-Environment="STORAGE_BASE_URL=https://api-storage.arkturian.com"
+Environment="TRANSCODING_API_URL=http://localhost:8082"
+Environment="TRANSCODING_RESPONSE_MODE=path"
+Environment="STORAGE_BASE_URL=https://api-storage.arkserver.arkturian.com"
+Environment="AI_ANALYSIS_QUEUE_PATH=/mnt/backup-disk/logs/ai_analysis_queue.txt"
 
 # Celery worker command
-ExecStart=/var/www/api-storage.arkturian.com/venv/bin/celery -A celery_app worker     --loglevel=info     --concurrency=4     --max-tasks-per-child=50     --queues=celery,ai_analysis,embeddings,transcoding     --logfile=/var/log/celery/worker.log
+ExecStart=/var/www/api-storage.arkturian.com/venv/bin/celery -A celery_app worker     --loglevel=info     --concurrency=2     --max-tasks-per-child=50     --queues=celery,ai_analysis,transcoding     --logfile=/var/log/celery/worker.log
 
 # Restart policy
 Restart=always

@@ -8,6 +8,18 @@ User=root
 Group=root
 WorkingDirectory=/var/www/api-storage.arkturian.com
 Environment="PATH=/var/www/api-storage.arkturian.com/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="CHROMA_COLLECTION_NAME=tenant_knowledge"
+Environment="CHROMA_DB_PATH=/var/www/api-storage.arkturian.com/chroma_db"
+Environment="DATABASE_URL=sqlite:////var/lib/storage-api/storage.db"
+Environment="DEFAULT_TENANT_ID=arkserver"
+Environment="HOST=0.0.0.0"
+EnvironmentFile=/etc/cloud-secrets/flower.env
+Environment="PORT=8080"
+Environment="STORAGE_UPLOAD_DIR=/mnt/backup-disk/uploads/storage"
+Environment="TRANSCODING_MODE=remote"
+Environment="TRANSCODING_API_URL=http://localhost:8082"
+Environment="STORAGE_BASE_URL=https://api-storage.arkserver.arkturian.com"
+Environment="AI_ANALYSIS_QUEUE_PATH=/mnt/backup-disk/logs/ai_analysis_queue.txt"
 
 # Flower command
 ExecStart=/var/www/api-storage.arkturian.com/venv/bin/celery -A celery_app flower \
