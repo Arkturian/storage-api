@@ -3,7 +3,8 @@
 The gateway uploads with one shared key of tenant "arkturian". Without a mark,
 a customer agent's files are indistinguishable from ours. The gateway sends the
 `tenant` claim of the verified JWT as X-Caller-Tenant; storage-api believes it
-only from an active key flagged may_assert_scope and stores it on new objects
+only from an active key flagged may_assert_scope (or, since #4007,
+may_assert_origin) and stores it on new objects
 as storage_objects.origin_tenant. The object's tenant_id does not change.
 
 A missing or untrusted header marks nothing; that is not an error.
@@ -34,7 +35,11 @@ def trusted(db) -> Optional[str]:
                .filter(TenantAPIKey.api_key == key, TenantAPIKey.is_active.is_(True)).one_or_none())
     except Exception:
         return None
-    return raw if row is not None and bool(getattr(row, "may_assert_scope", False)) else None
+    if row is None:
+        return None
+    # #4007: may_assert_origin marks uploads only (cloud-api portal uploads).
+    ok = bool(getattr(row, "may_assert_scope", False)) or bool(getattr(row, "may_assert_origin", False))
+    return raw if ok else None
 
 
 @contextmanager

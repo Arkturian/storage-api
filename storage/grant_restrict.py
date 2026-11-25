@@ -27,6 +27,8 @@ _scope: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("grant_sc
 _tenants_raw: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("grant_scope_tenants", default=None)
 _api_key: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("grant_scope_api_key", default=None)
 _tenants_ok: contextvars.ContextVar[Optional[frozenset]] = contextvars.ContextVar("grant_scope_tenants_ok", default=None)
+# #4007: per-request cache of storage.tenant_wall.wall(), reset with the rest.
+_wall: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar("grant_scope_tenant_wall", default=None)
 _TENANT_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
 LEVELS = ("personal", "intern")
 
@@ -141,9 +143,10 @@ class GrantScopeRestrict:
         if value is None:
             await self.app(scope, receive, send)
             return
-        tokens = (_scope.set(value), _tenants_raw.set(tenants), _api_key.set(api_key), _tenants_ok.set(None))
+        tokens = (_scope.set(value), _tenants_raw.set(tenants), _api_key.set(api_key), _tenants_ok.set(None),
+                  _wall.set(None))
         try:
             await self.app(scope, receive, send)
         finally:
-            for var, tok in zip((_scope, _tenants_raw, _api_key, _tenants_ok), tokens):
+            for var, tok in zip((_scope, _tenants_raw, _api_key, _tenants_ok, _wall), tokens):
                 var.reset(tok)

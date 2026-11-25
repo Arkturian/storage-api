@@ -695,6 +695,7 @@ def build_hls_url(tenant_id: str, basename: str) -> str:
 
 from storage import grant_restrict as _grant_restrict  # noqa: E402
 from storage import origin_tenant as _origin_tenant  # noqa: E402
+from storage import tenant_wall as _tenant_wall  # noqa: E402
 
 
 def _grant_restriction_gate(request: Request) -> None:
@@ -718,7 +719,8 @@ def _grant_restriction_gate(request: Request) -> None:
     db = SessionLocal()
     try:
         obj = db.query(StorageObject).filter(StorageObject.id == oid).first()
-        ok = obj is not None and _grant_restrict.allowed(obj, db)
+        ok = (obj is not None and _grant_restrict.allowed(obj, db)
+              and _tenant_wall.may_touch(obj, db, request.method))  # #4007
     finally:
         db.close()
     if not ok:
@@ -4587,6 +4589,11 @@ def _row_visible(obj, current_user: Optional[User], db: Optional[Session] = None
         _check_presence_and_privacy(obj, current_user, db)
     except HTTPException:
         return False
+    try:
+        if not _tenant_wall.listable(obj, db):  # #4007: other tenants' rows stay out
+            return False
+    except Exception:
+        return False
     if getattr(obj, "is_public", False):
         return True
     if current_user is None:
@@ -6581,6 +6588,9 @@ def list_objects(
     _restrict = _grant_restrict.sql_filter(StorageObject, db)
     if _restrict is not None:
         q = q.filter(_restrict)
+    _wall = _tenant_wall.sql_filter(StorageObject, db)  # #4007
+    if _wall is not None:
+        q = q.filter(_wall)
     if not operator_view:  # #3329 (c): a blocked object is listed to admins only
         q = q.filter(or_(StorageObject.abuse_status.is_(None), StorageObject.abuse_status != "hit"))
 
