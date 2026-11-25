@@ -17,7 +17,7 @@ a = ap.parse_args(); B = a.base
 db = sqlite3.connect(a.db)
 svc = db.execute("select api_key from tenant_api_keys where tenant_id='arkturian' and is_service=1 and is_active=1 order by rowid limit 1").fetchone()[0]
 nosign = db.execute("select api_key from tenant_api_keys where tenant_id='arkturian' and is_service=1 and is_active=1 and api_key<>? limit 1", (svc,)).fetchone()
-plain = db.execute("select api_key from tenant_api_keys where tenant_id='arkturian' and coalesce(is_service,0)=0 and api_key<>'Inetpass1' and is_active=1 limit 1").fetchone()[0]
+plain = db.execute("select api_key from tenant_api_keys where tenant_id='arkturian' and coalesce(is_service,0)=0 and coalesce(label,'')<>'default' and is_active=1 limit 1").fetchone()[0]
 db.execute("update tenant_api_keys set sign_tenants='arkturian' where api_key=?", (svc,))
 ark = [r[0] for r in db.execute("select id from storage_objects where tenant_id='arkturian' and tombstoned_at is null order by id desc limit 3")]
 one = db.execute("select id from storage_objects where tenant_id='oneal' and tombstoned_at is null order by id desc limit 1").fetchone()[0]

@@ -6,6 +6,7 @@ os.getenv/os.environ.get of a *KEY/*TOKEN/*SECRET/*PASSWORD variable with a
 non-empty string default. Values are never printed, only file and name."""
 import re
 from pathlib import Path
+from public_default_fixture import PUBLIC_DEFAULT_TEST  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 PAT = re.compile(r'(?:os\.getenv|os\.environ\.get)\(\s*"([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASS)[A-Z0-9_]*)"\s*,\s*"([^"]+)"')
@@ -37,7 +38,7 @@ def test_unset_master_authenticates_nobody(monkeypatch):
     db = sessionmaker(bind=eng)()
     monkeypatch.setattr(auth.settings, "API_KEY", "")
     try:
-        assert auth.verify_api_key(auth._BUILTIN_DEFAULT_MASTER, db) is None
+        assert auth.verify_api_key(PUBLIC_DEFAULT_TEST, db) is None
         assert auth.verify_api_key("", db) is None
         assert db.query(models.User).filter(models.User.email == "system@api").count() == 0
     finally:

@@ -66,7 +66,8 @@ async def startup():
     # never logged; only the fact that it is the known default.
     try:
         from config import settings as _s
-        if _s.API_KEY == "Inetpass1":
+        from storage.public_default import is_public_default as _is_pub
+        if _is_pub(_s.API_KEY):
             import logging as _lg
             _lg.getLogger("uvicorn.error").critical(
                 "SECURITY: API_KEY is unset — running on the PUBLIC hardcoded default. "

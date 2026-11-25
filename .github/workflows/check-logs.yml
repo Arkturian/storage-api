@@ -33,7 +33,7 @@ jobs:
             
             echo ""
             echo "=== Testing storage-api from server ==="
-            curl -s http://127.0.0.1:8002/health -H "X-API-KEY: Inetpass1" || echo "❌ storage-api not responding on 8002"
+            curl -s http://127.0.0.1:8002/health || echo "❌ storage-api not responding on 8002"
             
             echo ""
             echo "=== storage-api error logs (last 30 lines) ==="

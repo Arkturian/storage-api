@@ -27,6 +27,7 @@ SKIP_DIRS = {".git", "venv", ".venv", "node_modules", "__pycache__", ".pytest_ca
 BURNT_KEY_HASHES = {
     "060bb4cf7fc51b2ac58a59780ecfda1ccff8912f55d23d278945c7828994e031",  # aiserver API_KEY
     "c579de24b524e572e19b7363825e2135857d904adc4865b2a90ffc85b190d460",  # O'Neal API key
+    "43ba25cae1dea05aa4ac2b5ca908f4a91960a4f1630bee646421456f5187df29",  # old public default master (#1960, #3969)
 }
 
 _SECRET_NAME = re.compile(r"(key|secret|token|passw(or)?d|pwd|credential)", re.IGNORECASE)

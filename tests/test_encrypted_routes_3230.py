@@ -20,8 +20,9 @@ from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from models import Base, StorageDecryptLog, StorageObject, User  # noqa: E402
+from public_default_fixture import PUBLIC_DEFAULT_TEST  # noqa: E402
 
-DEFAULT = "Inetpass1"
+DEFAULT = PUBLIC_DEFAULT_TEST
 PAYLOAD = b"Name;Gehalt\nMartina;4200\n" * 4000  # ~100 KB, two segments
 
 
