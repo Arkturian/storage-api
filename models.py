@@ -66,6 +66,10 @@ class TenantAPIKey(Base):
     # object owned by a shared service account (system@api); for every other
     # key the header still only takes visibility away. Set by ops only.
     may_assert_scope = Column(Boolean, default=False, nullable=True)
+    # #4007: may mark new uploads with X-Caller-Tenant (origin_tenant) and
+    # nothing else, e.g. cloud-api for portal uploads of a customer's human.
+    # Unlike may_assert_scope it opens no encrypted or granted reads.
+    may_assert_origin = Column(Boolean, default=False, nullable=True)
     # #3230: may mint signed links for encrypted objects (cloud-api's signing
     # key). Other signing keys keep signing everything else. Set by ops only.
     may_sign_encrypted = Column(Boolean, default=False, nullable=True)

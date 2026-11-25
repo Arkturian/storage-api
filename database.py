@@ -86,6 +86,7 @@ _TENANT_KEY_COLUMNS = (
     ("may_publish_to_post", "BOOLEAN DEFAULT 0"),
     ("may_create_share_links", "BOOLEAN DEFAULT 0"),
     ("may_sign_intern", "BOOLEAN DEFAULT 0"),
+    ("may_assert_origin", "BOOLEAN DEFAULT 0"),
 )
 
 
