@@ -76,6 +76,9 @@ async def startup():
                 "normal owner/admin access."
             )
             print("🔴 SECURITY: master API_KEY is the public hardcoded default — set API_KEY in the env", flush=True)
+        # #4009: ja/nein on every start, so each instance can be checked from its
+        # journal (X-Caller-Tenant is never believed from the public default).
+        print(f"MASTER_PUBLIC_DEFAULT={'ja' if _is_pub(_s.API_KEY) else 'nein'}", flush=True)
         # Same class, different variable: DEFAULT_TENANT_ID falls back to the
         # OPERATOR's tenant name. On a customer instance that never sets it,
         # every keyless request silently resolves to "arkturian" — Cloud found

@@ -10,19 +10,19 @@ gateway account owns.
 The wall applies when all of these hold:
   * the request is narrowed (X-Grant-Scope-Restrict, i.e. not a superadmin),
   * the presenting key is active and flagged may_assert_scope (the gateway),
-  * the caller's verified home tenant (X-Caller-Tenant, #3811) is not the
-    key's tenant, or is missing (fail closed: then no tenant is "own"),
-  * and the key's tenant is not among the caller's verified tenants
-    (X-Grant-Scope-Tenants, #3329: memberships of a person).
+  * the gateway names the caller's tenants (X-Caller-Tenant, #3811, and/or
+    X-Grant-Scope-Tenants, #3329), and the key's tenant is not among them.
+A gateway that names no tenant (older than #3811/#3329, as on single-tenant
+customer instances) keeps the #3030 behaviour.
 
-Under the wall a caller of tenant T
-  * lists and finds only rows with origin_tenant == T, rows bound to its own
+Under the wall a caller with own tenants T
+  * lists and finds only rows with origin_tenant in T, rows bound to its own
     scope (an explicit share), and intern rows (cross-tenant by definition,
     #3329/#3982),
   * may still read by id what anyone may read (plainly public, see
     grant_restrict.allowed), since /storage/objects/{id} and /storage/media
     answer that without a key anyway,
-  * changes only rows with origin_tenant == T.
+  * changes only rows with origin_tenant in T.
 """
 from __future__ import annotations
 
@@ -33,14 +33,14 @@ from storage import grant_restrict, origin_tenant
 READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
-def wall(db) -> Optional[Tuple[Optional[str]]]:
-    """None when no wall applies, else a 1-tuple with the caller's tenant (or None)."""
+def wall(db) -> Optional[frozenset]:
+    """None when no wall applies, else the caller's own tenants (possibly empty)."""
     if not grant_restrict.current_scope() or db is None:
         return None
     cached = grant_restrict._wall.get()
     if cached is not None:
         return cached[0]
-    result: Optional[Tuple[Optional[str]]] = None
+    result: Optional[frozenset] = None
     key = grant_restrict._api_key.get()
     if key:
         try:
@@ -51,11 +51,15 @@ def wall(db) -> Optional[Tuple[Optional[str]]]:
             row = None
         if row is not None and bool(getattr(row, "may_assert_scope", False)):
             caller = origin_tenant.trusted(db)
-            # A verified member of the key's tenant (X-Grant-Scope-Tenants, from
-            # the same checked JWT) is no stranger, whatever their home tenant.
-            member = row.tenant_id in grant_restrict.trusted_tenants(db)
-            if caller != row.tenant_id and not member:
-                result = (caller,)
+            # X-Grant-Scope-Tenants: verified tenants from the same checked JWT.
+            tenants = grant_restrict.trusted_tenants(db)
+            own = frozenset(t for t in ({caller} | set(tenants)) if t)
+            # A gateway that names no tenant at all (older than #3811/#3329, e.g.
+            # on a single-tenant customer instance) keeps the #3030 behaviour.
+            # One that names tenants walls off everything not theirs, unless the
+            # caller belongs to the key's own tenant.
+            if own and row.tenant_id not in own:
+                result = own
     grant_restrict._wall.set((result,))
     return result
 
@@ -76,7 +80,7 @@ def listable(obj, db) -> bool:
         return True
     if obj is None:
         return False
-    if w[0] is not None and getattr(obj, "origin_tenant", None) == w[0]:
+    if getattr(obj, "origin_tenant", None) in w:
         return True
     if getattr(obj, "visibility_level", None) == "intern":
         return True
@@ -88,7 +92,7 @@ def may_touch(obj, db, method: str) -> bool:
     w = wall(db)
     if w is None or (method or "").upper() in READ_METHODS:
         return True
-    return obj is not None and w[0] is not None and getattr(obj, "origin_tenant", None) == w[0]
+    return obj is not None and getattr(obj, "origin_tenant", None) in w
 
 
 def sql_filter(model, db):
@@ -99,7 +103,4 @@ def sql_filter(model, db):
     from sqlalchemy import or_
     from models import MediaGrant
     granted = db.query(MediaGrant.object_id).filter(MediaGrant.scope == grant_restrict.current_scope())
-    parts = [model.visibility_level == "intern", model.id.in_(granted)]
-    if w[0] is not None:
-        parts.insert(0, model.origin_tenant == w[0])
-    return or_(*parts)
+    return or_(model.origin_tenant.in_(sorted(w)), model.visibility_level == "intern", model.id.in_(granted))
