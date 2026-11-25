@@ -79,6 +79,38 @@ class Refused(CheckUnavailable):
     """The model refused at least one question: no verdict, counted."""
 
 
+class RateLimited(CheckUnavailable):
+    """api-ai answered 429 (#3366): its daily limit holds until `resets_at`
+    (next local midnight), not for a fixed retry interval. Not an attempt."""
+
+    def __init__(self, msg: str, resets_at: Optional[str]):
+        super().__init__(msg)
+        self.resets_at = resets_at
+
+
+def _resets_at(r) -> Optional[str]:
+    """When a 429 ends, as UTC 'YYYY-MM-DDTHH:MM:SSZ'. From detail.resets_at
+    (api-ai decisions budget), else Retry-After seconds, else None."""
+    from datetime import timedelta, timezone
+    try:
+        j = r.json()
+        d = j.get("detail") if isinstance(j, dict) else None
+        raw = (d or {}).get("resets_at") if isinstance(d, dict) else None
+        raw = raw or (j.get("resets_at") if isinstance(j, dict) else None)
+        if raw:
+            t = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        pass
+    try:
+        secs = int(r.headers.get("retry-after", ""))
+        return (datetime.now(timezone.utc) + timedelta(seconds=max(1, secs))).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
 def enabled() -> bool:
     """Checks run at all (shadow or enforcing)."""
     return os.getenv("ABUSE_CHECK_ENABLED", "").strip().lower() in ("1", "true", "yes")
@@ -193,6 +225,8 @@ async def _ask_frame(c, url: str, token: str, jpeg: bytes) -> dict:
         r = await c.post(url, json=body, headers={"Authorization": f"Bearer {token}"})
     except Exception as e:
         raise CheckUnavailable(type(e).__name__)
+    if r.status_code == 429:
+        raise RateLimited("http 429", _resets_at(r))
     if r.status_code != 200:
         raise CheckUnavailable(f"http {r.status_code}")
     probs, refused = {}, []
@@ -351,9 +385,18 @@ async def check(db, obj, anlass: str) -> str:
         obj.abuse_status = "failed"
         db.commit()
         return "failed"
+    except RateLimited as e:
+        # #3366: a daily limit is not the object's fault. Give the attempt back
+        # and wait until the limit resets, else 48 tries burn out before midnight.
+        obj.abuse_status = "failed"
+        _record(obj, versuche=max(0, _attempts(obj) - 1), fehler=str(e)[:80], zuletzt=now,
+                naechster_versuch=e.resets_at)
+        db.commit()
+        print(f"⚠️ abuse check rate-limited object={obj.id} bis={e.resets_at}", flush=True)
+        return "failed"
     except CheckUnavailable as e:
         obj.abuse_status = "failed"
-        _record(obj, fehler=str(e)[:80], zuletzt=now)
+        _record(obj, fehler=str(e)[:80], zuletzt=now, naechster_versuch=None)
         db.commit()
         print(f"⚠️ abuse check unavailable object={obj.id}: {e}", flush=True)
         return "failed"
@@ -513,9 +556,13 @@ async def retry_open(session_factory, limit: int = 20) -> int:
     db = session_factory()
     done = 0
     try:
+        from sqlalchemy import func
+        jetzt = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        # #3366: objects waiting for a rate limit to reset stay out until then.
+        warten = func.coalesce(func.json_extract(StorageObject.metadata_json, "$.abuse_check.naechster_versuch"), "")
         rows = (db.query(StorageObject)
                 .filter(StorageObject.abuse_status.in_(("pending", "failed")),
-                        StorageObject.tombstoned_at.is_(None))
+                        StorageObject.tombstoned_at.is_(None), warten <= jetzt)
                 .order_by(StorageObject.id).limit(limit).all())
         for o in rows:
             if _attempts(o) >= MAX_ATTEMPTS:
