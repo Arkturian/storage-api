@@ -16,12 +16,14 @@ A gateway that names no tenant (older than #3811/#3329, as on single-tenant
 customer instances) keeps the #3030 behaviour.
 
 Under the wall a caller with own tenants T
-  * lists and finds only rows with origin_tenant in T, rows bound to its own
-    scope (an explicit share), and intern rows (cross-tenant by definition,
-    #3329/#3982),
-  * may still read by id what anyone may read (plainly public, see
-    grant_restrict.allowed), since /storage/objects/{id} and /storage/media
-    answer that without a key anyway,
+  * lists as "mine" only rows with origin_tenant in T and rows bound to its
+    own scope (an explicit share) (#4087),
+  * finds and lists beyond "mine" also intern rows (cross-tenant by
+    definition, #3329/#3982) and plainly public rows of anyone, the
+    operator's included: "alles was öffentlich ist darf er natürlich sehen"
+    (Alex 26.11., #4087),
+  * reads by id what anyone may read (plainly public) plus, through
+    grant_restrict.tenant_readable, every upload of its own tenant,
   * changes only rows with origin_tenant in T.
 """
 from __future__ import annotations
@@ -84,6 +86,8 @@ def listable(obj, db) -> bool:
         return True
     if getattr(obj, "visibility_level", None) == "intern":
         return True
+    if grant_restrict.plainly_public(obj):  # #4087: public stays findable
+        return True
     return _granted(obj, db)
 
 
@@ -95,12 +99,19 @@ def may_touch(obj, db, method: str) -> bool:
     return obj is not None and getattr(obj, "origin_tenant", None) in w
 
 
-def sql_filter(model, db):
-    """Criterion for listings, or None when no wall applies."""
+def sql_filter(model, db, mine: bool = False):
+    """Criterion for listings, or None when no wall applies.
+
+    mine=True (#4087): only the own tenant's rows and rows bound to the
+    caller's scope. Otherwise also intern rows and plainly public rows."""
     w = wall(db)
     if w is None:
         return None
-    from sqlalchemy import or_
+    from sqlalchemy import and_, func, or_
     from models import MediaGrant
     granted = db.query(MediaGrant.object_id).filter(MediaGrant.scope == grant_restrict.current_scope())
-    return or_(model.origin_tenant.in_(sorted(w)), model.visibility_level == "intern", model.id.in_(granted))
+    parts = [model.origin_tenant.in_(sorted(w)), model.id.in_(granted)]
+    if not mine:
+        not_pm = func.coalesce(func.json_extract(model.metadata_json, "$.private_media"), 0) != 1
+        parts += [model.visibility_level == "intern", and_(model.is_public.is_(True), not_pm)]
+    return or_(*parts)
