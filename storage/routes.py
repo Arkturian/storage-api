@@ -719,7 +719,9 @@ def _grant_restriction_gate(request: Request) -> None:
     db = SessionLocal()
     try:
         obj = db.query(StorageObject).filter(StorageObject.id == oid).first()
-        ok = (obj is not None and _grant_restrict.allowed(obj, db)
+        # #4087: the tenant read opens reads only; a change still needs the grant.
+        reading = (request.method or "").upper() in _tenant_wall.READ_METHODS
+        ok = (obj is not None and _grant_restrict.allowed(obj, db, tenant=reading)
               and _tenant_wall.may_touch(obj, db, request.method))  # #4007
     finally:
         db.close()
@@ -4197,8 +4199,11 @@ def _gateway_reads_granted(obj, current_user, db) -> bool:
     if not bool(getattr(current_user, "_storage_may_assert_scope", False)):
         return False
     from models import MediaGrant
-    return db.query(MediaGrant.id).filter(MediaGrant.object_id == obj.id,
-                                          MediaGrant.scope == scope).first() is not None
+    if db.query(MediaGrant.id).filter(MediaGrant.object_id == obj.id,
+                                      MediaGrant.scope == scope).first() is not None:
+        return True
+    # #4087: an upload of the agent's own tenant reads like a grant.
+    return _grant_restrict.tenant_readable(obj, db)
 
 
 def _shared_owner_direct_ok(obj, current_user, db) -> bool:
@@ -6589,7 +6594,7 @@ def list_objects(
     _restrict = _grant_restrict.sql_filter(StorageObject, db)
     if _restrict is not None:
         q = q.filter(_restrict)
-    _wall = _tenant_wall.sql_filter(StorageObject, db)  # #4007
+    _wall = _tenant_wall.sql_filter(StorageObject, db, mine=mine)  # #4007, #4087
     if _wall is not None:
         q = q.filter(_wall)
     if not operator_view:  # #3329 (c): a blocked object is listed to admins only
@@ -8525,6 +8530,13 @@ def sign_media_links(
         # tenant is one of leser_mandanten, intern when there is any.
         level = object_level(o) if readers is not None else None
         level_ok = (level == "personal" and o.tenant_id in readers) or (level == "intern" and bool(readers))
+        # #4087 (Alex 26.11.): an upload of the reader's own tenant, by origin_tenant,
+        # private_media included. Only from a may_sign_intern key (cloud-api checked
+        # the reader's tenants), never the instance tenant itself (operator agents
+        # keep the per-grant rule), never encrypted.
+        _origin = getattr(o, "origin_tenant", None)
+        tenant_ok = bool(readers is not None and _origin and _origin in readers
+                         and _origin != payload.tenant and not getattr(o, "encrypted", False))
         if o.tenant_id != payload.tenant and not level_ok:
             items.append({"id": oid, "error": "wrong_tenant"}); continue
         if getattr(o, "abuse_status", None) == "hit":  # #3329 (c)
@@ -8533,7 +8545,7 @@ def sign_media_links(
         url = f"{base_url}/storage/media/{oid}"
         if o.is_public and not md.get("private_media"):
             items.append({"id": oid, "url": url, "signed": False, "public": True}); continue
-        if oid not in granted and not level_ok:
+        if oid not in granted and not level_ok and not tenant_ok:
             items.append({"id": oid, "error": "not_granted"}); continue
         # #3230: only a key flagged may_sign_encrypted (cloud-api) mints links
         # for encrypted objects; the other signing keys of the tenant could
@@ -8555,6 +8567,8 @@ def sign_media_links(
         if level_ok:
             _item["visibility_level"] = level
             _item["tenant"] = o.tenant_id  # cloud-api checks personal against it too
+        elif tenant_ok and oid not in granted:
+            _item["origin_tenant"] = _origin  # #4087: read as a member of this tenant
         if getattr(o, "encrypted", False):
             # Always marked: the portal (#3235) recognises encrypted files by
             # this flag, also when the requested ttl needed no capping.

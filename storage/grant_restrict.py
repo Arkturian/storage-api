@@ -29,6 +29,8 @@ _api_key: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("grant_
 _tenants_ok: contextvars.ContextVar[Optional[frozenset]] = contextvars.ContextVar("grant_scope_tenants_ok", default=None)
 # #4007: per-request cache of storage.tenant_wall.wall(), reset with the rest.
 _wall: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar("grant_scope_tenant_wall", default=None)
+# #4087: tenant of the presenting gateway key, cached by trusted_tenants().
+_gw_tenant: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar("grant_scope_gateway_tenant", default=None)
 _TENANT_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
 LEVELS = ("personal", "intern")
 
@@ -47,6 +49,7 @@ def trusted_tenants(db) -> frozenset:
     if cached is not None:
         return cached
     result = frozenset()
+    gw_tenant = None
     raw, key = _tenants_raw.get(), _api_key.get()
     if raw and key and db is not None:
         parts = [p.strip() for p in raw.split(",") if p.strip()]
@@ -57,10 +60,38 @@ def trusted_tenants(db) -> frozenset:
                        .filter(TenantAPIKey.api_key == key, TenantAPIKey.is_active.is_(True)).one_or_none())
                 if row is not None and bool(getattr(row, "may_assert_scope", False)):
                     result = frozenset(parts)
+                    gw_tenant = row.tenant_id
             except Exception:
                 result = frozenset()
     _tenants_ok.set(result)
+    _gw_tenant.set((gw_tenant,))
     return result
+
+
+def tenant_readable(obj, db) -> bool:
+    """#4087 (Alex 26.11.): an upload belongs to its tenant, and every agent of
+    that tenant reads it, private_media included. Only for a narrowed agent
+    whose tenants the gateway verified (X-Grant-Scope-Tenants from a key
+    flagged may_assert_scope), only by origin_tenant, which storage-api itself
+    stored from a trusted source (#3811/#4007).
+
+    Not for the gateway key's own tenant (the instance operator): its agents
+    keep the per-grant rule of #3030, so Business, Ebanking and the like stay
+    apart. Never for encrypted objects or a safety block. Reads only; changes
+    stay with the grant and the wall (tenant_wall.may_touch)."""
+    if obj is None or not current_scope() or db is None:
+        return False
+    if getattr(obj, "encrypted", False) or getattr(obj, "abuse_status", None) == "hit":
+        return False
+    origin = getattr(obj, "origin_tenant", None)
+    if not origin:
+        return False
+    tenants = trusted_tenants(db)
+    if origin not in tenants:
+        return False
+    cached = _gw_tenant.get()
+    gw = cached[0] if cached else None
+    return bool(gw) and origin != gw
 
 
 def level_readable(obj, db) -> bool:
@@ -85,8 +116,9 @@ def plainly_public(obj) -> bool:
     return bool(getattr(obj, "is_public", False)) and not md.get("private_media")
 
 
-def allowed(obj, db) -> bool:
-    """True when no restriction is active, or the row is visible under it."""
+def allowed(obj, db, *, tenant: bool = True) -> bool:
+    """True when no restriction is active, or the row is visible under it.
+    tenant=False leaves out the #4087 tenant read (for changing requests)."""
     scope = current_scope()
     if not scope:
         return True
@@ -99,7 +131,9 @@ def allowed(obj, db) -> bool:
     from models import MediaGrant
     if db.query(MediaGrant.id).filter(MediaGrant.object_id == obj.id, MediaGrant.scope == scope).first() is not None:
         return True
-    return level_readable(obj, db)
+    if level_readable(obj, db):
+        return True
+    return tenant and tenant_readable(obj, db)
 
 
 def sql_filter(model, db):
@@ -118,6 +152,14 @@ def sql_filter(model, db):
                         or_(model.abuse_status.is_(None), model.abuse_status != "hit"))
         parts.append(and_(level_ok, model.visibility_level == "intern"))
         parts.append(and_(level_ok, model.visibility_level == "personal", model.tenant_id.in_(sorted(tenants))))
+        # #4087: the own tenant's uploads, private_media included (see tenant_readable).
+        cached = _gw_tenant.get()
+        gw = cached[0] if cached else None
+        own = sorted(t for t in tenants if t != gw)
+        if gw and own:
+            parts.append(and_(model.encrypted.is_(False),
+                              or_(model.abuse_status.is_(None), model.abuse_status != "hit"),
+                              model.origin_tenant.in_(own)))
     return or_(*parts)
 
 
@@ -144,9 +186,9 @@ class GrantScopeRestrict:
             await self.app(scope, receive, send)
             return
         tokens = (_scope.set(value), _tenants_raw.set(tenants), _api_key.set(api_key), _tenants_ok.set(None),
-                  _wall.set(None))
+                  _wall.set(None), _gw_tenant.set(None))
         try:
             await self.app(scope, receive, send)
         finally:
-            for var, tok in zip((_scope, _tenants_raw, _api_key, _tenants_ok, _wall), tokens):
+            for var, tok in zip((_scope, _tenants_raw, _api_key, _tenants_ok, _wall, _gw_tenant), tokens):
                 var.reset(tok)

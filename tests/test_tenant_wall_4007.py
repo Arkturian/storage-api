@@ -116,29 +116,31 @@ def listed(c, headers, ids, **params):
     return {names[i["id"]] for i in r.json()["items"] if i["id"] in names}
 
 
-def test_lesser_agent_lists_only_its_tenant_its_grants_and_intern(env):
+def test_lesser_agent_lists_only_its_tenant_and_its_grants_as_mine(env):
+    """#4087: mine = the own tenant (all of it) plus what is bound to the agent."""
     c, _, ids = env
     assert listed(c, agent("Blender", "lesser"), ids) == {
-        "les_pub", "les_priv_blender", "op_shared_to_blender", "op_intern"}
+        "les_pub", "les_priv_blender", "les_priv_other", "op_shared_to_blender"}
 
 
-def test_grouping_filter_does_not_widen_the_wall(env):
+def test_grouping_filter_shows_public_but_no_foreign_private(env):
+    """#4087: beyond mine, public stays findable; private of others never."""
     c, _, ids = env
     got = listed(c, agent("Blender", "lesser"), ids, link_id=LINK, mine="false")
-    assert got <= {"les_pub", "les_priv_blender", "op_shared_to_blender", "op_intern"}
-    assert not got & {"op_pub", "ark_pub", "edera_pub", "op_priv", "edera_priv"}
+    assert {"op_pub", "ark_pub", "edera_pub", "op_intern", "les_priv_other"} <= got
+    assert not got & {"op_priv", "edera_priv"}
 
 
 def test_tenant_b_sees_nothing_of_a_or_the_operator(env):
     c, _, ids = env
-    assert listed(c, agent("EderaBot", "edera"), ids) == {"edera_pub", "edera_priv", "op_intern"}
+    assert listed(c, agent("EderaBot", "edera"), ids) == {"edera_pub", "edera_priv"}
 
 
 def test_tenants_header_alone_walls_too(env):
     """No home tenant, but verified memberships: the wall uses them."""
     c, _, ids = env
     h = {"X-API-KEY": GATEWAY, "X-Grant-Scope-Restrict": "cloud-session:Blender", "X-Grant-Scope-Tenants": "lesser"}
-    assert listed(c, h, ids) == {"les_pub", "les_priv_blender", "op_shared_to_blender", "op_intern"}
+    assert listed(c, h, ids) == {"les_pub", "les_priv_blender", "les_priv_other", "op_shared_to_blender"}
 
 
 def test_gateway_naming_no_tenant_keeps_3030_behaviour(env):
@@ -178,13 +180,14 @@ def test_headers_from_a_plain_key_build_no_wall(env):
 
 
 def test_asset_refs_respect_the_wall(env):
+    """#4087: public rows are findable by link; foreign private rows never."""
     c, _, ids = env
     r = c.get("/storage/asset-refs", headers=agent("Blender", "lesser"), params={"link_id": LINK})
     assert r.status_code == 200, r.text
     names = {v: k for k, v in ids.items()}
     got = {names[i["id"]] for i in r.json().get("results", []) if i.get("id") in names}
-    assert "les_pub" in got
-    assert not got & {"op_pub", "ark_pub", "edera_pub", "op_priv", "edera_priv"}
+    assert {"les_pub", "les_priv_other", "op_pub", "edera_pub"} <= got
+    assert not got & {"op_priv", "edera_priv"}
 
 
 def test_read_by_id_stays_what_anyone_may_read(env):
