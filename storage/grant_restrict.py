@@ -192,3 +192,59 @@ class GrantScopeRestrict:
         finally:
             for var, tok in zip((_scope, _tenants_raw, _api_key, _tenants_ok, _wall, _gw_tenant), tokens):
                 var.reset(tok)
+
+
+def _key_authenticates(api_key: Optional[str]) -> bool:
+    """True when X-API-KEY names a caller storage-api would accept (same rule
+    as auth.verify_api_key). Fail-closed: any error counts as no."""
+    if not api_key:
+        return False
+    try:
+        from auth import verify_api_key
+        from database import SessionLocal
+        db = SessionLocal()
+        try:
+            return verify_api_key(api_key, db) is not None
+        finally:
+            db.close()
+    except Exception:
+        return False
+
+
+class GrantScopeNeedsKey:
+    """#3736: X-Grant-Scope-Restrict only together with a valid key.
+
+    The restriction is checked before authentication (object routes answer
+    404 from _grant_restriction_gate, HEAD /storage/media in its middleware).
+    Without a key the status code therefore told an anonymous caller whether
+    an object exists and carries a grant for a given scope (404 vs 401/403).
+    Every legitimate sender (MCP gateway, knowledge-api) presents its key, so
+    a request with the header and no valid key gets one uniform 401 before
+    any lookup, whatever the object."""
+
+    def __init__(self, app, key_check=None):
+        self.app = app
+        self._check = key_check or _key_authenticates
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        restrict = api_key = None
+        for k, v in scope.get("headers") or []:
+            kl = k.lower()
+            if kl == HEADER:
+                restrict = v.decode("latin-1").strip() or None
+            elif kl == b"x-api-key":
+                api_key = v.decode("latin-1").strip() or None
+        if restrict is None:
+            await self.app(scope, receive, send)
+            return
+        from starlette.concurrency import run_in_threadpool
+        if await run_in_threadpool(self._check, api_key):
+            await self.app(scope, receive, send)
+            return
+        from starlette.responses import JSONResponse
+        resp = JSONResponse({"detail": "Invalid API key"}, status_code=401,
+                            headers={"WWW-Authenticate": "Bearer"})
+        await resp(scope, receive, send)
