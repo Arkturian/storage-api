@@ -29,6 +29,7 @@ INGEST = "k-ingest-3631"
 UNKNOWN = "k-unknown-3631"
 PROJECT = "k-project-3631"
 YOUTUBE = "k-youtube-3958"
+CLOUD = "k-cloud-node-4157"
 CANVAS = "project-api:canvas"
 AGENT = "cloud-session:Goliath"
 OTHER = "cloud-session:Martin"
@@ -51,9 +52,11 @@ EXPECTED = {
         ("POST", "/storage/objects/1/grants"), ("DELETE", "/storage/objects/1/grants"),
     },
     P.YOUTUBE_UPLOADER: {("POST", "/storage/upload"), ("GET", "/storage/list")},
+    P.CLOUD_NODE: {("POST", "/storage/upload"), ("GET", "/storage/objects/1"), ("DELETE", "/storage/objects/1"),
+                   ("GET", "/storage/media/1")},
 }
 KEY_OF = {P.PORTAL_SIGNER: PORTAL, P.POST_SIGNER: POST, P.INGEST: INGEST, P.PROJECT_UPLOADER: PROJECT,
-          P.YOUTUBE_UPLOADER: YOUTUBE}
+          P.YOUTUBE_UPLOADER: YOUTUBE, P.CLOUD_NODE: CLOUD}
 
 
 def _all_endpoints():
@@ -98,6 +101,8 @@ def env(tmp_path, monkeypatch):
                      sign_tenants="david", sign_scopes=CANVAS, route_profile=P.PROJECT_UPLOADER),
         TenantAPIKey(api_key=YOUTUBE, tenant_id="david", label="youtube-api", is_active=True,
                      route_profile=P.YOUTUBE_UPLOADER),
+        TenantAPIKey(api_key=CLOUD, tenant_id="david", label="cloud-api studio", is_active=True,
+                     route_profile=P.CLOUD_NODE),
         TenantAPIKey(api_key=UNKNOWN, tenant_id="david", label="x", is_active=True, sign_tenants="david",
                      route_profile="no-such-profile"),
     ])

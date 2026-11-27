@@ -16,6 +16,10 @@ Who holds which profile (read from the callers' code, 21.11.2026):
                  transcripts, frames and media as its own machine account, bound
                  to cloud-session:YouTube only, and lists its own objects as a
                  download cache. No sign, no delete, no grants.
+  cloud-node     cloud-api on a node outside the core (studio, #4157, Cloud
+                 27.11.2026): stores private and encrypted attachments and
+                 history exports as its own machine account, reads and deletes
+                 only those. No sign, no grants, no listing, nothing public.
 """
 import re
 from typing import Callable, Iterable, Mapping, Optional
@@ -27,6 +31,7 @@ POST_SIGNER = "post-signer"
 INGEST = "ingest"
 PROJECT_UPLOADER = "project-uploader"
 YOUTUBE_UPLOADER = "youtube-uploader"
+CLOUD_NODE = "cloud-node"
 
 ROUTE_PROFILES = {
     PORTAL_SIGNER: (
@@ -59,6 +64,12 @@ ROUTE_PROFILES = {
         ("POST", "/storage/upload"),
         ("GET", "/storage/list"),
     ),
+    CLOUD_NODE: (
+        ("POST", "/storage/upload"),
+        ("GET", _OBJECT),
+        ("DELETE", _OBJECT),
+        ("GET", r"/storage/media/[0-9]+"),
+    ),
 }
 
 _COMPILED = {
@@ -79,6 +90,10 @@ _INGEST_REFUSED_HEADERS = ("x-on-behalf-of", "x-compute-focal")
 _YOUTUBE_FIELDS = _INGEST_FIELDS | {"collection_id", "link_id", "ai_mode", "analyze"}
 YOUTUBE_SCOPE = "cloud-session:YouTube"
 _YOUTUBE_TAG_RE = re.compile(r"[A-Za-z0-9._-]{1,80}")
+# cloud-node: exactly the fields cloud-api sends (_upload_to_storage,
+# _upload_verschluesselt). Agent scopes only, as for ingest.
+_CLOUD_NODE_FIELDS = (_INGEST_FIELDS - {"original_filename"}) | {"collection_id", "ai_mode", "ttl_hours", "encrypted"}
+_CLOUD_NODE_SCOPE_PREFIXES = ("cloud-session:", "cloud-session-x:")
 
 
 def route_allowed(profile: str, method: str, path: str) -> bool:
@@ -123,9 +138,33 @@ def youtube_upload_problem(form, headers: Mapping[str, str]) -> Optional[str]:
     return None
 
 
+def cloud_node_upload_problem(form, headers: Mapping[str, str]) -> Optional[str]:
+    """Why this cloud-node upload is refused, or None. Runs before anything is stored.
+
+    Never public. private may be missing: cloud-api stores history exports
+    with is_public=false only, which no anonymous or foreign caller reads."""
+    problem = _private_upload_problem(
+        form, headers, lambda scope: scope.startswith(_CLOUD_NODE_SCOPE_PREFIXES),
+        "grant_scope must be an agent scope", fields=_CLOUD_NODE_FIELDS,
+        private_values=("true", None))
+    if problem:
+        return problem
+    if form.get("ai_mode", "none") != "none":
+        return "ai_mode must be none"
+    if form.get("encrypted", "false") not in ("true", "false"):
+        return "encrypted must be true or false"
+    ttl = form.get("ttl_hours")
+    if ttl is not None and not re.fullmatch(r"[0-9]{1,6}", str(ttl)):
+        return "ttl_hours must be a whole number of hours"
+    value = form.get("collection_id")
+    if value is not None and not _YOUTUBE_TAG_RE.fullmatch(str(value)):
+        return "collection_id must be 1-80 of A-Z a-z 0-9 . _ -"
+    return None
+
+
 def _private_upload_problem(form, headers: Mapping[str, str], scope_ok: Callable[[str], bool],
                             scope_error: str, fields=_INGEST_FIELDS,
-                            reuse_values=("false",)) -> Optional[str]:
+                            reuse_values=("false",), private_values=("true",)) -> Optional[str]:
     for header in _INGEST_REFUSED_HEADERS:
         if headers.get(header) is not None:
             return f"header not allowed: {header}"
@@ -139,7 +178,7 @@ def _private_upload_problem(form, headers: Mapping[str, str], scope_ok: Callable
         return "a file is required"
     if form.get("is_public", "false") != "false":
         return "is_public must be false"
-    if form.get("private") != "true":
+    if form.get("private") not in private_values:
         return "private must be true"
     if form.get("reuse_existing") not in reuse_values:
         return "reuse_existing must be false"

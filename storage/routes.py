@@ -2927,9 +2927,11 @@ async def _check_ingest_upload(request: Request, db: Session) -> None:
     from storage import route_profiles
     row = _presented_tenant_key(request, db)
     if row is None or row.route_profile not in (route_profiles.INGEST, route_profiles.PROJECT_UPLOADER,
-                                                route_profiles.YOUTUBE_UPLOADER):
+                                                route_profiles.YOUTUBE_UPLOADER, route_profiles.CLOUD_NODE):
         return
-    if row.route_profile == route_profiles.INGEST:
+    if row.route_profile == route_profiles.CLOUD_NODE:
+        problem = route_profiles.cloud_node_upload_problem(await request.form(), request.headers)
+    elif row.route_profile == route_profiles.INGEST:
         problem = route_profiles.ingest_upload_problem(await request.form(), request.headers)
     elif row.route_profile == route_profiles.YOUTUBE_UPLOADER:
         problem = route_profiles.youtube_upload_problem(await request.form(), request.headers)
