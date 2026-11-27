@@ -582,6 +582,10 @@ app.add_middleware(DefaultMasterTally)
 # gateway, per agent). Outermost, so every layer below sees the scope.
 from storage.grant_restrict import GrantScopeRestrict  # noqa: E402
 app.add_middleware(GrantScopeRestrict)
+# #3736: the header only together with a valid key, else one uniform 401
+# before any lookup (no existence/grant oracle). Outside GrantScopeRestrict.
+from storage.grant_restrict import GrantScopeNeedsKey  # noqa: E402
+app.add_middleware(GrantScopeNeedsKey)
 from storage.origin_tenant import CallerTenantHeader  # noqa: E402
 app.add_middleware(CallerTenantHeader)
 
